@@ -141,6 +141,9 @@ struct AppState {
     /// Result of the last update check, shared by every window so opening the
     /// main window does not hit the network again.
     update_status: Mutex<UpdateStatus>,
+    /// Panel is open on `panel_desktop_id`; a desktop switch hides it.
+    panel_open: AtomicBool,
+    panel_desktop_id: Mutex<Option<Vec<u8>>>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -1024,6 +1027,58 @@ fn place_panel(app: &AppHandle, window: &tauri::WebviewWindow) {
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
+/// Remember that the panel is open, and which desktop it was opened on.
+fn set_panel_open(app: &AppHandle, open: bool) {
+    let state = app.state::<AppState>();
+    state.panel_open.store(open, Ordering::Relaxed);
+    let mut recorded = state.panel_desktop_id.lock().unwrap();
+    *recorded = if open {
+        hexbench_core::sys::current_desktop_id()
+    } else {
+        None
+    };
+}
+
+/// Windows carries a window along on a virtual desktop switch. Hide the panel
+/// while another desktop is active and show it again on return, so it stays
+/// where the user opened it.
+fn spawn_panel_desktop_watch(app: AppHandle) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(400));
+            let (open, recorded) = {
+                let state = app.state::<AppState>();
+                (
+                    state.panel_open.load(Ordering::Relaxed),
+                    state.panel_desktop_id.lock().unwrap().clone(),
+                )
+            };
+            if !open {
+                continue;
+            }
+            let (Some(recorded), Some(current)) =
+                (recorded, hexbench_core::sys::current_desktop_id())
+            else {
+                continue;
+            };
+            let Some(window) = app.get_webview_window("phrases") else {
+                continue;
+            };
+            let visible = window.is_visible().unwrap_or(false);
+            if current != recorded {
+                if visible {
+                    let _ = window.hide();
+                }
+            } else if !visible {
+                place_panel(&app, &window);
+                let _ = window.show();
+                if let Ok(hwnd) = window.hwnd() {
+                    hexbench_core::sys::set_no_activate(hwnd.0 as isize, true);
+                }
+            }
+        }
+    });
+}
 fn open_phrases_panel(app: &AppHandle) {
     // Never build a webview inside an event-loop callback (tray menu, global
     // shortcut): creating a WebView2 window there re-enters the loop and can
@@ -1036,9 +1091,11 @@ fn open_phrases_panel_now(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("phrases") {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
+            set_panel_open(app, false);
         } else {
             place_panel(app, &window);
             let _ = window.show();
+            set_panel_open(app, true);
         }
         return;
     }
@@ -1052,6 +1109,7 @@ fn open_phrases_panel_now(app: &AppHandle) {
             let _ = window.show();
             if let Some(panel) = handle.get_webview_window("phrases") {
                 place_panel(&handle, &panel);
+                set_panel_open(&handle, true);
                 // Showing the window lets Tauri re-apply its decorations, which
                 // wipes the ex-styles set at build time. Re-assert afterwards,
                 // otherwise clicking the panel steals focus from the chat app
@@ -1488,6 +1546,8 @@ pub fn run() {
             config_path,
             pending_update: Mutex::new(None),
             update_status: Mutex::new(UpdateStatus::default()),
+            panel_open: AtomicBool::new(false),
+            panel_desktop_id: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -1536,6 +1596,7 @@ pub fn run() {
 
             spawn_engine(engine_shared.clone());
             spawn_panel_follower(handle.clone());
+            spawn_panel_desktop_watch(handle.clone());
             if std::env::args().any(|arg| arg == "--panel") {
                 let panel_handle = handle.clone();
                 thread::spawn(move || {

@@ -457,7 +457,6 @@ pub fn is_locked() -> bool {
     }
 }
 
-/// `true` when the foreground window covers a whole monitor.
 /// Move the cursor (used to nudge it back inside after a switch).
 pub fn set_cursor_pos(x: i32, y: i32) -> bool {
     // SAFETY: plain values.
