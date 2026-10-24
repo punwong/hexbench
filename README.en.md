@@ -40,7 +40,7 @@ A small panel that docks beside a chat app (built for 千牛, works with anythin
 
 - **Global hotkeys** — every shortcut is registered in one place (`全局 → 热键`), so tools never fight over a combo
 - **WebDAV config sync** — upload/pull `config.json`; the password is stored with Windows DPAPI and never uploaded
-- **One-click updates** — signed updates via the Tauri updater: download, silent NSIS install, automatic restart. No installer wizard.
+- **One-click updates** — the sidebar shows when a new version exists: click to download (with progress), then click *Update & restart*. Silent NSIS install, automatic restart, no installer wizard.
 
 ## Install
 
