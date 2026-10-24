@@ -97,7 +97,7 @@ To publish a release: bump the version in `Cargo.toml` and `src-tauri/tauri.conf
 - [x] Global hotkey registry
 - [x] WebDAV config sync
 - [x] Signed one-click updates + CI releases
-- [x] winget manifests
+- [x] winget manifests (PR [microsoft/winget-pkgs#460910](https://github.com/microsoft/winget-pkgs/pull/460910) pending review)
 - [ ] SignPath code signing (pending approval)
 - [ ] Scoop bucket
 - [ ] Conflict handling / auto-pull for WebDAV sync

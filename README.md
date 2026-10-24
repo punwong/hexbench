@@ -625,7 +625,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 - [x] `tauri-plugin-updater` 自动更新（签名校验 + NSIS passive 静默安装 + 自动重启）
 - [x] GitHub Actions：CI（构建 / 测试 / clippy）+ 打 tag 自动出包并发布 latest.json
 - [ ] SignPath 代码签名（需要组织账号审批）
-- [x] winget 清单（本地校验通过，待提交 PR）
+- [x] winget 清单（`winget install --manifest` 实测通过，PR [microsoft/winget-pkgs#460910](https://github.com/microsoft/winget-pkgs/pull/460910) 待审核）
 - [ ] Scoop 上架
 - [ ] 中英文文档 + 实测资源占用数据
 
