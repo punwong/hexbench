@@ -216,7 +216,7 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
   return invoke<UpdateInfo | null>("update_check");
 }
 
-export async function installUpdate(
+export async function downloadUpdate(
   onProgress: (percent: number | null) => void,
 ): Promise<void> {
   if (!isTauri) return;
@@ -231,11 +231,16 @@ export async function installUpdate(
     },
   );
   try {
-    // The installer replaces the process; this call does not return on success.
-    await invoke("update_install");
+    // Only fetches the installer; restarting is a separate, explicit step.
+    await invoke<UpdateInfo>("update_download");
   } finally {
     unlisten();
   }
+}
+
+export async function installDownloaded(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("update_install");
 }
 
 export async function pickApp(): Promise<void> {

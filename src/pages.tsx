@@ -14,8 +14,6 @@ import type {
   UpdateSettings,
 } from "./types";
 import {
-  checkUpdate,
-  installUpdate,
   onAppPicked,
   pickApp,
   runningApps,
@@ -692,10 +690,18 @@ function UpdateCard({
   version,
   endpoint,
   onSaveEndpoint,
+  state,
+  onCheck,
+  onDownload,
+  onInstall,
 }: {
   version: string;
   endpoint: string;
   onSaveEndpoint: (value: string) => void;
+  state: { phase: string; version: string | null; progress: number | null; error: string | null };
+  onCheck: () => void;
+  onDownload: () => void;
+  onInstall: () => void;
 }) {
   const [endpointDraft, setEndpointDraft] = useState(endpoint);
 
@@ -703,48 +709,24 @@ function UpdateCard({
     setEndpointDraft(endpoint);
   }, [endpoint]);
 
-  const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState<number | null>(null);
-  const [available, setAvailable] = useState<string | null>(null);
-
-  const check = async () => {
-    setBusy(true);
-    setStatus("检查中…");
-    setAvailable(null);
-    setProgress(null);
-    try {
-      const info = await checkUpdate();
-      if (!info) {
-        setStatus(`已是最新版本（${version}）`);
-      } else {
-        setAvailable(info.version);
-        setStatus(`发现新版本 ${info.version}${info.date ? ` · ${info.date}` : ""}`);
-      }
-    } catch (reason) {
-      setStatus(`检查失败：${String(reason)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const install = async () => {
-    setBusy(true);
-    setStatus("下载中…");
-    setProgress(0);
-    try {
-      await installUpdate(setProgress);
-      setStatus("安装完成，正在重启…");
-    } catch (reason) {
-      setStatus(`更新失败：${String(reason)}`);
-      setBusy(false);
-    }
-  };
+  const busy = state.phase === "checking" || state.phase === "downloading";
+  const status =
+    state.phase === "checking"
+      ? "检查中…"
+      : state.phase === "available"
+        ? `发现新版本 ${state.version}`
+        : state.phase === "downloading"
+          ? `下载中 ${state.progress ?? 0}%`
+          : state.phase === "ready"
+            ? `已下载 ${state.version}，重启后生效`
+            : state.phase === "error"
+              ? `更新失败：${state.error ?? "未知错误"}`
+              : "";
 
   return (
     <Card title="更新">
       <p className="sub" style={{ marginTop: 0 }}>
-        点一下就完事：下载、静默安装、自动重启，不用走安装向导。
+        侧边栏会提示新版本：点一下开始下载，下载完成后再点「更新并重启」。
       </p>
       <Row label="当前版本">
         <span className="sub">{version}</span>
@@ -758,43 +740,55 @@ function UpdateCard({
             placeholder="https://…/latest.json"
             onChange={(event) => setEndpointDraft(event.target.value)}
           />
-          <button
-            type="button"
-            className="btn"
-            onClick={() => onSaveEndpoint(endpointDraft.trim())}
-          >
+          <button type="button" className="btn" onClick={() => onSaveEndpoint(endpointDraft.trim())}>
             保存
           </button>
         </div>
       </Row>
-      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-        <button type="button" className="btn" disabled={busy} onClick={() => void check()}>
+      <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center" }}>
+        <button type="button" className="btn" disabled={busy} onClick={onCheck}>
           检查更新
         </button>
-        {available && (
-          <button type="button" className="btn primary" disabled={busy} onClick={() => void install()}>
-            更新到 {available}
+        {state.phase === "available" && (
+          <button type="button" className="btn primary" onClick={onDownload}>
+            下载 {state.version}
+          </button>
+        )}
+        {state.phase === "ready" && (
+          <button type="button" className="btn primary" onClick={onInstall}>
+            更新并重启
           </button>
         )}
       </div>
+      {state.phase === "downloading" && (
+        <div className="update-bar" style={{ marginTop: 10 }}>
+          <i style={{ width: `${state.progress ?? 0}%` }} />
+        </div>
+      )}
       {status && (
         <p className="sub" style={{ marginBottom: 0 }}>
           {status}
-          {busy && progress !== null ? ` ${progress}%` : ""}
         </p>
       )}
     </Card>
   );
 }
-
 export function AboutPage({
   snap,
   config,
   update,
+  updateState,
+  onCheck,
+  onDownload,
+  onInstall,
 }: {
   snap: Snapshot;
   config: Config;
   update: UpdateConfig;
+  updateState: { phase: string; version: string | null; progress: number | null; error: string | null };
+  onCheck: () => void;
+  onDownload: () => void;
+  onInstall: () => void;
 }) {
   return (
     <div className="stack">
@@ -802,6 +796,10 @@ export function AboutPage({
         version={snap.version}
         endpoint={config.updates.endpoint}
         onSaveEndpoint={(value) => update({ updates: { endpoint: value } })}
+        state={updateState}
+        onCheck={onCheck}
+        onDownload={onDownload}
+        onInstall={onInstall}
       />
       <Card title="关于 HexBench">
         <dl className="kv">

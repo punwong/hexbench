@@ -825,3 +825,96 @@ code,
   border-radius: 6px;
   padding: 4px 9px;
 }
+
+/* ---------- update indicator ---------- */
+
+.sidebar-bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 10px 10px;
+}
+
+.sidebar-bottom .sidebar-foot {
+  margin-top: 0;
+  padding: 0;
+}
+
+.update-pill {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  padding: 4px;
+}
+
+.update-pill.ready {
+  border-color: transparent;
+  background: transparent;
+  padding: 0;
+}
+
+.update-pill.error {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+.update-action {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.update-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.update-action:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.update-pill.ready .update-action {
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  padding: 9px 10px;
+}
+
+.update-pill.ready .update-action:hover {
+  filter: brightness(1.06);
+}
+
+.update-pill.error .update-action {
+  color: var(--danger);
+}
+
+.update-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  overflow: hidden;
+}
+
+.update-pill .update-bar {
+  margin: 4px 8px 6px;
+}
+
+.update-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}

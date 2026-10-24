@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
+  ArrowUpCircle,
   Crosshair,
   Gauge,
   Info,
   Keyboard,
   MessageSquare,
+  RefreshCw,
   Settings,
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
 
 import {
+  checkUpdate,
   createVirtualDesktop,
+  downloadUpdate,
   getSnapshot,
+  installDownloaded,
   openConfigFolder,
   refreshLayout,
   saveConfig,
@@ -36,6 +41,10 @@ import type { Patch } from "./pages";
 
 type Page = "overview" | "trigger" | "guards" | "phrases" | "hotkeys" | "general" | "about";
 
+/// Where the updater currently is: nothing, a version to grab, downloading,
+/// a package waiting for a restart, or a failure worth showing.
+type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
+
 const TITLES: Record<Page, { title: string; subtitle: string }> = {
   overview: { title: "概览", subtitle: "实时状态与显示器布局" },
   trigger: { title: "触发", subtitle: "触发带位置、比例与时序" },
@@ -52,6 +61,57 @@ export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(0);
+
+  const [updatePhase, setUpdatePhase] = useState<UpdatePhase>("idle");
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const runCheck = useCallback(async (silent: boolean) => {
+    setUpdatePhase("checking");
+    setUpdateError(null);
+    try {
+      const info = await checkUpdate();
+      if (!info) {
+        setUpdateVersion(null);
+        setUpdatePhase("idle");
+        return;
+      }
+      setUpdateVersion(info.version);
+      setUpdatePhase("available");
+    } catch (reason) {
+      setUpdateError(String(reason));
+      // A failed automatic check should stay quiet; a manual one should not.
+      setUpdatePhase(silent ? "idle" : "error");
+    }
+  }, []);
+
+  const runDownload = useCallback(async () => {
+    setUpdatePhase("downloading");
+    setUpdateProgress(0);
+    try {
+      await downloadUpdate(setUpdateProgress);
+      setUpdatePhase("ready");
+    } catch (reason) {
+      setUpdateError(String(reason));
+      setUpdatePhase("error");
+    }
+  }, []);
+
+  const runInstall = useCallback(async () => {
+    try {
+      // Hands the package to NSIS, which replaces the files and restarts us.
+      await installDownloaded();
+    } catch (reason) {
+      setUpdateError(String(reason));
+      setUpdatePhase("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void runCheck(true), 3000);
+    return () => window.clearTimeout(timer);
+  }, [runCheck]);
 
   const configRef = useRef<Config | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
@@ -180,7 +240,40 @@ export default function App() {
           <NavItem page="about" current={page} onClick={setPage} icon={<Info size={16} />} label="关于" />
         </div>
 
+        <div className="sidebar-bottom">
+        {(updatePhase === "available" ||
+          updatePhase === "downloading" ||
+          updatePhase === "ready" ||
+          updatePhase === "error") && (
+          <div className={`update-pill ${updatePhase}`}>
+            <button
+              type="button"
+              className="update-action"
+              disabled={updatePhase === "downloading"}
+              onClick={() => {
+                if (updatePhase === "available") void runDownload();
+                else if (updatePhase === "ready") void runInstall();
+                else setPage("about");
+              }}
+            >
+              {updatePhase === "ready" ? <RefreshCw size={14} /> : <ArrowUpCircle size={14} />}
+              <span>
+                {updatePhase === "available" && `发现 ${updateVersion}，点击下载`}
+                {updatePhase === "downloading" && `下载中 ${updateProgress ?? 0}%`}
+                {updatePhase === "ready" && "更新并重启"}
+                {updatePhase === "error" && "更新失败，点此查看"}
+              </span>
+            </button>
+            {updatePhase === "downloading" && (
+              <div className="update-bar">
+                <i style={{ width: `${updateProgress ?? 0}%` }} />
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="sidebar-foot">v{snap?.version ?? "0.1.0"} · MIT</div>
+        </div>
       </aside>
 
       <main className="main">
@@ -237,7 +330,20 @@ export default function App() {
             onOpenFolder={() => void openConfigFolder()}
           />
         ) : (
-          <AboutPage snap={snap} config={config} update={update} />
+          <AboutPage
+            snap={snap}
+            config={config}
+            update={update}
+            updateState={{
+              phase: updatePhase,
+              version: updateVersion,
+              progress: updateProgress,
+              error: updateError,
+            }}
+            onCheck={() => void runCheck(false)}
+            onDownload={() => void runDownload()}
+            onInstall={() => void runInstall()}
+          />
         )}
       </main>
 

@@ -131,6 +131,10 @@ impl Shared {
 struct AppState {
     shared: Arc<Mutex<Shared>>,
     config_path: PathBuf,
+    /// Installer bytes fetched by `update_download`, waiting for
+    /// `update_install`. Kept in memory (a couple of MB) so the user can
+    /// download first and restart later.
+    pending_update: Mutex<Option<Vec<u8>>>,
 }
 
 #[tauri::command]
@@ -739,22 +743,50 @@ async fn update_check(app: AppHandle) -> Result<Option<UpdateInfoDto>, String> {
 }
 
 #[tauri::command]
-async fn update_install(app: AppHandle) -> Result<(), String> {
+async fn update_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateInfoDto, String> {
     let updater = build_updater(&app)?;
     let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
         return Err("没有可用的更新".to_string());
     };
 
     let progress_app = app.clone();
-    update
-        .download_and_install(
+    let bytes = update
+        .download(
             move |chunk, total| {
                 let _ = progress_app.emit("update-progress", UpdateProgress { chunk, total });
             },
             || {},
         )
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    let info = UpdateInfoDto {
+        version: update.version.clone(),
+        notes: update.body.clone().unwrap_or_default(),
+        date: update.date.map(|date| date.to_string()).unwrap_or_default(),
+    };
+    *state.pending_update.lock().unwrap() = Some(bytes);
+    Ok(info)
+}
+
+#[tauri::command]
+async fn update_install(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let bytes = state
+        .pending_update
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| "还没有下载更新包".to_string())?;
+
+    let updater = build_updater(&app)?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Err("没有可用的更新".to_string());
+    };
+    // Verifies the minisign signature before handing the package to NSIS.
+    update.install(bytes).map_err(|error| error.to_string())
 }
 
 /// Let the user click any window to pick it.
@@ -1290,7 +1322,11 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
         ))
-        .manage(AppState { shared, config_path })
+        .manage(AppState {
+            shared,
+            config_path,
+            pending_update: Mutex::new(None),
+        })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             save_config,
@@ -1317,6 +1353,7 @@ pub fn run() {
             sync_push,
             sync_pull,
             update_check,
+            update_download,
             update_install,
             pick_app,
             toggle_phrases_panel
