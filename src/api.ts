@@ -264,6 +264,28 @@ export async function onUpdateStatus(
   return listen<UpdateStatus>("update-status", (event) => handler(event.payload));
 }
 
+/// Full diagnostic dump (runtime state, monitors, config, log tail) for bug reports.
+export async function diagnostics(): Promise<string> {
+  if (!isTauri) return "浏览器预览模式，没有诊断信息";
+  return invoke<string>("diagnostics");
+}
+
+export async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // Fallback for webviews without the async clipboard API.
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
 export async function pickApp(): Promise<void> {
   if (!isTauri) return;
   await invoke("pick_app");

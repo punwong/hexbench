@@ -152,6 +152,69 @@ struct UpdateStatus {
 }
 
 #[tauri::command]
+fn diagnostics(app: AppHandle, state: State<'_, AppState>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("HexBench {}\n", app.package_info().version));
+    out.push_str(&format!(
+        "when: {:?}  os: {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::env::consts::OS
+    ));
+
+    {
+        let shared = state.shared.lock().unwrap();
+        out.push_str(&format!(
+            "phase={} paused={} cursor={:?} hit={:?} guard={:?}\n",
+            shared.engine_phase, shared.paused, shared.cursor, shared.hit, shared.guard
+        ));
+        out.push_str(&format!(
+            "ticks={} fires={} sendFailures={} desktops={:?}\n",
+            shared.stats.ticks,
+            shared.stats.fires,
+            shared.stats.failures,
+            shared.desktop_count
+        ));
+        out.push_str("--- monitors ---\n");
+        for monitor in &shared.monitors {
+            out.push_str(&format!(
+                "#{} {}x{} at {},{}{}\n",
+                monitor.index,
+                monitor.w,
+                monitor.h,
+                monitor.x,
+                monitor.y,
+                if monitor.primary { " (primary)" } else { "" }
+            ));
+        }
+        out.push_str("--- config (password removed) ---\n");
+        let mut config = shared.config.clone();
+        config.sync.password.clear();
+        if let Ok(text) = serde_json::to_string_pretty(&config) {
+            out.push_str(&text);
+            out.push('\n');
+        }
+    }
+
+    if let Ok(dir) = app.path().app_log_dir() {
+        let path = dir.join("HexBench.log");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            out.push_str("--- log tail ---\n");
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(150);
+            for line in &lines[start..] {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+#[tauri::command]
 fn snapshot(state: State<'_, AppState>) -> Snapshot {
     let shared = state.shared.lock().unwrap();
     Snapshot {
@@ -1216,6 +1279,7 @@ fn spawn_engine(shared: Arc<Mutex<Shared>>) {
         let initial = shared.lock().unwrap().config.clone();
         let mut engine = Engine::new(initial, false);
         let mut tick_count: u64 = 0;
+        let mut last_guard: Option<String> = None;
 
         loop {
             tick_count += 1;
@@ -1259,6 +1323,23 @@ fn spawn_engine(shared: Arc<Mutex<Shared>>) {
                 }
 
                 state.engine_phase = engine.phase().to_string();
+                if let Some(tick) = &tick {
+                    if let Some(fire) = tick.fire {
+                        log::info!(
+                            "fire {:?} at {}ms (desktops={:?})",
+                            fire.hit.side,
+                            fire.at_ms,
+                            state.desktop_count
+                        );
+                    }
+                }
+                if tick.is_some() {
+                    let guard_now = state.guard.clone();
+                    if guard_now != last_guard {
+                        log::info!("guard {:?} -> {:?}", last_guard, guard_now);
+                        last_guard = guard_now;
+                    }
+                }
                 state.monitors = engine
                     .monitors()
                     .iter()
@@ -1340,7 +1421,20 @@ pub fn run() {
                 open_main(app);
             }
         }))
-        .plugin(tauri_plugin_log::Builder::new().build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                // Info is plenty: the diagnostic export ships the tail of this
+                // file, and dependency TRACE output (certificate dumps, HTTP
+                // internals) would drown our own lines.
+                .level(log::LevelFilter::Info)
+                .level_for("rustls", log::LevelFilter::Warn)
+                .level_for("reqwest", log::LevelFilter::Warn)
+                .level_for("hyper", log::LevelFilter::Warn)
+                .level_for("hyper_util", log::LevelFilter::Warn)
+                .level_for("tao", log::LevelFilter::Warn)
+                .level_for("wry", log::LevelFilter::Warn)
+                .build(),
+        )
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 // The panel remembers its own geometry (config.phrases.panel*)
@@ -1385,6 +1479,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            diagnostics,
             save_config,
             set_paused,
             set_test_mode,

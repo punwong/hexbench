@@ -14,6 +14,8 @@ import type {
   UpdateSettings,
 } from "./types";
 import {
+  copyText,
+  diagnostics,
   onAppPicked,
   pickApp,
   runningApps,
@@ -806,6 +808,8 @@ export function AboutPage({
   onDownload: () => void;
   onInstall: () => void;
 }) {
+  const [copyState, setCopyState] = useState("");
+
   return (
     <div className="stack">
       <UpdateCard
@@ -848,6 +852,25 @@ export function AboutPage({
           <dt>发送失败</dt>
           <dd>{snap.stats.failures}</dd>
         </dl>
+        <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center" }}>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => {
+              void (async () => {
+                try {
+                  await copyText(await diagnostics());
+                  setCopyState("已复制，可以直接粘贴给我");
+                } catch (reason) {
+                  setCopyState(`复制失败：${String(reason)}`);
+                }
+              })();
+            }}
+          >
+            复制诊断信息
+          </button>
+          {copyState && <span className="sub">{copyState}</span>}
+        </div>
       </Card>
     </div>
   );

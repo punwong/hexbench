@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_BUSY, QUN
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    IsZoomed, SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
     SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
@@ -479,6 +479,13 @@ pub fn foreground_is_fullscreen() -> bool {
     // The desktop itself always covers the monitor; it is not a fullscreen app.
     let class = window_class(hwnd);
     if class == "Progman" || class == "WorkerW" {
+        return false;
+    }
+    // A maximized window is not an immersive fullscreen app. With an
+    // auto-hidden taskbar it covers the monitor exactly, which used to look
+    // like fullscreen and silently disabled triggering whenever such a window
+    // was in front (i.e. as soon as our own window was closed).
+    if unsafe { IsZoomed(hwnd) } != 0 {
         return false;
     }
 

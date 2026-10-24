@@ -483,7 +483,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | 凭证 | DPAPI 加密存 `credentials.bin`，不进导出、不进同步 |
 | 热键 | `RegisterHotKey`，失败时提示占用并要求改键；不静默降级 |
 | 单实例 / 自启 | `tauri-plugin-single-instance` / `tauri-plugin-autostart`；自启带 `--autostart` 参数，不弹窗 |
-| 日志 | `tauri-plugin-log`，滚动保留 7 天，不记录光标坐标 |
+| 日志 | `tauri-plugin-log`（Info 级，依赖库降到 Warn）：记录防误触状态变化与每次触发；关于页可一键复制诊断（状态 + 显示器 + 配置 + 日志尾部） |
 | 更新 | `tauri-plugin-updater` + 签名；关于页手动检查 + 可选自动检查 |
 | 分发 | GitHub Actions 构建 → SignPath Foundation 免费 OSS 签名 → NSIS → winget / Scoop |
 | 测试 | `hexbench-core` 单测（几何、配置、状态机）+ `--layout` CLI 回放布局并打印可触发区间 |

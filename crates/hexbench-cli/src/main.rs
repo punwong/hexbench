@@ -35,6 +35,35 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Live engine probe: prints every tick instead of switching desktops.
+    // Useful when a trigger works on one machine and not on another.
+    if std::env::args().any(|arg| arg == "--probe") {
+        let seconds: u64 = std::env::args()
+            .skip_while(|arg| arg != "--probe")
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10);
+        let path = config::default_path().unwrap_or_else(|| PathBuf::from("config.json"));
+        let (loaded, _) = config::load(&path);
+        let mut engine = hexbench_core::engine::Engine::new(loaded, true);
+        let started = Instant::now();
+        while started.elapsed().as_secs() < seconds {
+            let tick = engine.tick();
+            println!(
+                "{:>5}ms cursor={:?} hit={} guard={} fire={}",
+                tick.at_ms,
+                tick.cursor,
+                tick.hit
+                    .map(|hit| format!("{:?}@{}", hit.side, hit.edge_x))
+                    .unwrap_or_else(|| "-".to_string()),
+                tick.guard.unwrap_or("-"),
+                tick.fire.is_some()
+            );
+            sleep(Duration::from_millis(50));
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // WebDAV round trip, for checking a server without opening the UI.
     if let Some(index) = std::env::args().position(|arg| arg == "--sync-test") {
         let rest: Vec<String> = std::env::args().skip(index + 1).collect();
