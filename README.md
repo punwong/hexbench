@@ -1,5 +1,7 @@
 # HexBench · 海克斯
 
+**[English](README.en.md) · 中文**
+
 > **按显示器最外侧边缘切换 Windows 虚拟桌面** · Multi-monitor aware virtual desktop switching
 
 `设计阶段` · `Windows 11 主目标 / Windows 10 尽力` · `Tauri 2 + React` · `现代化界面` · `开源`
