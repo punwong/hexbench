@@ -16,7 +16,6 @@ export interface TriggerSettings {
 
 export interface GuardSettings {
   skipWhenButtonDown: boolean;
-  skipFullscreen: boolean;
   excludeTaskbar: boolean;
   skipWhenLocked: boolean;
   processBlacklist: string[];

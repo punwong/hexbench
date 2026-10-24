@@ -458,12 +458,7 @@ export function GuardsPage({
             onChange={(value) => update({ guard: { skipWhenButtonDown: value } })}
           />
         </Row>
-        <Row label="前台全屏时" hint="游戏、视频、PPT 放映">
-          <Toggle
-            checked={config.guard.skipFullscreen}
-            onChange={(value) => update({ guard: { skipFullscreen: value } })}
-          />
-        </Row>
+
         <Row label="光标在任务栏上" hint="开始按钮、托盘、显示桌面都不抢">
           <Toggle
             checked={config.guard.excludeTaskbar}
@@ -784,8 +779,7 @@ const GUARD_LABEL: Record<string, string> = {
   "": "无",
   locked: "锁屏",
   button: "按着鼠标键",
-  fullscreen: "前景是全屏应用",
-  "fullscreen-rect": "前景窗口无标题栏且铺满屏幕",
+
   taskbar: "光标在任务栏上",
   blacklist: "前景应用在黑名单",
   paused: "已暂停",

@@ -18,7 +18,6 @@ const demoConfig: Config = {
   },
   guard: {
     skipWhenButtonDown: true,
-    skipFullscreen: true,
     excludeTaskbar: true,
     skipWhenLocked: true,
     processBlacklist: [],

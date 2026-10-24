@@ -149,11 +149,7 @@ impl Engine {
         if guard.skip_when_button_down && sys::mouse_button_down() {
             return Some("button");
         }
-        if guard.skip_fullscreen {
-            if let Some(kind) = sys::foreground_fullscreen_kind() {
-                return Some(kind);
-            }
-        }
+
         if guard.exclude_taskbar && sys::cursor_over_taskbar(x, y) {
             return Some("taskbar");
         }

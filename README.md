@@ -69,7 +69,7 @@ rightExposed(M, y) = MonitorFromPoint({ M.right,    y }, MONITOR_DEFAULTTONULL) 
 ```
 每 50 ms:
     (x, y) = GetCursorPos
-    if 已暂停 / 冷却中 / 鼠标按键按下 / 前台全屏 / 前台进程在黑名单 / 锁屏 → 跳过
+    if 已暂停 / 冷却中 / 鼠标按键按下 / 前台进程在黑名单 / 锁屏 → 跳过
 
     M = 包含 (x, y) 的那块显示器
     if M 不存在 → 跳过
@@ -173,7 +173,7 @@ rightExposed(M, y) = MonitorFromPoint({ M.right,    y }, MONITOR_DEFAULTTONULL) 
 - **不抢焦点** —— 面板是 `WS_EX_NOACTIVATE` 窗口，点击时焦点仍留在聊天输入框
 - **话术可编辑** —— 主界面「快捷语」里加 / 改 / 删，面板 1.5 秒内自动同步
 
-体验细节：托盘常驻（左键打开主界面、右键菜单）、开机自启、防误触（拖拽 / 全屏 / 进程黑名单 / 锁屏）、切换后光标回位、暂停热键、切换失败提示、首次使用引导、亮暗主题跟随系统。
+体验细节：托盘常驻（左键打开主界面、右键菜单）、开机自启、防误触（拖拽 / 进程黑名单 / 锁屏）、切换后光标回位、暂停热键、切换失败提示、首次使用引导、亮暗主题跟随系统。
 
 ---
 
@@ -301,7 +301,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | --- | --- |
 | **概览**（工具内） | 主开关 + 运行状态 + **显示器布局图**（视觉主角）+ 测试模式入口 + 本次运行切换次数 |
 | **触发**（工具内） | 触发带比例 / 位置（底部·顶部）、停留阈值、冷却时间、轮询间隔、左右侧开关、单屏开关 |
-| **防误触**（工具内） | 拖拽时禁用、全屏时禁用、任务栏排除、进程黑名单、锁屏暂停 |
+| **防误触**（工具内） | 拖拽时禁用、任务栏排除、进程黑名单、锁屏暂停 |
 | **通用**（全局） | 主题、语言、开机自启、暂停热键、日志目录 |
 | **同步**（全局） | WebDAV 地址 / 用户名 / 密码、上传、下载（v0.4） |
 | **关于**（全局） | 版本、检查更新、自检（发送一次切换并报告结果）、许可证、开源致谢 |
@@ -402,7 +402,6 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | `trigger.restoreCursor` | bool | `true` | — | 触发后内推光标 |
 | `trigger.restoreOffsetPx` | u32 | `24` | 8–200 | 内推距离，同时作为复位阈值 |
 | `guard.skipWhenButtonDown` | bool | `true` | — | 拖拽 / 按住时不触发 |
-| `guard.skipFullscreen` | bool | `true` | — | 前台全屏时不触发 |
 | `guard.excludeTaskbar` | bool | `true` | — | 光标在任务栏上不触发 |
 | `guard.skipWhenLocked` | bool | `true` | — | 锁屏 / 安全桌面时暂停 |
 | `guard.processBlacklist` | string[] | `[]` | ≤ 50 项 | 进程名，不区分大小写 |
@@ -475,7 +474,6 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | 触发检测 | 状态机 + 50 ms 轮询；`dwell` 计时用单调时钟，不用墙钟；触发后需离开触发区才复位，**卡满 3 秒强制复位**防死锁 |
 | 切换桌面 | 一次 `SendInput` 提交 4 个按键，检查返回值；失败记 `GetLastError` + 一次性提示 |
 | 虚拟桌面数量 | 读 `HKCU\...\Explorer\VirtualDesktops\VirtualDesktopIDs`（每个 GUID 16 字节）+ `CurrentVirtualDesktop` 定位当前是第几个；只有一个时界面提示并提供「新建虚拟桌面」（`SendInput` Win+Ctrl+D），新建后按真实步数（Windows 把新桌面追加在末尾）切回原桌面 |
-| 全屏检测 | `SHQueryUserNotificationState`（`QUNS_RUNNING_D3D_FULL_SCREEN` / `QUNS_BUSY` / `QUNS_PRESENTATION_MODE`）+ 前台窗口矩形覆盖显示器（排除桌面、任务栏） |
 | 锁屏检测 | `OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS)` 失败即视为锁屏/安全桌面，暂停 |
 | 黑名单 | `GetForegroundWindow` → `GetWindowThreadProcessId` → `QueryFullProcessImageNameW`；提权进程取不到名字时退回窗口类名 |
 | 布局变化 | 引擎线程建 `HWND_MESSAGE` 窗口跑消息循环，监听 `WM_DISPLAYCHANGE` / `WM_SETTINGCHANGE` / `WM_DPICHANGED`，**去抖 500 ms** 后重算 |
@@ -515,7 +513,6 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | 任务栏 | 底 / 顶 / 左 / 右、自动隐藏 | 排除是否生效；"显示桌面"角 |
 | 会话 | 锁屏、切换用户、RDP、休眠唤醒 | 不误切；恢复后重算 |
 | 提权 | 任务管理器、管理员终端、UAC | `SendInput` 是否被拦；失败是否提示 |
-| 全屏 | 独占游戏、视频全屏、PPT 放映 | 跳过；光标被锁时不连切 |
 | 边界 | 第一个 / 最后一个桌面、快速连推、停在角落 | 不连切；无桌面可切时静默 |
 | 输入 | 拖拽、滚轮、输入法候选框、放大镜 | 不误触 |
 | 长稳 | 72 h、反复插拔显示器 | 句柄 / 内存不增长 |
@@ -545,7 +542,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 **v0.1 核心（无界面，先验证手感）**
 - [x] `hexbench-core`：显示器枚举 + 探头分段 + 触发带（`cargo test` 覆盖第三节的布局）
 - [x] 触发状态机（dwell / 冷却 / 离开复位 / 内推）
-- [x] 任务栏排除、锁屏 / 全屏跳过
+- [x] 任务栏排除、锁屏跳过
 - [x] 进程黑名单（从运行中的应用列表点选，按 exe 名不区分大小写匹配）
 - [x] `SendInput` 一次提交 + 失败检测（真机切换待手动确认）
 - [x] 配置读写（JSON + 原子写 + `.bak` 回退）

@@ -216,7 +216,7 @@ impl Sides {
 #[serde(default, rename_all = "camelCase")]
 pub struct GuardSettings {
     pub skip_when_button_down: bool,
-    pub skip_fullscreen: bool,
+
     pub exclude_taskbar: bool,
     pub skip_when_locked: bool,
     pub process_blacklist: Vec<String>,
@@ -227,7 +227,7 @@ impl Default for GuardSettings {
     fn default() -> Self {
         Self {
             skip_when_button_down: true,
-            skip_fullscreen: true,
+
             exclude_taskbar: true,
             skip_when_locked: true,
             process_blacklist: Vec::new(),
