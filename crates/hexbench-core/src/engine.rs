@@ -14,6 +14,8 @@ use crate::{sys, Rect};
 /// What happened during one tick, for logging.
 #[derive(Debug, Clone, Copy)]
 pub struct Tick {
+    /// Machine phase before this tick: idle / armed / disarmed.
+    pub phase: &'static str,
     pub at_ms: u64,
     pub cursor: Option<(i32, i32)>,
     pub hit: Option<Hit>,
@@ -101,6 +103,11 @@ impl Engine {
         self.stats
     }
 
+    /// Current trigger-machine phase, for diagnostics.
+    pub fn phase(&self) -> &'static str {
+        self.machine.phase_name()
+    }
+
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
     }
@@ -174,6 +181,7 @@ impl Engine {
         self.stats.ticks += 1;
 
         let mut tick = Tick {
+            phase: self.machine.phase_name(),
             at_ms,
             cursor: None,
             hit: None,

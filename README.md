@@ -472,7 +472,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | 边缘判定 | 探头分段：断点取所有 `top`/`bottom`，逐段测中点，合并暴露段；结果缓存，布局变化才重算 |
 | 触发带 | `M.bottom - M.height × ratio` 到 `M.bottom`，默认 10%；`position=top` 时贴 `M.top` |
 | 任务栏排除 | `WindowFromPoint` 判类名 `Shell_TrayWnd` / `Shell_SecondaryTrayWnd` / `TrayNotifyWnd` / `MSTaskSwWClass`；不靠 `rcWork` 硬切，保住角落手感 |
-| 触发检测 | 状态机 + 50 ms 轮询；`dwell` 计时用单调时钟，不用墙钟 |
+| 触发检测 | 状态机 + 50 ms 轮询；`dwell` 计时用单调时钟，不用墙钟；触发后需离开触发区才复位，**卡满 3 秒强制复位**防死锁 |
 | 切换桌面 | 一次 `SendInput` 提交 4 个按键，检查返回值；失败记 `GetLastError` + 一次性提示 |
 | 虚拟桌面数量 | 读 `HKCU\...\Explorer\VirtualDesktops\VirtualDesktopIDs`（每个 GUID 16 字节）+ `CurrentVirtualDesktop` 定位当前是第几个；只有一个时界面提示并提供「新建虚拟桌面」（`SendInput` Win+Ctrl+D），新建后按真实步数（Windows 把新桌面追加在末尾）切回原桌面 |
 | 全屏检测 | `SHQueryUserNotificationState`（`QUNS_RUNNING_D3D_FULL_SCREEN` / `QUNS_BUSY` / `QUNS_PRESENTATION_MODE`）+ 前台窗口矩形覆盖显示器（排除桌面、任务栏） |

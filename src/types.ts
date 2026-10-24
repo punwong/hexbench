@@ -140,6 +140,7 @@ export interface Snapshot {
   configPath: string;
   autostart: boolean;
   desktopCount: number | null;
+  enginePhase: string;
   accent: string | null;
   hotkeyError: string | null;
 }

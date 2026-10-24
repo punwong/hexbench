@@ -773,6 +773,23 @@ function UpdateCard({
     </Card>
   );
 }
+const PHASE_LABEL: Record<string, string> = {
+  idle: "空闲",
+  armed: "待触发（光标已在触发区）",
+  disarmed: "已触发，等待离开触发区",
+};
+
+const GUARD_LABEL: Record<string, string> = {
+  "": "无",
+  locked: "锁屏",
+  button: "按着鼠标键",
+  fullscreen: "前景是全屏窗口",
+  taskbar: "光标在任务栏上",
+  blacklist: "前景应用在黑名单",
+  paused: "已暂停",
+  disabled: "总开关关闭",
+};
+
 export function AboutPage({
   snap,
   config,
@@ -819,6 +836,12 @@ export function AboutPage({
 
       <Card title="诊断">
         <dl className="kv">
+          <dt>引擎状态</dt>
+          <dd>{PHASE_LABEL[snap.enginePhase] ?? snap.enginePhase}</dd>
+          <dt>当前命中</dt>
+          <dd>{snap.hit ? `${snap.hit.side === "left" ? "左" : "右"}边缘 · 第 ${snap.hit.monitor + 1} 块屏` : "无"}</dd>
+          <dt>防误触拦截</dt>
+          <dd>{GUARD_LABEL[snap.guard ?? ""] ?? (snap.guard ?? "无")}</dd>
           <dt>轮询次数</dt>
           <dd>{snap.stats.ticks}</dd>
           <dt>触发次数</dt>

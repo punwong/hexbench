@@ -94,6 +94,7 @@ function mockSnapshot(): Snapshot {
     configPath: "C:\\Users\\you\\AppData\\Roaming\\io.github.hexbench\\config.json",
     autostart: mockAutostart,
     desktopCount: mockDesktops,
+    enginePhase: hit ? "armed" : "idle",
     accent: null,
     hotkeyError: null,
   };

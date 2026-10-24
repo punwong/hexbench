@@ -86,6 +86,7 @@ struct Snapshot {
     config_path: String,
     autostart: bool,
     desktop_count: Option<usize>,
+    engine_phase: String,
     accent: Option<String>,
     hotkey_error: Option<String>,
 }
@@ -102,6 +103,7 @@ struct Shared {
     stats: StatsDto,
     autostart: bool,
     desktop_count: Option<usize>,
+    engine_phase: String,
     accent: Option<String>,
     hotkey_error: Option<String>,
     refresh_requested: bool,
@@ -118,6 +120,7 @@ impl Shared {
             guard: None,
             monitors: Vec::new(),
             regions: Vec::new(),
+            engine_phase: "idle".to_string(),
             stats: StatsDto { ticks: 0, fires: 0, failures: 0 },
             autostart: false,
             desktop_count: None,
@@ -169,6 +172,7 @@ fn snapshot(state: State<'_, AppState>) -> Snapshot {
         config_path: state.config_path.display().to_string(),
         autostart: shared.autostart,
         desktop_count: shared.desktop_count,
+        engine_phase: shared.engine_phase.clone(),
         accent: shared.accent.clone(),
         hotkey_error: shared.hotkey_error.clone(),
     }
@@ -1171,7 +1175,17 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             "open" => open_main(app),
             "quit" => {
                 QUITTING.store(true, Ordering::SeqCst);
-                app.exit(0);
+                // Leaving the event-loop callback before exiting, plus a hard
+                // watchdog: a hung shutdown otherwise looks like a frozen app
+                // with no way out.
+                let handle = app.clone();
+                thread::spawn(move || {
+                    thread::spawn(|| {
+                        thread::sleep(Duration::from_secs(3));
+                        std::process::exit(0);
+                    });
+                    handle.exit(0);
+                });
             }
             "test" => {
                 let state = app.state::<AppState>();
@@ -1244,6 +1258,7 @@ fn spawn_engine(shared: Arc<Mutex<Shared>>) {
                     }
                 }
 
+                state.engine_phase = engine.phase().to_string();
                 state.monitors = engine
                     .monitors()
                     .iter()

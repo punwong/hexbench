@@ -59,6 +59,11 @@ impl Default for Timing {
     }
 }
 
+/// If the cursor never leaves the zone after a trigger (parked on the edge,
+/// or the position cannot change), the machine would stay disarmed forever.
+/// Force a reset after this long so a second trigger is always possible.
+const DISARMED_WATCHDOG_MS: u64 = 3000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
@@ -87,6 +92,15 @@ impl Machine {
 
     pub fn is_idle(&self) -> bool {
         self.phase == Phase::Idle
+    }
+
+    /// `idle` / `armed` / `disarmed`, for the diagnostics panel.
+    pub fn phase_name(&self) -> &'static str {
+        match self.phase {
+            Phase::Idle => "idle",
+            Phase::Armed => "armed",
+            Phase::Disarmed => "disarmed",
+        }
     }
 
     /// Feed one observation. `hit` is `None` when the cursor is not in a zone
@@ -125,7 +139,9 @@ impl Machine {
                 }
             },
             Phase::Disarmed => {
-                if hit.is_none() {
+                let stalled = now_ms.saturating_sub(self.last_fire.unwrap_or(now_ms))
+                    >= DISARMED_WATCHDOG_MS;
+                if hit.is_none() || stalled {
                     self.phase = Phase::Idle;
                 }
             }
@@ -207,6 +223,25 @@ mod tests {
         // After the cooldown it arms again and needs a fresh dwell.
         m.step(Some(hit_left()), 650, timing());
         assert!(m.step(Some(hit_left()), 750, timing()).is_some());
+    }
+
+    #[test]
+    fn watchdog_rearms_a_parked_cursor() {
+        let mut m = Machine::new();
+        m.step(Some(hit_left()), 0, timing());
+        assert!(m.step(Some(hit_left()), 100, timing()).is_some());
+
+        // Parked in the zone: stays disarmed for a while.
+        for t in (150..2900).step_by(50) {
+            assert!(m.step(Some(hit_left()), t, timing()).is_none());
+        }
+        // Watchdog releases it, then a normal dwell fires again.
+        assert!(m.step(Some(hit_left()), 3200, timing()).is_none());
+        assert!(m.step(Some(hit_left()), 3900, timing()).is_none());
+        assert!(
+            m.step(Some(hit_left()), 4050, timing()).is_some(),
+            "watchdog must make a stuck trigger fire again"
+        );
     }
 
     #[test]
