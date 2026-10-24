@@ -623,7 +623,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 - [x] `tauri-plugin-updater` 自动更新（签名校验 + NSIS passive 静默安装 + 自动重启）
 - [x] GitHub Actions：CI（构建 / 测试 / clippy）+ 打 tag 自动出包并发布 latest.json
 - [ ] SignPath 代码签名（需要组织账号审批）
-- [ ] winget / Scoop 上架
+- [x] winget 清单（本地校验通过，待提交 PR）`r`n- [ ] Scoop 上架
 - [ ] 中英文文档 + 实测资源占用数据
 
 ---
@@ -741,6 +741,15 @@ cargo run -p hexbench-cli -- run --dry-run   # 跑引擎，只打印不切换
 - 私钥不要进仓库（`.tauri/` 已忽略）；**丢了私钥就再也无法给老版本推更新**
 - 清单里的版本号必须和安装包实际版本一致，否则 updater 会以「签名版本不符」拒绝（这是防篡改校验）
 - 端点必须是 https；本地联调时才临时开 `dangerousInsecureTransportProtocol`
+
+---
+### winget
+
+`winget/` 下已经按 [winget-pkgs](https://github.com/microsoft/winget-pkgs) 的目录结构放好了三份清单（version / installer / locale），本地用 `winget validate --manifest winget\manifests\p\punwong\HexBench\0.1.3` 验证通过。
+
+提交方式：把 `winget/manifests/p/punwong/HexBench/0.1.3` 整个目录复制到 fork 出来的 winget-pkgs 仓库的同名路径，开 PR 等审核。之后就能 `winget install punwong.HexBench`。
+
+每次发版都要重新生成清单：改版本号、更新 `InstallerUrl`、用 `Get-FileHash` 填新的 `InstallerSha256`。
 
 ---
 ## 许可证
