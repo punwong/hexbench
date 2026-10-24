@@ -1337,6 +1337,18 @@ fn spawn_engine(shared: Arc<Mutex<Shared>>) {
                     let guard_now = state.guard.clone();
                     if guard_now != last_guard {
                         log::info!("guard {:?} -> {:?}", last_guard, guard_now);
+                        if guard_now.as_deref() == Some("fullscreen")
+                            || guard_now.as_deref() == Some("fullscreen-rect")
+                        {
+                            if let Some(info) = hexbench_core::sys::foreground_window_info() {
+                                log::info!(
+                                    "  fullscreen window: {} | {} | {}",
+                                    info.process,
+                                    info.class,
+                                    info.title
+                                );
+                            }
+                        }
                         last_guard = guard_now;
                     }
                 }

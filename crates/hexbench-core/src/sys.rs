@@ -33,7 +33,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     IsZoomed, SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::geometry::EdgeProbe;
@@ -459,7 +460,14 @@ pub fn is_locked() -> bool {
 }
 
 /// `true` when the foreground window covers a whole monitor.
+/// Why the foreground counts as fullscreen, if it does: `fullscreen` comes
+/// from the shell state (a real immersive app), `fullscreen-rect` from a
+/// borderless window that covers the monitor.
 pub fn foreground_is_fullscreen() -> bool {
+    foreground_fullscreen_kind().is_some()
+}
+
+pub fn foreground_fullscreen_kind() -> Option<&'static str> {
     let mut state: i32 = 0;
     // SAFETY: out-pointer to a local.
     let hr = unsafe { SHQueryUserNotificationState(&mut state) };
@@ -468,48 +476,60 @@ pub fn foreground_is_fullscreen() -> bool {
             || state == QUNS_RUNNING_D3D_FULL_SCREEN
             || state == QUNS_PRESENTATION_MODE)
     {
-        return true;
+        return Some("fullscreen");
     }
 
     // SAFETY: handle + local rect.
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_null() {
-        return false;
+        return None;
     }
     // The desktop itself always covers the monitor; it is not a fullscreen app.
     let class = window_class(hwnd);
     if class == "Progman" || class == "WorkerW" {
-        return false;
+        return None;
     }
     // A maximized window is not an immersive fullscreen app. With an
     // auto-hidden taskbar it covers the monitor exactly, which used to look
     // like fullscreen and silently disabled triggering whenever such a window
     // was in front (i.e. as soon as our own window was closed).
     if unsafe { IsZoomed(hwnd) } != 0 {
-        return false;
+        return None;
+    }
+    // A window with a title bar is a normal app even when it happens to fill
+    // the monitor (some clients size themselves that way without being
+    // "maximized"). Immersive fullscreen games and video players drop the
+    // caption, so this is what separates the two.
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    if style & (WS_CAPTION as u32) == (WS_CAPTION as u32) {
+        return None;
     }
 
     let mut rect = RECT::default();
     // SAFETY: out-pointer to a local rect.
     if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
-        return false;
+        return None;
     }
     // SAFETY: the window belongs to this desktop.
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     if monitor.is_null() {
-        return false;
+        return None;
     }
     // SAFETY: plain-old-data struct, zeroed then cbSize set.
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     // SAFETY: cbSize is set and `info` is correctly sized.
     if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
-        return false;
+        return None;
     }
-    rect.left <= info.rcMonitor.left
+    if rect.left <= info.rcMonitor.left
         && rect.top <= info.rcMonitor.top
         && rect.right >= info.rcMonitor.right
         && rect.bottom >= info.rcMonitor.bottom
+    {
+        return Some("fullscreen-rect");
+    }
+    None
 }
 
 /// Move the cursor (used to nudge it back inside after a switch).
