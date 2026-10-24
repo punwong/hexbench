@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>HexBench</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+
+      #root {
+        position: fixed;
+        inset: 0;
+      }
+
+      .band {
+        position: absolute;
+        background: rgba(37, 99, 235, 0.1);
+        border-top: 1px dashed rgba(37, 99, 235, 0.45);
+        animation: zone-in 160ms ease-out;
+      }
+
+      .zone {
+        position: absolute;
+        border-radius: 3px;
+        background: rgba(37, 99, 235, 0.32);
+        border: 1px solid rgba(37, 99, 235, 0.85);
+        box-shadow: 0 0 14px rgba(37, 99, 235, 0.45);
+        animation: zone-in 160ms ease-out;
+      }
+
+      @keyframes zone-in {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/overlay.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HexBench · 海克斯 · 方案</title>
+<style>
+  :root{
+    --bg:#ffffff; --bg2:#f6f8fa; --bg3:#eef2f6; --bg4:#0d1117;
+    --fg:#1f2328; --muted:#59636e; --border:#d1d9e0;
+    --accent:#0969da; --accent-soft:#ddf4ff;
+    --warn:#9a6700; --warn-soft:#fff8c5;
+    --ok:#1a7f37; --no:#cf222e;
+    --shadow:0 1px 3px rgba(31,35,40,.08);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0d1117; --bg2:#151b23; --bg3:#1c232b; --bg4:#010409;
+      --fg:#e6edf3; --muted:#9198a1; --border:#3d444d;
+      --accent:#4493f8; --accent-soft:#121d2f;
+      --warn:#d29922; --warn-soft:#282215;
+      --ok:#3fb950; --no:#f85149;
+      --shadow:0 1px 3px rgba(0,0,0,.4);
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",Roboto,sans-serif;
+    font-size:15.5px;line-height:1.78;-webkit-font-smoothing:antialiased}
+  .topbar{height:4px;background:linear-gradient(90deg,#0969da,#3fb950,#bf8700)}
+  .wrap{max-width:920px;margin:0 auto;padding:44px 28px 90px}
+
+  header{margin-bottom:34px;padding-bottom:26px;border-bottom:1px solid var(--border)}
+  .kicker{font-size:12px;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:10px}
+  h1{margin:0 0 10px;font-size:38px;line-height:1.2;font-weight:700;letter-spacing:-.02em}
+  .sub{font-size:16.5px;color:var(--muted);margin:0 0 18px}
+  .badges{display:flex;flex-wrap:wrap;gap:8px}
+  .badge{font-size:12.5px;font-weight:600;padding:4px 11px;border-radius:999px;border:1px solid var(--border);background:var(--bg2);color:var(--muted)}
+  .badge.acc{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+
+  h2{font-size:24px;margin:52px 0 16px;padding-bottom:9px;border-bottom:1px solid var(--border);font-weight:650;letter-spacing:-.01em}
+  h3{font-size:18px;margin:30px 0 12px;font-weight:650}
+  p{margin:0 0 15px}
+  ul{margin:0 0 15px;padding-left:22px}
+  li{margin:6px 0}
+  li::marker{color:var(--muted)}
+  strong,b{font-weight:650}
+  a{color:var(--accent)}
+
+  .lead{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px 22px;font-size:16.5px;line-height:1.75;box-shadow:var(--shadow)}
+  .lead b{color:var(--accent)}
+
+  .tw{overflow-x:auto;margin:0 0 20px;border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;font-size:14px}
+  th,td{padding:11px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border)}
+  th{background:var(--bg2);font-weight:650;font-size:13px;white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:nth-child(even){background:color-mix(in srgb,var(--bg2) 55%,transparent)}
+  td:first-child{font-weight:600}
+  .y{color:var(--ok);font-weight:700}
+  .n{color:var(--no);font-weight:700}
+  .p{color:var(--warn);font-weight:700}
+
+  code{font-family:ui-monospace,"Cascadia Code",Consolas,"Microsoft YaHei",monospace;font-size:.88em;background:var(--bg3);padding:2px 6px;border-radius:5px;border:1px solid var(--border)}
+  pre{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto;margin:0 0 20px}
+  pre code{background:none;border:none;padding:0;font-size:13px;line-height:1.72;white-space:pre}
+  pre.term{background:var(--bg4);border-color:#30363d;color:#c9d1d9}
+  pre.term code{color:#c9d1d9}
+  pre.term .ok{color:#3fb950}
+  pre.term .no{color:#f85149}
+
+  .note{display:flex;gap:11px;padding:14px 17px;border-radius:10px;background:var(--warn-soft);border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);font-size:14.5px;margin:0 0 20px}
+  .key{display:flex;gap:11px;padding:15px 18px;border-radius:10px;background:var(--accent-soft);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);font-size:15px;margin:0 0 20px;line-height:1.72}
+  .note .ic,.key .ic{flex:0 0 auto;font-size:16px;line-height:1.5}
+
+  .cards{display:grid;gap:11px;margin:0 0 22px}
+  .card{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start;padding:15px 17px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow)}
+  .card .num{width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;font-size:12.5px;font-weight:700;display:flex;align-items:center;justify-content:center;margin-top:2px}
+  .card .t{font-weight:650;margin-bottom:3px}
+  .card .d{font-size:14px;color:var(--muted);line-height:1.65}
+
+  .vs{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 22px}
+  @media(max-width:640px){.vs{grid-template-columns:1fr}}
+  .vs>div{padding:16px 18px;border-radius:10px;border:1px solid var(--border);background:var(--bg2)}
+  .vs .h{font-size:12.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+  .vs .big{font-size:26px;font-weight:700;line-height:1.15;margin-bottom:4px}
+  .vs .s{font-size:13.5px;color:var(--muted)}
+
+  .toc{margin:0 0 32px;padding:15px 20px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;font-size:14px}
+  .toc .h{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:9px}
+  .toc a{color:var(--accent);text-decoration:none;margin-right:16px;display:inline-block;line-height:2}
+  .toc a:hover{text-decoration:underline}
+
+  .phase{margin:0 0 18px;padding:14px 18px;border-left:3px solid var(--accent);background:var(--bg2);border-radius:0 10px 10px 0}
+  .phase .ph{font-weight:700;font-size:15px;margin-bottom:6px}
+  .phase ul{margin:0;padding-left:20px}
+  .phase li{margin:4px 0;font-size:14.5px}
+
+  footer{margin-top:60px;padding-top:22px;border-top:1px solid var(--border);font-size:13px;color:var(--muted)}
+  .src{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="topbar"></div>
+<div class="wrap">
+
+<header>
+  <div class="kicker">Project Plan · 方案</div>
+  <h1>HexBench · 海克斯</h1>
+  <p class="sub">按显示器最外侧边缘切换 Windows 虚拟桌面<br><span style="font-size:14px">Multi-monitor aware virtual desktop switching</span></p>
+  <div class="badges">
+    <span class="badge">设计阶段</span>
+    <span class="badge">Windows 11 主目标 / 10 尽力</span>
+    <span class="badge">Tauri 2 + React</span>
+    <span class="badge">探头分段</span>
+    <span class="badge">可扩展主界面</span>
+    <span class="badge">WebDAV 同步</span>
+    <span class="badge acc">开源</span>
+  </div>
+</header>
+
+<div class="toc">
+  <div class="h">目录</div>
+  <a href="#why">一 · 为什么做这个</a><a href="#core">二 · 核心思路</a><a href="#verify">三 · 几何验证</a><a href="#what">四 · 功能</a><a href="#scope">五 · 范围与成功标准</a><a href="#stack">六 · 技术栈</a><a href="#design">七 · 主界面</a><a href="#config">八 · 配置与同步</a><a href="#res">九 · 资源占用</a><a href="#impl">十 · 实现要点</a><a href="#diff">十一 · 对比</a><a href="#test">十二 · 测试矩阵</a><a href="#risk">十三 · 风险</a><a href="#road">十四 · 路线图</a><a href="#decide">十五 · 决策清单</a>
+</div>
+
+<h2 id="intro">一句话介绍</h2>
+<div class="lead">
+  一个常驻托盘的 Windows 效率工具箱。<b>第一个工具</b>：鼠标推到屏幕最外侧边缘的角落区，就切换虚拟桌面。多显示器横竖混排、任意摆放都零配置，插拔副屏自动适应；配一套刻意设计过的图形界面，配置可经 <b>WebDAV</b> 跨设备同步。
+</div>
+
+<h2 id="why">一、为什么做这个</h2>
+
+<h3>起点：我用 Quicker 做了一个，它能用</h3>
+<p>那个动作靠<b>手工录入四个外角点</b>工作：竖屏的左上、左下 + 横屏的右上、右下。配合「边缘上限 90% / 下限 100%」，把触发区限制在各屏最底部的 10%。</p>
+<p>这个做法在数学上是正确的，而且挺巧——左边缘的垂直限位用竖屏自己的上下边界，右边缘用横屏自己的上下边界，两块屏各算各的，互不干扰。<b>实测零误触发。</b></p>
+
+<h3>但它有绕不过去的成本</h3>
+<div class="tw"><table>
+  <thead><tr><th>问题</th><th>代价</th></tr></thead>
+  <tbody>
+    <tr><td>必须装 Quicker 并保持常驻</td><td>本机实测 <b>210 MB</b> 工作集（可用内存只剩 3.4 GB / 31.8 GB）</td></tr>
+    <tr><td>首次使用要手工录 4 个角点</td><td>插拔副屏、改分辨率、转屏、换电脑，<b>全部要重录</b></td></tr>
+    <tr><td>按主机名分别保存方案</td><td>换台机器等于从零开始</td></tr>
+    <tr><td>界面是通用表单</td><td>没有针对这个功能的界面设计</td></tr>
+  </tbody>
+</table></div>
+
+<h3>现成的开源项目，没有一个正好落在需求上</h3>
+<div class="tw"><table>
+  <thead><tr><th>项目</th><th>做法</th><th>差距（读源码确认）</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>winxcorners（951★）<br>Convenient Window（192★）</td>
+      <td>按每块屏的矩形直接算四角 / 四边热区</td>
+      <td><b>从不判断"这条边外面还有没有另一块屏"</b> → 内部接缝被当成边缘，误触发</td>
+    </tr>
+    <tr>
+      <td>DeskBorder（7★）</td>
+      <td>只取全局最外侧的边（左右边逻辑正确）</td>
+      <td>上下边没做同样判断；C# WPF，常驻 30–60 MB；<b>没有现成安装包</b></td>
+    </tr>
+    <tr>
+      <td>Quicker 动作</td>
+      <td>手工标定四个外角点</td>
+      <td>正确，但要宿主 210 MB + 手工录点</td>
+    </tr>
+  </tbody>
+</table></div>
+<p style="font-size:13.5px;color:var(--muted)">星数、内存等数据截至 2026-10，仅作横向参考。</p>
+<p>缺口很明确：<b>没有一个独立、零配置、能正确处理非矩形布局、并且界面做得像样的工具。</b></p>
+
+<h2 id="core">二、核心思路</h2>
+
+<h3>2.1 把你手工录的那 4 个值，自动算出来</h3>
+<p>这是整个项目唯一的技术主张。手录四个角点本质提供四类信息，而这四类信息系统 API 全都知道：</p>
+
+<div class="tw"><table>
+  <thead><tr><th>你手工录的</th><th>程序自动算</th></tr></thead>
+  <tbody>
+    <tr><td>「最左边缘」的 X</td><td>该屏左边仍在虚拟桌面范围内的部分（见 2.2）</td></tr>
+    <tr><td>「最右边缘」的 X</td><td>该屏右边仍在虚拟桌面范围内的部分（见 2.2）</td></tr>
+    <tr><td>左边缘的垂直范围</td><td><b>光标所在屏 <code>M</code></b> 的触发带（默认底部 10%）</td></tr>
+    <tr><td>右边缘的垂直范围</td><td>同上，仍是 <code>M</code> 的触发带</td></tr>
+  </tbody>
+</table></div>
+
+<div class="key"><div class="ic">◆</div><div><b>关键在最后两行</b>：垂直范围不取整块虚拟屏的高度，而取「光标此刻所在那块屏」的高度。这正是「每块屏各录自己的上下角」所做到的等价效果。</div></div>
+
+<h3>2.2 边缘判定：探头分段（唯一模型）</h3>
+<p>不做 <code>min/max</code> 的简化版，直接判定「这条边在这一段外面还有没有屏」——探针法既是 <code>min/max</code> 的推广，也是布局图绘制触发带的同一份数据。</p>
+
+<pre><code>// 左侧：边外第一列
+leftExposed (M, y) = MonitorFromPoint({ M.left - 1, y }, MONITOR_DEFAULTTONULL) == NULL;
+// 右侧：边外第一列（注意是 M.right，不是 M.right - 1）
+rightExposed(M, y) = MonitorFromPoint({ M.right,    y }, MONITOR_DEFAULTTONULL) == NULL;</code></pre>
+
+<p>一条边可能被切成若干段：取所有显示器的 <code>top</code> / <code>bottom</code> 作为断点并排序，逐段用中点探一次，合并相邻的「暴露段」。显示器数 ≤ 8，O(n²) 可以忽略。</p>
+
+<p>判定逻辑：</p>
+<pre><code>每 50 ms:
+    (x, y) = GetCursorPos
+    if 已暂停 / 冷却中 / 鼠标按键按下 / 前台全屏 / 前台进程在黑名单 / 锁屏 → 跳过
+
+    M = 包含 (x, y) 的那块显示器
+    if M 不存在 → 跳过
+
+    inBand = (y &gt;= M.bottom - M.height * ratio) and (y &lt; M.bottom)     // 默认底部 10%
+    onTaskbar = 光标落点属于任务栏窗口（Shell_TrayWnd / Shell_SecondaryTrayWnd / TrayNotifyWnd ...）
+
+    if inBand and not onTaskbar:
+        if x in [M.left, M.left + 1]        and leftExposed(M, y)  → 交给状态机，方向 = 上一个
+        if x in [M.right - 2, M.right - 1]  and rightExposed(M, y) → 交给状态机，方向 = 下一个</code></pre>
+
+<p>三行判断解决三个问题：</p>
+<ul>
+  <li><b>只有真实外边缘触发</b>：探头为 <code>NULL</code> 才命中，内部接缝永远不命中（不是靠 <code>min/max</code> 特判）</li>
+  <li><b>触发带用 <code>M</code> 自己的高度</b>：每块屏比例一致，横竖混排各算各的</li>
+  <li><b><code>M</code> 从光标实时查</b>：布局变了自然正确，不需要任何标定</li>
+</ul>
+
+<p>两处实现细节：</p>
+<ul>
+  <li>边缘判定给 1~2 px 容差（<code>M.left + 1</code>、<code>M.right - 2</code>），避免高 DPI 下 <code>GetCursorPos</code> 与 <code>GetMonitorInfoW</code> 的取整差 1 px 导致永远不命中。</li>
+  <li>右侧探针用 <code>M.right</code>：那是边外的第一列。用 <code>M.right - 1</code> 会永远探到自己。</li>
+</ul>
+
+<h3>2.3 触发状态机</h3>
+<p><b>只靠「冷却 + 电平」是不够的</b>：冷却结束后光标还停在触发区，会再切一次——鼠标停在角落不动，桌面就会连续翻滚。所以触发必须是「进入 → 停留 → 触发 → 必须离开才能复位」的状态机。</p>
+
+<pre><code>           进入触发区                 停留 ≥ dwell
+  Idle ───────────────&gt; Armed ──────────────────&gt; Fire
+    ↑                     │                        │
+    │     提前离开         │                        │ 一次性提交 4 个按键
+    └─────────────────────┘                        ↓
+    ↑                                          Disarmed
+    │                                             │
+    └──────── 光标离开触发区 ≥ 复位距离 ───────────┘</code></pre>
+
+<div class="tw"><table>
+  <thead><tr><th>规则</th><th>值 / 行为</th></tr></thead>
+  <tbody>
+    <tr><td>进入 → 停留阈值 <code>dwell</code></td><td>默认 <b>120 ms</b>，可配 0–500</td></tr>
+    <tr><td>触发 → <code>Disarmed</code></td><td>一次只发一次，<code>SendInput</code> 四个按键<b>一次提交</b>，检查返回值</td></tr>
+    <tr><td>复位条件</td><td>光标离开触发区 <b>≥ 24 px</b>（或离开该边缘），不是靠时间</td></tr>
+    <tr><td>冷却 <code>cooldown</code></td><td>默认 <b>500 ms</b>（&gt; 系统切换动画），从 Fire 起算，只防抖不负责复位</td></tr>
+    <tr><td>光标回位</td><td>触发后向内推 <b>24 px</b>（可关）——这一步本身就是「离开」，顺带完成复位</td></tr>
+    <tr><td>发送失败</td><td><code>SendInput</code> 返回 0 时记日志 + 一次性提示「切换被系统拦截」，不静默</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note"><div class="ic">⚠️</div><div>回位只在<b>由本程序触发</b>时执行，且可关；关掉后仍要靠「移动离开」复位。</div></div>
+
+<h3>2.4 为什么不需要手工标定</h3>
+<p>"这条边外面有没有屏"不是主观判断，是系统能客观回答的事实（就是 2.2 那两行）。探头法默认开启，不再作为"增强模式"留到 v0.5——否则核心判定要在发布前重写一遍，布局图组件也得跟着改两次。</p>
+
+<h2 id="verify">三、几何验证（开发机布局）</h2>
+<p>以下数据由 <code>hexbench --layout --demo</code> 生成（示例布局），避免文档与实现漂移。</p>
+
+<pre class="term"><code>屏 0 (横屏, 主屏)   L 0      T 0      R 3440   B 1440    3440 × 1440
+屏 1 (竖屏)         L -1080  T -232   R 0      B 1688    1080 × 1920</code></pre>
+
+<p>触发带 = 每屏底部 10%，探头分段后的结果：</p>
+<pre class="term"><code>屏 0  左边缘 x=0      <span class="no">✕ 内部接缝（左边是竖屏）</span>        带内 0 px
+屏 0  右边缘 x=3439   <span class="ok">✓ 外露 1440 px</span>                 带内 144 px（10%）
+屏 1  左边缘 x=-1080  <span class="ok">✓ 外露 1920 px</span>                 带内 192 px（10%）
+屏 1  右边缘 x=-1     <span class="ok">✓ 外露 480 px（232 + 248）</span>      带内 192 px（10%）</code></pre>
+
+<div class="key"><div class="ic">◆</div><div><b>为什么是三条可触发边段，而不是两条</b>：竖屏右下角（x=-1，y=1496~1688）的右边确实没有屏——屏 0 只到 y=1440。这是真实外边缘，手录四角没覆盖到它而已。探头法把它算进来是正确行为；该段只有光标能到达时才生效（显示器排布的空隙能否进入由系统决定），到不了也永远不误触发。</div></div>
+
+<div class="key"><div class="ic">✓</div><div><b>内部接缝仍然是 0</b>：屏 0 的左边缘在 x=0 处外侧是竖屏，屏 1 的右边缘在 y=0~1440 处外侧是屏 0，两处都不会命中。与手录四角的结论一致。</div></div>
+
+<h2 id="what">四、功能</h2>
+<div class="cards">
+  <div class="card"><div class="num">1</div><div><div class="t">推到最外侧边缘即切</div><div class="d">鼠标推到最左 / 最右屏幕边缘的角落区，切换上一个 / 下一个虚拟桌面</div></div></div>
+  <div class="card"><div class="num">2</div><div><div class="t">多显示器零配置</div><div class="d">横竖混排、L 形、错位、上下堆叠，都不需要对屏、不需要录点</div></div></div>
+  <div class="card"><div class="num">3</div><div><div class="t">内部接缝永不误触发</div><div class="d">只在探头判定为真实外边缘的区段生效</div></div></div>
+  <div class="card"><div class="num">4</div><div><div class="t">触发比例按屏独立</div><div class="d">每块屏用自己的高度算触发带，手感一致</div></div></div>
+  <div class="card"><div class="num">5</div><div><div class="t">布局变化自动适应</div><div class="d">插拔副屏、改分辨率、转屏、改缩放，监听 WM_DISPLAYCHANGE 重算</div></div></div>
+  <div class="card"><div class="num">6</div><div><div class="t">可视化设置界面</div><div class="d">真实比例的显示器布局图，实时显示可触发边缘</div></div></div>
+  <div class="card"><div class="num">7</div><div><div class="t">测试模式</div><div class="d">只高亮不切换，用来熟悉触发区、排查误触</div></div></div>
+  <div class="card"><div class="num">8</div><div><div class="t">WebDAV 配置同步</div><div class="d">多台设备共用一套行为参数</div></div></div>
+  <div class="card"><div class="num">9</div><div><div class="t">首次使用引导</div><div class="d">弹一次主界面，讲清楚该往哪推，之后不再打扰</div></div></div>
+</div>
+<p>体验细节：托盘常驻（左键打开主界面、右键菜单）、开机自启、防误触（拖拽 / 全屏 / 进程黑名单 / 锁屏）、切换后光标回位、暂停热键、切换失败提示、首次使用引导、亮暗主题跟随系统。</p>
+
+<h2 id="scope">五、范围：做什么、不做什么、怎样算成功</h2>
+
+<h3>工具集边界</h3>
+<p>第一版只做「边缘切桌面」一个工具，把托盘壳、配置、布局图这套底座打磨好；后续按需增加同类效率小工具，但<b>第一版不做插件机制</b>，也不对外提供第三方接口。</p>
+
+<h3>非目标（明确不做）</h3>
+<ul>
+  <li>macOS / Linux</li>
+  <li>「当前是第几个桌面」的 HUD —— 需要未公开 <code>ImmersiveShell</code> 接口，每个 Windows 版本都要适配</li>
+  <li>窗口管理 / 平铺 / 布局记忆</li>
+  <li>触控与触控板手势</li>
+  <li>多套配置方案（导航留槽位，第一版不实现）</li>
+  <li>自建云同步（只用用户自己的 WebDAV）</li>
+</ul>
+
+<h3>成功标准</h3>
+<div class="tw"><table>
+  <thead><tr><th>指标</th><th>目标</th><th>验证方式</th></tr></thead>
+  <tbody>
+    <tr><td>误触发</td><td>≤ 1 次/天</td><td>自用 7 天日志</td></tr>
+    <tr><td>触发 → 开始切换</td><td>≤ 150 ms（P95）</td><td>打点日志</td></tr>
+    <tr><td>托盘常驻</td><td>工作集 ≤ 20 MB，私有 ≤ 5 MB</td><td>空闲 5 分钟后读一次</td></tr>
+    <tr><td>安装包</td><td>≤ 15 MB</td><td>构建产物</td></tr>
+    <tr><td>首次使用</td><td>零配置即可触发</td><td>新机器 / 新用户实测</td></tr>
+    <tr><td>长稳</td><td>72 h 无句柄、内存增长</td><td>压测脚本</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="stack">六、技术栈</h2>
+
+<h3>选型依据</h3>
+<p>要做"好看、现代化"，Web 技术栈是唯一顺路的选择，而 Tauri 是 Rust 侧最成熟、热度最高的 WebView 方案：</p>
+
+<div class="tw"><table>
+  <thead><tr><th>指标</th><th>Tauri 2</th></tr></thead>
+  <tbody>
+    <tr><td>版本 / 迭代</td><td>2.12.5 · 2026-10，高频更新</td></tr>
+    <tr><td>crates.io 下载量</td><td><b>3,808 万</b>（Rust GUI 框架最高）</td></tr>
+    <tr><td>渲染</td><td>系统 WebView2，不打包浏览器内核</td></tr>
+    <tr><td>托盘</td><td>官方 <code>TrayIconBuilder</code></td></tr>
+  </tbody>
+</table></div>
+
+<div class="key"><div class="ic">◆</div><div><b>参考项目：CC Switch</b>（<code>farion1231/cc-switch</code>，14.7 万星，v4.0.18）采用了完全相同的技术栈，被大规模实际使用验证过<b>工程品质（稳定、轻量）</b>。</div></div>
+<div class="note"><div class="ic">⚠️</div><div>注意：CC Switch 可以作<b>技术参考</b>，但<b>不作视觉参考</b>——它的界面是工具型后台风格，不是我们要的观感。技术栈提供"能做到"，做不做好看要靠第七节的设计规范。</div></div>
+
+<h3>分层</h3>
+<div class="tw"><table>
+  <thead><tr><th>层</th><th>选型</th></tr></thead>
+  <tbody>
+    <tr><td>桌面框架</td><td><b>Tauri 2</b></td></tr>
+    <tr><td>核心引擎</td><td><b><code>hexbench-core</code></b>（独立 crate，不依赖 Tauri，可单测、可跑 CLI）</td></tr>
+    <tr><td>后端</td><td>Rust + <code>windows-sys</code>（显示器枚举、边缘判定、<code>SendInput</code>、DPAPI）；需要 COM / DWM 时再补 <code>windows</code></td></tr>
+    <tr><td>前端</td><td><b>React 18 + TypeScript + Vite</b></td></tr>
+    <tr><td>样式</td><td><b>Tailwind CSS + shadcn/ui（Radix）</b></td></tr>
+    <tr><td>动画</td><td><b>Framer Motion</b>（spring 物理动画）</td></tr>
+    <tr><td>图标 / 提示</td><td>lucide-react / sonner</td></tr>
+    <tr><td>国际化</td><td>i18next + react-i18next（Rust 侧托盘菜单共用同一份语言包）</td></tr>
+    <tr><td>表单校验</td><td>react-hook-form + zod</td></tr>
+    <tr><td>HTTP（WebDAV）</td><td>reqwest（rustls-tls）</td></tr>
+    <tr><td>打包</td><td><b>NSIS 为主</b>（per-user、免 UAC）；WiX MSI 可选</td></tr>
+    <tr><td>更新</td><td><code>tauri-plugin-updater</code>（签名后启用）</td></tr>
+  </tbody>
+</table></div>
+
+<h3>同类项目的实际选择（2026-10 查）</h3>
+<p>做技术选型前先看真实项目怎么选，避免拍脑袋：</p>
+<div class="tw"><table>
+  <thead><tr><th>项目</th><th>类型</th><th>Win32 绑定</th><th>仓库结构</th></tr></thead>
+  <tbody>
+    <tr><td><b>cc-switch</b>（Tauri 2）</td><td>托盘常驻的 CLI 切换器</td><td><b><code>windows-sys</code> 0.61</b> + <code>winreg</code></td><td>单个 <code>src-tauri</code> crate</td></tr>
+    <tr><td><b>clash-verge-rev</b>（Tauri 2）</td><td>大型代理客户端</td><td><b><code>windows</code> 0.62 + <code>windows-sys</code></b> + <code>windows-service</code></td><td>workspace，按业务拆多个 crate</td></tr>
+    <tr><td><b>EcoPaste</b>（Tauri 2）</td><td>剪贴板管理器，托盘 + 自动启动</td><td><b><code>windows</code> 0.52</b> + <code>winapi</code> 0.3</td><td>单个 <code>src-tauri</code> crate</td></tr>
+    <tr><td><b>komorebi</b>（纯 Rust）</td><td>Windows 平铺窗口管理器</td><td><b><code>windows</code> 0.62</b></td><td>workspace，9 个 crate</td></tr>
+    <tr><td><b>Spacedrive</b>（Tauri 2）</td><td>大型文件管理器</td><td>—</td><td>大 workspace（<code>core</code> / <code>apps/tauri/src-tauri</code> / <code>crates/*</code>）</td></tr>
+  </tbody>
+</table></div>
+<div class="key"><div class="ic">◆</div><div><b>三条结论</b>：① 没有项目手写 FFI，全部用 <code>windows</code> 或 <code>windows-sys</code>；② <code>windows-sys</code> 用于薄绑定，<code>windows</code> 用于富 API（COM/DWM/Direct2D），两者可共存；③ 核心逻辑单独 crate 是中大型项目的共同做法，小工具则一个 crate 放完。</div></div>
+
+<h3>平台约束（已确认的边界）</h3>
+<div class="tw"><table>
+  <thead><tr><th>约束</th><th>影响</th><th>处理</th></tr></thead>
+  <tbody>
+    <tr><td>Mica 仅 Windows 11 22H2+</td><td>Win10 无毛玻璃</td><td>Win10 降级 Acrylic（1809+），再不行纯色</td></tr>
+    <tr><td>Windows 10 已于 2025-10 结束支持</td><td>测试成本翻倍</td><td><b>主目标 Win11</b>，Win10 尽力（不承诺像素级一致）</td></tr>
+    <tr><td><code>SendInput</code> 可能被 UIPI 拦截</td><td>前台是提权窗口 / UAC 时切换无效</td><td>v0.1 实测；失败检测 + 提示；文档写明。<b>不申请 <code>uiAccess</code></b>（要装进 Program Files + 签名，与 per-user 免 UAC 冲突）</td></tr>
+    <tr><td>自绘标题栏会丢 Snap Layouts / Aero Snap / 双击最大化</td><td>系统手感退化</td><td>优先用系统标题栏 + Mica；确需自绘则用社区 overlay 方案并补齐行为，先做原型验证</td></tr>
+    <tr><td><code>titleBarStyle: "Overlay"</code> 在 Windows 上是否生效</td><td>未知</td><td>实现前先做最小验证，不写死在方案里</td></tr>
+    <tr><td>CSS <code>AccentColor</code> 系统色在 WebView2 的可用性</td><td>不可靠</td><td>改为 Rust 读注册表强调色，注入 CSS 变量</td></tr>
+  </tbody>
+</table></div>
+
+<h3>关键架构：托盘常驻 + 主窗口按需创建</h3>
+<p>Tauri 2 的窗口列表留空——<b>启动后只有托盘图标，不创建任何 WebView</b>。用户点托盘菜单「打开主界面」时才用 <code>WebviewWindowBuilder</code> 创建主窗口；关闭时销毁 WebView、回到纯托盘状态。</p>
+
+<div class="tw"><table>
+  <thead><tr><th>行为</th><th>状态</th><th>内存</th></tr></thead>
+  <tbody>
+    <tr><td>开机自启 / 启动</td><td><b>只有托盘，不弹窗</b></td><td>13~16 MB</td></tr>
+    <tr><td>打开主界面</td><td>创建 WebView 并显示</td><td>+80~120 MB</td></tr>
+    <tr><td>关闭主界面</td><td>销毁 WebView，回托盘</td><td>回到 13~16 MB</td></tr>
+  </tbody>
+</table></div>
+<div class="note"><div class="ic">⚠️</div><div><b>开机自启绝不弹窗</b>——否则每次开机都被一个窗口挡住。主界面是「打开来看、关掉回收」的形态。首次安装除外：引导只在第一次运行弹一次。</div></div>
+
+<div class="key"><div class="ic">✓</div><div><b>已实测验证</b>：<code>windows: []</code> 的 Tauri 2 应用运行时，<code>msedgewebview2</code> 进程数零新增，常驻内存 <b>11.3 MB 工作集 / 1.9 MB 私有</b>。</div></div>
+
+<p>配套要点：</p>
+<ul>
+  <li>窗口 <code>visible: false</code>，前端 ready 后再 <code>show()</code> —— 消除启动白屏闪烁</li>
+  <li>关闭主窗口 = 销毁 WebView 而非退出进程；<b>延迟 3~5 分钟再回收</b>，二次打开是热的（<code>visible:false</code> 只解决闪烁，不解决按需创建的开销）</li>
+  <li>标题栏方案先验证再定（见上表），不自作主张</li>
+</ul>
+
+<h2 id="design">七、主界面与设计规范</h2>
+
+<h3>信息架构</h3>
+<p>侧边栏分<b>「工具」和「全局」两层</b>，第一版只有「边缘切桌面」一个工具，加新工具时只加一组，全局部分不动：</p>
+<pre><code>┌────────────────┬─────────────────────────┐
+│ 边缘切桌面       │                         │
+│   概览          │                         │
+│   触发          │      当前页面内容        │
+│   防误触        │                         │
+│ ─────────────  │                         │
+│ 全局            │                         │
+│   通用          │                         │
+│   同步          │                         │
+│   关于          │                         │
+└────────────────┴─────────────────────────┘
+   ↑ 工具是一组，加新工具就往下加一组</code></pre>
+
+<div class="tw"><table>
+  <thead><tr><th>页面</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td>概览（工具内）</td><td>主开关 + 运行状态 + <b>显示器布局图</b>（视觉主角）+ 测试模式入口 + 本次运行切换次数</td></tr>
+    <tr><td>触发（工具内）</td><td>触发带比例 / 位置（底部·顶部）、停留阈值、冷却时间、轮询间隔、左右侧开关、单屏开关</td></tr>
+    <tr><td>防误触（工具内）</td><td>拖拽时禁用、全屏时禁用、任务栏排除、进程黑名单、锁屏暂停</td></tr>
+    <tr><td>通用（全局）</td><td>主题、语言、开机自启、暂停热键、日志目录</td></tr>
+    <tr><td>同步（全局）</td><td>WebDAV 地址 / 用户名 / 密码、上传、下载（v0.4）</td></tr>
+    <tr><td>关于（全局）</td><td>版本、检查更新、自检（发送一次切换并报告结果）、许可证、开源致谢</td></tr>
+  </tbody>
+</table></div>
+
+<div class="key"><div class="ic">◆</div><div><b>预留扩展槽位</b>（不实现，导航结构留好）：方案、统计、快捷键编辑、外观主题。<b>导航用侧边栏而非顶部标签</b>——工具和页面变多时顶部会挤爆。<b>第一版不引入路由</b>，页面用 <code>useState</code> 切换即可，等工具超过 3 个再上 <code>react-router</code>。</div></div>
+
+<h3>视觉</h3>
+<p>技术栈只提供能力，观感必须单独定。以下为硬约束，编码时不得自行发挥。</p>
+<div class="tw"><table>
+  <thead><tr><th>项</th><th>规范</th></tr></thead>
+  <tbody>
+    <tr><td>窗口材质</td><td><b>Mica</b>（Win11 22H2+）→ <b>Acrylic</b>（Win10 1809+）→ 纯色兜底；跟随系统主题</td></tr>
+    <tr><td>强调色</td><td><b>从注册表读取系统强调色</b>（<code>ColorizationColor</code> / <code>AccentColorMenu</code>）注入 CSS 变量，深浅各一套；不依赖 <code>AccentColor</code>，不自造品牌色</td></tr>
+    <tr><td>中性色阶</td><td>一套灰阶，浅色 / 深色各一套，跟随系统主题</td></tr>
+    <tr><td>语义色</td><td>成功 / 警告 / 危险各一，仅用于状态，不用于装饰</td></tr>
+    <tr><td>字号</td><td>12 说明 · 13 标签 · 14 正文 · 16 区块标题 · 20 页面标题</td></tr>
+    <tr><td>字重</td><td><b>只有三档</b>：400 正文 / 600 强调 / 700 标题（不用 650——Win10 的 Segoe UI 会落到 700，白定）</td></tr>
+    <tr><td>字体</td><td><code>Segoe UI Variable</code> → <code>Segoe UI</code> → 系统无衬线；Win10 不做逐字重补偿</td></tr>
+    <tr><td>间距刻度</td><td><b>只用</b> 4 / 8 / 12 / 16 / 24 / 32</td></tr>
+    <tr><td>圆角</td><td>卡片 12px · 控件 8px · 徽章 6px · 窗口圆角交给系统</td></tr>
+    <tr><td>阴影</td><td>只有两档：卡片一档、浮层一档</td></tr>
+    <tr><td>窗口</td><td>默认 960 × 640，最小 820 × 560，可缩放</td></tr>
+  </tbody>
+</table></div>
+
+<h3>动效</h3>
+<p>统一 spring 参数，全项目只有一套：</p>
+<pre><code>{ type: "spring", stiffness: 400, damping: 30, mass: 0.8 }   // 约 5~8% 过冲</code></pre>
+<div class="tw"><table>
+  <thead><tr><th>规则</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>时长上限</td><td><b>300 ms</b>，超出的必须改短</td></tr>
+    <tr><td>允许动的地方</td><td>窗口进出、面板展开收起、开关切换、滑块数值平滑、布局图变化、触发瞬间闪烁一次</td></tr>
+    <tr><td><b>禁止</b></td><td>循环动画、装饰性动画、超过 2 个元素同时大幅位移、入场逐项延迟超过 4 项</td></tr>
+    <tr><td>降级</td><td>系统「动画效果」关闭或 <code>prefers-reduced-motion</code> 时，全部退化为瞬时切换，spring 不生效</td></tr>
+    <tr><td>原则</td><td>快而不炫 —— 设置面板"点了立刻有反应"比"表演"重要</td></tr>
+  </tbody>
+</table></div>
+
+<h3>布局图（界面的视觉主角）</h3>
+<p>主界面的概览页核心不是表单，是这张图：</p>
+<ul>
+  <li>按<b>真实显示器坐标等比映射</b>到画布（SVG，不用 Canvas）</li>
+  <li>显示器轮廓：1.5px 描边 + 8px 圆角 + 极淡填充，标注设备名与分辨率</li>
+  <li>触发带：贴着边缘的半透明色块（强调色 20% 填充 + 1px 描边），<b>按探头分段逐段绘制</b>——接缝处断开，不做整条边</li>
+  <li><b>可触发区用强调色、被禁用的屏灰掉、内部接缝不画触发带并标注为"接缝"</b></li>
+  <li>光标位置：小圆点 + 十字准线，主程序每 50 ms 通过 Tauri event 推送</li>
+  <li>命中触发区时：对应边高亮闪一次（一次性，不循环）</li>
+  <li>拖动比例滑块：触发带高度带 spring 平滑变化</li>
+  <li><b>极端比例</b>：3440 横屏 + 1080 竖屏并排时，竖屏只有横屏的 1/3 宽。画布自动适配 + 每块屏最小可视宽度，hover 放大；不靠等比硬缩</li>
+  <li><b>测试模式</b>：布局图进入"只演示"状态，命中触发区只高亮、不切换，并显示"如果现在松手，会切到哪个方向"</li>
+</ul>
+
+<h3>首次使用</h3>
+<p>触发区是看不见的，第一次装完必须讲清楚：</p>
+<ul>
+  <li>首次运行弹一次主界面（仅一次，不影响"自启不弹窗"）</li>
+  <li>布局图上高亮可触发区 + 一句"把鼠标推到高亮区，停 0.1 秒"</li>
+  <li>提供 30 秒的"试一试"流程：推过去 → 高亮 → 告诉用户成功了</li>
+  <li>之后不再打扰</li>
+</ul>
+
+<h3>不做的事</h3>
+<ul>
+  <li>不做屏幕覆盖层（会为每块屏拉起一套 WebView2 进程，内存涨一个数量级）——可视化全部在主界面内完成</li>
+  <li>不做"当前是第几个桌面"的 HUD（见第五节非目标）</li>
+  <li>不替用户改系统的动画设置；切换动画由 DWM 控制，只能给出手动关闭的说明</li>
+</ul>
+
+<h2 id="config">八、配置、同步与安全</h2>
+
+<h3>单一事实源</h3>
+<p><b>只保留一份配置</b>：<code>%APPDATA%\io.github.&lt;user&gt;.hexbench\config.json</code>。不用 <code>tauri-plugin-store</code> 再存一份——两份事实源是 bug 温床。</p>
+<ul>
+  <li>写入：<code>config.json.tmp</code> → flush → rename 覆盖，保留 <code>config.json.bak</code></li>
+  <li>读取：失败或校验不过时回退 <code>.bak</code>，再不行用默认值并提示</li>
+  <li>兼容：<code>serde(default)</code> + 未知字段透传，旧版本读到新配置不会清空</li>
+  <li>密码：单独文件 <code>credentials.bin</code>，DPAPI（<code>CryptProtectData</code>，<code>CRYPTPROTECT_UI_FORBIDDEN</code>），<b>永不出现在 config.json</b></li>
+</ul>
+
+<h3>配置项</h3>
+<div class="tw"><table>
+  <thead><tr><th>键</th><th>类型</th><th>默认</th><th>范围</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>enabled</code></td><td>bool</td><td><code>true</code></td><td>—</td><td>总开关</td></tr>
+    <tr><td><code>trigger.ratio</code></td><td>f32</td><td><code>0.10</code></td><td>0.03–0.50</td><td>触发带占所在屏高度的比例</td></tr>
+    <tr><td><code>trigger.position</code></td><td>enum</td><td><code>bottom</code></td><td>bottom / top</td><td>触发带贴哪条边（任务栏自动隐藏时的退路）</td></tr>
+    <tr><td><code>trigger.sides</code></td><td>enum</td><td><code>both</code></td><td>left / right / both</td><td>启用哪侧</td></tr>
+    <tr><td><code>trigger.dwellMs</code></td><td>u32</td><td><code>120</code></td><td>0–500</td><td>进入后停留多久才算数</td></tr>
+    <tr><td><code>trigger.cooldownMs</code></td><td>u32</td><td><code>500</code></td><td>200–2000</td><td>两次触发的最小间隔</td></tr>
+    <tr><td><code>trigger.pollMs</code></td><td>u32</td><td><code>50</code></td><td>20–100</td><td>轮询间隔</td></tr>
+    <tr><td><code>trigger.restoreCursor</code></td><td>bool</td><td><code>true</code></td><td>—</td><td>触发后内推光标</td></tr>
+    <tr><td><code>trigger.restoreOffsetPx</code></td><td>u32</td><td><code>24</code></td><td>8–200</td><td>内推距离，同时作为复位阈值</td></tr>
+    <tr><td><code>guard.skipWhenButtonDown</code></td><td>bool</td><td><code>true</code></td><td>—</td><td>拖拽 / 按住时不触发</td></tr>
+    <tr><td><code>guard.skipFullscreen</code></td><td>bool</td><td><code>true</code></td><td>—</td><td>前台全屏时不触发</td></tr>
+    <tr><td><code>guard.excludeTaskbar</code></td><td>bool</td><td><code>true</code></td><td>—</td><td>光标在任务栏上不触发</td></tr>
+    <tr><td><code>guard.skipWhenLocked</code></td><td>bool</td><td><code>true</code></td><td>—</td><td>锁屏 / 安全桌面时暂停</td></tr>
+    <tr><td><code>guard.processBlacklist</code></td><td>string[]</td><td><code>[]</code></td><td>≤ 50 项</td><td>进程名，不区分大小写</td></tr>
+    <tr><td><code>guard.pauseHotkey</code></td><td>string</td><td><code>Ctrl+Alt+Shift+P</code></td><td>—</td><td>注册失败时提示改键</td></tr>
+    <tr><td><code>monitors.overrides</code></td><td>map</td><td><code>{}</code></td><td>—</td><td>每屏开关，按 EDID 作键，<b>仅本地</b></td></tr>
+    <tr><td><code>ui.theme</code></td><td>enum</td><td><code>system</code></td><td>system / light / dark</td><td></td></tr>
+    <tr><td><code>ui.language</code></td><td>enum</td><td><code>auto</code></td><td>auto / zh-CN / en</td><td></td></tr>
+    <tr><td><code>sync.enabled</code></td><td>bool</td><td><code>false</code></td><td>—</td><td></td></tr>
+    <tr><td><code>sync.url</code></td><td>string</td><td><code>""</code></td><td>https</td><td>必须是 https</td></tr>
+    <tr><td><code>sync.username</code></td><td>string</td><td><code>""</code></td><td>—</td><td></td></tr>
+    <tr><td><code>sync.autoPull</code></td><td>bool</td><td><code>false</code></td><td>—</td><td>启动时自动拉取</td></tr>
+    <tr><td><code>meta.schema</code></td><td>u32</td><td><code>1</code></td><td>—</td><td>配置结构版本，用于迁移</td></tr>
+    <tr><td><code>meta.updatedAt</code></td><td>i64</td><td><code>0</code></td><td>—</td><td>毫秒时间戳</td></tr>
+    <tr><td><code>meta.deviceId</code></td><td>string</td><td>uuid</td><td>—</td><td>只用于冲突提示</td></tr>
+  </tbody>
+</table></div>
+
+<h3>同步</h3>
+<p><b>显示器坐标绝不进配置文件</b>——运行时自动计算。所以配置天然设备无关：</p>
+<div class="tw"><table>
+  <thead><tr><th>✅ 同步</th><th>❌ 不同步</th></tr></thead>
+  <tbody>
+    <tr><td>触发带比例 / 位置、停留与冷却、轮询间隔</td><td>显示器坐标（运行时算）</td></tr>
+    <tr><td>防误触开关、暂停热键、进程黑名单</td><td><b>WebDAV 密码</b>（DPAPI 本地加密）</td></tr>
+    <tr><td>界面语言、主题、开机自启</td><td><b>每屏开关</b>（另一台机器的 <code>DISPLAY1</code> 不是同一块屏）</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note"><div class="ic">⚠️</div><div><b>每屏开关只存本地</b>，键用 EDID（厂商 + 型号 + 序列号）而不是 <code>\\.\DISPLAY1</code>——线序、显卡口一变名字就换，同型号双屏还会重名。跨设备同步一个按名字匹配的开关没有意义。</div></div>
+
+<ul>
+  <li><b>安全</b>：密码 DPAPI 本地加密，永不上传；配置里只留用户名和地址</li>
+  <li><b>策略</b>：手动上传 / 下载为主，可选启动时自动拉取；配置带 <code>updated_at</code> + <code>device_id</code>，下载前比对时间戳，<b>不做后台自动合并</b></li>
+  <li><b>冲突</b>：远端比本地新时弹一次确认（覆盖 / 保留本地），不做静默覆盖</li>
+  <li><b>兼容</b>：坚果云、Nextcloud、ownCloud、群晖、InfiniCLOUD（Basic Auth over HTTPS + <code>MKCOL</code> / <code>PUT</code> / <code>GET</code>）</li>
+  <li><b>证书</b>：默认只接受有效 HTTPS 证书。群晖等自签场景提供「允许自签」开关，默认关、开启时强提示</li>
+  <li><b>失败静默</b>：网络异常不阻塞切换功能，只在同步页显示状态</li>
+</ul>
+
+<h2 id="res">九、资源占用</h2>
+<div class="vs">
+  <div><div class="h">HexBench 常驻内存</div><div class="big">13~16 MB</div><div class="s">已实测裸壳 11.3 MB 工作集 / 1.9 MB 私有</div></div>
+  <div><div class="h">现在用的 Quicker 方案</div><div class="big">210 MB</div><div class="s">宿主常驻内存（本机实测工作集）</div></div>
+</div>
+<div class="tw"><table>
+  <thead><tr><th>项</th><th>预估</th><th>依据</th></tr></thead>
+  <tbody>
+    <tr><td><b>托盘常驻</b>（开机自启 / 关闭主界面后）</td><td><b>13~16 MB</b></td><td>已实测裸壳 11.3 MB 工作集 / 1.9 MB 私有</td></tr>
+    <tr><td>打开主界面</td><td>临时 +80~120 MB</td><td>WebView2 子进程，关闭后延迟 3~5 分钟回收</td></tr>
+    <tr><td>安装包</td><td><b>8~12 MB</b></td><td>裸壳实测 5.55 MB + React/shadcn/motion 资源</td></tr>
+    <tr><td>对比</td><td>Quicker 常驻 <b>210 MB</b> 工作集</td><td>本机实测</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note"><div class="ic">⚠️</div><div><b>测量口径</b>（避免和竞品比较时口径不一）：应用空闲 5 分钟后，任务管理器读<b>工作集</b>与<b>私有字节</b>两个数，各取三次中位数。对外只报这两个值，不混用「物理内存」这种含糊说法。</div></div>
+
+<p>其他稳定性设计：</p>
+<div class="tw"><table>
+  <thead><tr><th>项</th><th>做法</th></tr></thead>
+  <tbody>
+    <tr><td>桌面引擎</td><td>Windows 原生虚拟桌面，不自建，不与系统冲突</td></tr>
+    <tr><td>切换方式</td><td><code>SendInput</code> 发 <code>Win+Ctrl+←/→</code> —— 系统内置不可改快捷键，<b>不碰未公开 COM 接口，Windows 更新不会失效</b></td></tr>
+    <tr><td>DPI</td><td>清单声明 <code>PerMonitorV2</code>，全程物理像素；启动时用 150% 缩放自检坐标一致性</td></tr>
+    <tr><td>轮询</td><td>50 ms <code>GetCursorPos</code> + 缓存的显示器矩形，不用全局钩子；不调 <code>timeBeginPeriod</code>，避免拉高整机定时器精度</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="impl">十、实现要点</h2>
+<div class="tw"><table>
+  <thead><tr><th>部分</th><th>做法</th></tr></thead>
+  <tbody>
+    <tr><td>显示器枚举</td><td><code>EnumDisplayMonitors</code> + <code>GetMonitorInfoW</code>，同时取 <code>rcMonitor</code>（物理像素）和 <code>rcWork</code></td></tr>
+    <tr><td>边缘判定</td><td>探头分段：断点取所有 <code>top</code>/<code>bottom</code>，逐段测中点，合并暴露段；结果缓存，布局变化才重算</td></tr>
+    <tr><td>触发带</td><td><code>M.bottom - M.height × ratio</code> 到 <code>M.bottom</code>，默认 10%；<code>position=top</code> 时贴 <code>M.top</code></td></tr>
+    <tr><td>任务栏排除</td><td><code>WindowFromPoint</code> 判类名 <code>Shell_TrayWnd</code> / <code>Shell_SecondaryTrayWnd</code> / <code>TrayNotifyWnd</code> / <code>MSTaskSwWClass</code>；不靠 <code>rcWork</code> 硬切，保住角落手感</td></tr>
+    <tr><td>触发检测</td><td>状态机 + 50 ms 轮询；<code>dwell</code> 计时用单调时钟，不用墙钟</td></tr>
+    <tr><td>切换桌面</td><td>一次 <code>SendInput</code> 提交 4 个按键，检查返回值；失败记 <code>GetLastError</code> + 一次性提示</td></tr>
+    <tr><td>虚拟桌面数量</td><td>读 <code>HKCU\...\Explorer\VirtualDesktops\VirtualDesktopIDs</code>（每个 GUID 16 字节）+ <code>CurrentVirtualDesktop</code> 定位当前是第几个；只有一个时界面提示并提供「新建虚拟桌面」（<code>SendInput</code> Win+Ctrl+D），新建后按真实步数切回原桌面</td></tr>
+    <tr><td>全屏检测</td><td><code>SHQueryUserNotificationState</code>（<code>QUNS_RUNNING_D3D_FULL_SCREEN</code> / <code>QUNS_BUSY</code> / <code>QUNS_PRESENTATION_MODE</code>）+ 前台窗口矩形覆盖显示器（排除桌面、任务栏）</td></tr>
+    <tr><td>锁屏检测</td><td><code>OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS)</code> 失败即视为锁屏/安全桌面，暂停</td></tr>
+    <tr><td>黑名单</td><td><code>GetForegroundWindow</code> → <code>GetWindowThreadProcessId</code> → <code>QueryFullProcessImageNameW</code>；提权进程取不到名字时退回窗口类名</td></tr>
+    <tr><td>布局变化</td><td>引擎线程建 <code>HWND_MESSAGE</code> 窗口跑消息循环，监听 <code>WM_DISPLAYCHANGE</code> / <code>WM_SETTINGCHANGE</code> / <code>WM_DPICHANGED</code>，<b>去抖 500 ms</b> 后重算</td></tr>
+    <tr><td>配置</td><td>单一 <code>config.json</code>，原子写 + <code>.bak</code>；<code>serde(default)</code> 保兼容</td></tr>
+    <tr><td>凭证</td><td>DPAPI 加密存 <code>credentials.bin</code>，不进导出、不进同步</td></tr>
+    <tr><td>热键</td><td><code>RegisterHotKey</code>，失败时提示占用并要求改键；不静默降级</td></tr>
+    <tr><td>单实例 / 自启</td><td><code>tauri-plugin-single-instance</code> / <code>tauri-plugin-autostart</code>；自启带 <code>--autostart</code> 参数，不弹窗</td></tr>
+    <tr><td>日志</td><td><code>tauri-plugin-log</code>，滚动保留 7 天，不记录光标坐标</td></tr>
+    <tr><td>更新</td><td><code>tauri-plugin-updater</code> + 签名；关于页手动检查 + 可选自动检查</td></tr>
+    <tr><td>分发</td><td>GitHub Actions 构建 → SignPath Foundation 免费 OSS 签名 → NSIS → winget / Scoop</td></tr>
+    <tr><td>测试</td><td><code>hexbench-core</code> 单测（几何、配置、状态机）+ <code>--layout</code> CLI 回放布局并打印可触发区间</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="diff">十一、与现有方案对比</h2>
+<div class="tw"><table>
+  <thead><tr><th>能力</th><th>HexBench</th><th>热区类工具</th><th>DeskBorder</th><th>Quicker 动作</th></tr></thead>
+  <tbody>
+    <tr><td>只在真实外边缘触发</td><td class="y">✅ 探头分段</td><td class="n">❌ 含内部接缝</td><td class="p">⚠️ 仅左右边</td><td class="y">✅</td></tr>
+    <tr><td>触发比例按屏独立</td><td class="y">✅</td><td class="p">⚠️</td><td class="y">✅</td><td class="y">✅ 靠录点策略</td></tr>
+    <tr><td>无需手工录点</td><td class="y">✅</td><td class="y">✅</td><td class="y">✅</td><td class="n">❌</td></tr>
+    <tr><td>布局变化自动适应</td><td class="y">✅</td><td class="y">✅</td><td class="y">✅</td><td class="n">❌ 需重录</td></tr>
+    <tr><td>现代化界面</td><td class="y">✅ 按规范设计</td><td class="p">⚠️</td><td class="p">⚠️</td><td class="y">✅</td></tr>
+    <tr><td>配置跨设备同步</td><td class="y">✅ WebDAV</td><td class="n">❌</td><td class="n">❌</td><td class="n">❌</td></tr>
+    <tr><td>有现成安装包</td><td class="y">✅</td><td class="y">✅</td><td class="n">❌</td><td>—</td></tr>
+    <tr><td>常驻内存</td><td>13~16 MB</td><td>中</td><td>30–60 MB</td><td>210 MB</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="test">十二、测试矩阵</h2>
+<div class="tw"><table>
+  <thead><tr><th>维度</th><th>用例</th><th>关注点</th></tr></thead>
+  <tbody>
+    <tr><td>显示器数</td><td>1 / 2 / 3+</td><td>单屏开始按钮冲突；三屏中间屏两侧都应是接缝</td></tr>
+    <tr><td>排布</td><td>横 + 竖、上下堆叠、L 形、错位</td><td>探头分段是否正确；排布空隙能否进入</td></tr>
+    <tr><td>DPI</td><td>100 / 125 / 150 / 200 混合</td><td>物理像素一致；变化后重算</td></tr>
+    <tr><td>任务栏</td><td>底 / 顶 / 左 / 右、自动隐藏</td><td>排除是否生效；"显示桌面"角</td></tr>
+    <tr><td>会话</td><td>锁屏、切换用户、RDP、休眠唤醒</td><td>不误切；恢复后重算</td></tr>
+    <tr><td>提权</td><td>任务管理器、管理员终端、UAC</td><td><code>SendInput</code> 是否被拦；失败是否提示</td></tr>
+    <tr><td>全屏</td><td>独占游戏、视频全屏、PPT 放映</td><td>跳过；光标被锁时不连切</td></tr>
+    <tr><td>边界</td><td>第一个 / 最后一个桌面、快速连推、停在角落</td><td>不连切；无桌面可切时静默</td></tr>
+    <tr><td>输入</td><td>拖拽、滚轮、输入法候选框、放大镜</td><td>不误触</td></tr>
+    <tr><td>长稳</td><td>72 h、反复插拔显示器</td><td>句柄 / 内存不增长</td></tr>
+    <tr><td>配置</td><td>损坏、降级、跨设备同步</td><td>不丢配置；冲突有提示</td></tr>
+    <tr><td>首次</td><td>新用户零配置</td><td>30 秒内能成功触发一次</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="risk">十三、风险与缓解</h2>
+<div class="tw"><table>
+  <thead><tr><th>风险</th><th>影响</th><th>缓解</th></tr></thead>
+  <tbody>
+    <tr><td>UIPI 拦截 <code>SendInput</code></td><td>提权前台时切换无效</td><td>v0.1 实测；失败检测 + 提示；文档写明；不申请 <code>uiAccess</code></td></tr>
+    <tr><td>任务栏 / 自动隐藏冲突</td><td>误触发、抢开始按钮</td><td>类名排除；自动隐藏时提供"触发带换到顶部"</td></tr>
+    <tr><td>杀软误报</td><td>安装被拦、进程被隔离</td><td>签名、不加壳、开源可审计、收集误报并申诉</td></tr>
+    <tr><td>SignPath 未通过</td><td>无签名 → SmartScreen 警告</td><td>先申请；未批则自签 + README 说明安装步骤</td></tr>
+    <tr><td>Windows 更新改动快捷键</td><td>功能失效</td><td>只用公开快捷键；关于页提供"自检：发一次切换并报告结果"</td></tr>
+    <tr><td>WebDAV 自签证书</td><td>群晖 / Nextcloud 连不上</td><td>明确默认只支持有效证书；可选开关（默认关）</td></tr>
+    <tr><td>两份文档漂移</td><td>方案与实现不一致</td><td>README 为唯一源；改完同步 <code>plan.html</code></td></tr>
+    <tr><td>布局图极端比例</td><td>竖屏被画成一条线</td><td>自动适配 + 最小可视宽度 + hover 放大</td></tr>
+    <tr><td>单屏误触（开始按钮）</td><td>首次体验差</td><td>单屏专项实测；必要时单屏默认只开右边缘</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="road">十四、路线图</h2>
+<div class="phase"><div class="ph">v0.1 核心（无界面，先验证手感）</div><ul>
+  <li><span class="y">✓</span> <code>hexbench-core</code>：显示器枚举 + 探头分段 + 触发带（<code>cargo test</code> 覆盖第三节的布局）</li>
+  <li><span class="y">✓</span> 触发状态机（dwell / 冷却 / 离开复位 / 内推）</li>
+  <li><span class="y">✓</span> 任务栏排除、锁屏 / 全屏跳过</li>
+  <li><span class="y">✓</span> 进程黑名单（从运行中的应用列表点选，不区分大小写的 exe 名匹配）</li>
+  <li><span class="y">✓</span> <code>SendInput</code> 一次提交 + 失败检测（真机切换待手动确认）</li>
+  <li><span class="y">✓</span> 配置读写（JSON + 原子写 + <code>.bak</code> 回退）</li>
+  <li><span class="y">✓</span> <code>hexbench --layout</code>（本机布局 + <code>--demo</code> 复现第三节）</li>
+  <li><span class="y">✓</span> 单屏 dry-run 实测：误触 0，任务栏正确跳过</li>
+  <li>☐ 双屏实测（当前机器只有一块屏）</li>
+</ul></div>
+<div class="phase"><div class="ph">v0.2 常驻形态</div><ul>
+  <li><span class="y">✓</span> Tauri 托盘图标 + 菜单（打开主界面 / 测试模式 / 暂停 / 退出）</li>
+  <li><span class="y">✓</span> 单实例（第二次启动唤起窗口）、开机自启</li>
+  <li><span class="y">✓</span> 暂停热键（全局；组合被占用时只写日志，界面提示待补）</li>
+  <li><span class="y">✓</span> <code>windows: []</code> 纯托盘形态（启动不创建 WebView）</li>
+  <li><span class="y">✓</span> 纯托盘内存实测：12 MB 工作集 / 2 MB 私有，零 WebView 进程</li>
+</ul></div>
+<div class="phase"><div class="ph">v0.3 主界面</div><ul>
+  <li><span class="y">✓</span> 侧边栏「工具 / 全局」两层（概览 / 触发 / 防误触 / 通用 / 关于）</li>
+  <li><span class="y">✓</span> 布局图（真实坐标、分段触发带、光标跟随、命中高亮）</li>
+  <li><span class="y">✓</span> 触发页按当前配置实时预览触发带与可触发边缘（含接缝分段）</li>
+  <li><span class="y">✓</span> 触发范围可叠到真实屏幕（透明置顶、鼠标穿透、5 秒自动消失）</li>
+  <li><span class="y">✓</span> 测试模式 + 首次引导</li>
+  <li><span class="y">✓</span> 主题跟随系统 / 浅色 / 深色</li>
+  <li><span class="y">✓</span> 进程黑名单接入（点选添加，前台进程名缓存 250ms）</li>
+  <li><span class="y">✓</span> 系统强调色注入（灰阶强调色自动回退）</li>
+  <li>☐ Mica（透明窗口下实测渲染不出材质，已回退，需换方案）</li>
+  <li>☐ Tailwind + shadcn 基础层（当前手写 CSS，视觉 token 照第七节）</li>
+  <li>☐ spring 动效（当前只有 CSS transition）</li>
+</ul></div>
+<div class="phase"><div class="ph">v0.4 同步</div><ul>
+  <li><code>reqwest</code> WebDAV 客户端（含自签证书开关）</li>
+  <li>DPAPI 凭证存储</li>
+  <li>上传 / 下载 / 冲突提示 / 启动自动拉取</li>
+</ul></div>
+<div class="phase"><div class="ph">v0.5 发布</div><ul>
+  <li><span class="y">✓</span> NSIS 安装包（1.51 MB，未签名）</li>
+  <li>☐ <code>tauri-plugin-updater</code> 自动更新</li>
+  <li>GitHub Actions 自动构建 + SignPath 签名</li>
+  <li>winget / Scoop 上架</li>
+  <li>中英文文档 + 实测资源占用数据</li>
+</ul></div>
+
+<h2 id="decide">十五、决策清单</h2>
+
+<h3>已敲定</h3>
+<div class="tw"><table>
+  <thead><tr><th>事项</th><th>结论</th></tr></thead>
+  <tbody>
+    <tr><td>判定模型</td><td>探头分段，唯一模型；不再有"增强模式"</td></tr>
+    <tr><td>触发方式</td><td>状态机 + 停留阈值 + 离开复位，不做纯电平触发</td></tr>
+    <tr><td>触发带</td><td>默认贴底 10%，排除任务栏窗口；位置可换顶部，或「上下」= 四个角（配「两侧」）</td></tr>
+    <tr><td>光标回位</td><td>默认开，内推 24 px，可关</td></tr>
+    <tr><td>每屏开关</td><td>只存本地，按 EDID 作键，不进同步</td></tr>
+    <tr><td>配置</td><td>单一 <code>config.json</code> 原子写；密码 DPAPI 单独文件</td></tr>
+    <tr><td>信息架构</td><td>侧边栏分「工具 / 全局」两层；加工具只加一组，全局不动</td></tr>
+    <tr><td>首发页面</td><td>五页：概览 / 触发 / 防误触 / 通用 / 关于；同步随 v0.4</td></tr>
+    <tr><td>平台</td><td>Win11 22H2+ 主目标，Win10 22H2 尽力（Acrylic / 纯色兜底，不做像素级一致）</td></tr>
+    <tr><td>安装 / 更新</td><td>NSIS 为主、MSI 可选；<code>tauri-plugin-updater</code></td></tr>
+    <tr><td>首次使用</td><td>引导弹一次 + 测试模式</td></tr>
+    <tr><td>项目名</td><td><b>HexBench · 海克斯</b>（2026-10 暂定）；内部 crate 叫 <code>hexbench-core</code>，可执行文件 <code>hexbench.exe</code></td></tr>
+    <tr><td>许可证</td><td><b>MIT</b>（2026-10 定）；不做商业双许可，保留 SignPath 免费签名资格</td></tr>
+  </tbody>
+</table></div>
+
+<h3>待你拍板</h3>
+<div class="tw"><table>
+  <thead><tr><th>事项</th><th>建议</th><th>影响</th></tr></thead>
+  <tbody>
+    <tr><td>是否申请 SignPath</td><td>建议申请（要求项目已发布、有可验证声誉）</td><td>是否长期吃 SmartScreen 警告</td></tr>
+    <tr><td>首发语言</td><td>中文 + 英文</td><td>翻译量、托盘菜单同步</td></tr>
+    <tr><td>单屏左边缘默认值</td><td>实测后定，倾向默认关</td><td>开始按钮误触率</td></tr>
+    <tr><td>是否提供"关闭系统动画"入口</td><td>建议不提供，只写文档</td><td>勿替用户改全局设置</td></tr>
+  </tbody>
+</table></div>
+
+<p style="font-size:13.5px;color:var(--muted)"><b>SignPath 免费证书的硬条件</b>（2026-10 查 signpath.org/terms）：OSI 认可协议且<b>不得商业双许可</b>；项目必须已经发布、有可验证声誉；每版签名手动审批；团队全员开 MFA；主页要写明「代码签名政策」。</p>
+
+<p style="font-size:13.5px;color:var(--muted)">查重结果（2026-10）：GitHub 上 <code>hexbench</code> 只有 4 个 0 星仓库，crates.io 无同名 crate；<code>hexkit</code> 反而被一个「38+ 开发者小工具合集」占着，<code>hexdesk</code> 是家具设计，两个都不能用。中文名「海克斯」在中文语境里强关联英雄联盟的「海克斯科技」，对外露出统一写 <code>HexBench（海克斯）</code> 并带上功能描述。</p>
+
+<h2>开发</h2>
+<pre><code>pnpm install                          # 前端依赖（首次）
+pnpm tauri dev                        # 托盘 + 主界面（开发模式）
+
+cargo test                            # 几何 / 状态机 / 配置单测
+cargo run -p hexbench-cli             # 打印本机显示器与可触发区
+cargo run -p hexbench-cli -- --demo   # 复现第三节的示例布局
+cargo run -p hexbench-cli -- run --dry-run   # 跑引擎，只打印不切换</code></pre>
+<p>UI 目前是<b>手写 CSS</b>（未引入 Tailwind / shadcn / Framer Motion），视觉 token 照第七节执行。等交互定稿再评估是否迁移，避免先上框架再返工。</p>
+<div class="tw"><table>
+  <thead><tr><th>crate</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>hexbench-core</code></td><td>显示器枚举、探头分段、触发带；只依赖 <code>windows-sys</code>（官方 raw 绑定，见 <code>src/sys.rs</code>）</td></tr>
+    <tr><td><code>hexbench-cli</code></td><td><code>hexbench</code> 二进制：布局检查 + 无界面引擎（<code>run</code>）</td></tr>
+  </tbody>
+</table></div>
+<p>需要 Rust 1.85+ 与 MSVC 工具链。</p>
+
+<h2>许可证</h2>
+<p><b>MIT。</b></p>
+<ul>
+  <li>分发时保留版权声明与许可文本</li>
+  <li>不提供商业双许可版本（这是 SignPath 免费签名的前提）</li>
+  <li>项目名与图标不在许可授权范围内，衍生分发请改名换图标</li>
+</ul>
+
+<footer>
+  源文件：<span class="src">README.md</span> · 本页为同一内容的渲染版本 · 改 README 后需同步本页
+</footer>
+
+</div>
+</body>
+</html>

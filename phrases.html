@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>快捷语</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #ffffff;
+        color: #1b1f24;
+        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+          sans-serif;
+        overflow: hidden;
+      }
+
+      #root {
+        height: 100%;
+      }
+
+      .panel {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        border: 1px solid #e3e7ed;
+        border-radius: 10px;
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+
+      .head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 6px 8px 6px 12px;
+        background: #f8f9fb;
+        border-bottom: 1px solid #e3e7ed;
+        font-size: 12px;
+        color: #5f6a76;
+        cursor: grab;
+        user-select: none;
+      }
+
+      .head-logo {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        margin-right: 7px;
+        padding: 0;
+        border: none;
+        background: transparent;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      .head-logo:hover {
+        background: #eef1f6;
+      }
+
+      .head-title {
+        margin-right: auto;
+      }
+
+      .head-title {
+        font-weight: 600;
+        color: #1b1f24;
+      }
+
+      .head-actions {
+        display: flex;
+        gap: 6px;
+      }
+
+      .icon {
+        border: none;
+        background: transparent;
+        color: #5f6a76;
+        font-size: 13px;
+        line-height: 1;
+        width: 24px;
+        height: 22px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      .icon.active {
+        background: #e8f0ff;
+        color: #2f6fed;
+      }
+
+      .icon:hover {
+        background: #eef1f6;
+        color: #1b1f24;
+      }
+
+      .list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .item {
+        text-align: left;
+        border: 1px solid #e3e7ed;
+        background: #ffffff;
+        border-radius: 8px;
+        padding: 8px 10px;
+        cursor: pointer;
+        font: inherit;
+        color: inherit;
+      }
+
+      .item:hover {
+        border-color: #2f6fed;
+        background: #f5f8ff;
+      }
+
+      .item .title {
+        display: block;
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      .item .preview {
+        display: block;
+        color: #5f6a76;
+        font-size: 11.5px;
+        margin-top: 3px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .edit-item {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 8px;
+        border: 1px solid #e3e7ed;
+        border-radius: 8px;
+        background: #f8f9fb;
+      }
+
+      .edit-item input,
+      .edit-item textarea {
+        font: inherit;
+        font-size: 12.5px;
+        color: #1b1f24;
+        background: #ffffff;
+        border: 1px solid #e3e7ed;
+        border-radius: 6px;
+        padding: 6px 8px;
+        outline: none;
+        resize: vertical;
+      }
+
+      .edit-item input:focus,
+      .edit-item textarea:focus {
+        border-color: #2f6fed;
+      }
+
+      .edit-item .del {
+        align-self: flex-end;
+        border: none;
+        background: transparent;
+        color: #b42318;
+        font-size: 11.5px;
+        cursor: pointer;
+        padding: 2px 4px;
+      }
+
+      .empty {
+        color: #5f6a76;
+        font-size: 12px;
+        padding: 14px 10px;
+        line-height: 1.7;
+      }
+
+
+      .panel.collapsed {
+        border-radius: 14px;
+      }
+
+      .bubble {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 100%;
+        height: 100%;
+        background: #ffffff;
+        border-radius: 14px;
+        color: #2f6fed;
+        cursor: grab;
+        user-select: none;
+      }
+
+      .bubble:hover {
+        background: #f5f8ff;
+      }
+
+      .bubble .count {
+        position: absolute;
+        right: 9px;
+        bottom: 6px;
+        font-size: 10.5px;
+        color: #5f6a76;
+      }
+
+      .toast {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 10px;
+        text-align: center;
+        font-size: 11.5px;
+        color: #15803d;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/phrases.tsx"></script>
+  </body>
+</html>

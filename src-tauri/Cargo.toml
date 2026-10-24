@@ -1,0 +1,28 @@
+[package]
+name = "hexbench-app"
+description = "HexBench tray application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexbench_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hexbench-core = { path = "../crates/hexbench-core" }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

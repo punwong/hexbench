@@ -1,0 +1,60 @@
+name: release
+
+# 打 tag 即发版：签名构建 → 生成 latest.json → 发布 Release。
+# 需要的仓库 secrets：
+#   TAURI_SIGNING_PRIVATE_KEY          （minisign 私钥内容，publish 之后不可更改）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD （私钥口令，没设就留空）
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 签名构建（NSIS + updater 工件）
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: 生成 latest.json
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_NOTES: ${{ github.event.head_commit.message }}
+        run: node scripts/latest-json.mjs
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/nsis/*-setup.exe.sig
+            latest.json
