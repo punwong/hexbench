@@ -11,6 +11,7 @@ import type {
   Snapshot,
   TriggerSettings,
   UiSettings,
+  UpdateSettings,
 } from "./types";
 import {
   checkUpdate,
@@ -34,6 +35,7 @@ export type Patch = {
   guard?: Partial<GuardSettings>;
   hotkeys?: Partial<HotkeySettings>;
   phrases?: Partial<PhraseSettings>;
+  updates?: Partial<UpdateSettings>;
   ui?: Partial<UiSettings>;
 };
 
@@ -686,7 +688,21 @@ export function GeneralPage({
   );
 }
 
-function UpdateCard({ version }: { version: string }) {
+function UpdateCard({
+  version,
+  endpoint,
+  onSaveEndpoint,
+}: {
+  version: string;
+  endpoint: string;
+  onSaveEndpoint: (value: string) => void;
+}) {
+  const [endpointDraft, setEndpointDraft] = useState(endpoint);
+
+  useEffect(() => {
+    setEndpointDraft(endpoint);
+  }, [endpoint]);
+
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
@@ -733,6 +749,24 @@ function UpdateCard({ version }: { version: string }) {
       <Row label="当前版本">
         <span className="sub">{version}</span>
       </Row>
+      <Row label="更新源" hint="留空用内置地址；也可以填自己的镜像（需 https）">
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            className="phrase-text"
+            style={{ width: 330 }}
+            value={endpointDraft}
+            placeholder="https://…/latest.json"
+            onChange={(event) => setEndpointDraft(event.target.value)}
+          />
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onSaveEndpoint(endpointDraft.trim())}
+          >
+            保存
+          </button>
+        </div>
+      </Row>
       <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
         <button type="button" className="btn" disabled={busy} onClick={() => void check()}>
           检查更新
@@ -753,10 +787,22 @@ function UpdateCard({ version }: { version: string }) {
   );
 }
 
-export function AboutPage({ snap }: { snap: Snapshot }) {
+export function AboutPage({
+  snap,
+  config,
+  update,
+}: {
+  snap: Snapshot;
+  config: Config;
+  update: UpdateConfig;
+}) {
   return (
     <div className="stack">
-      <UpdateCard version={snap.version} />
+      <UpdateCard
+        version={snap.version}
+        endpoint={config.updates.endpoint}
+        onSaveEndpoint={(value) => update({ updates: { endpoint: value } })}
+      />
       <Card title="关于 HexBench">
         <dl className="kv">
           <dt>版本</dt>

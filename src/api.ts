@@ -1,7 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check } from "@tauri-apps/plugin-updater";
 import type { Config, RunningApp, Snapshot } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -27,6 +25,7 @@ const demoConfig: Config = {
     pauseHotkey: "Ctrl+Alt+Shift+P",
   },
   hotkeys: { pause: "Ctrl+Alt+Shift+P", phrasesPanel: "Ctrl+Alt+Shift+Q" },
+  updates: { endpoint: "" },
   sync: {
     enabled: false,
     url: "",
@@ -214,36 +213,29 @@ export interface UpdateInfo {
 
 export async function checkUpdate(): Promise<UpdateInfo | null> {
   if (!isTauri) return null;
-  const update = await check();
-  if (!update) return null;
-  return {
-    version: update.version,
-    date: update.date ?? "",
-    notes: update.body ?? "",
-  };
+  return invoke<UpdateInfo | null>("update_check");
 }
 
 export async function installUpdate(
   onProgress: (percent: number | null) => void,
 ): Promise<void> {
   if (!isTauri) return;
-  const update = await check();
-  if (!update) return;
   let downloaded = 0;
   let total: number | null = null;
-  await update.downloadAndInstall((event) => {
-    if (event.event === "Started") {
-      total = event.data.contentLength ?? null;
-      downloaded = 0;
-      onProgress(0);
-    } else if (event.event === "Progress") {
-      downloaded += event.data.chunkLength;
+  const unlisten = await listen<{ chunk: number; total: number | null }>(
+    "update-progress",
+    (event) => {
+      downloaded += event.payload.chunk;
+      total = event.payload.total ?? total;
       onProgress(total ? Math.min(100, Math.round((downloaded / total) * 100)) : null);
-    } else if (event.event === "Finished") {
-      onProgress(100);
-    }
-  });
-  await relaunch();
+    },
+  );
+  try {
+    // The installer replaces the process; this call does not return on success.
+    await invoke("update_install");
+  } finally {
+    unlisten();
+  }
 }
 
 export async function pickApp(): Promise<void> {

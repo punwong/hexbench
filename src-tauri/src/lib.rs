@@ -11,6 +11,7 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 use hexbench_core::config::{self, Config, DockSide};
@@ -687,6 +688,70 @@ fn sync_pull(state: State<'_, AppState>) -> Result<String, String> {
     Ok("已拉取并应用".to_string())
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfoDto {
+    version: String,
+    notes: String,
+    date: String,
+}
+
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    chunk: usize,
+    total: Option<u64>,
+}
+
+fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let endpoint = {
+        let state = app.state::<AppState>();
+        let shared = state.shared.lock().unwrap();
+        shared.config.updates.endpoint.clone()
+    };
+
+    let mut builder = app.updater_builder();
+    if !endpoint.trim().is_empty() {
+        let url: tauri::Url = endpoint
+            .trim()
+            .parse()
+            .map_err(|error| format!("更新地址无效：{error}"))?;
+        builder = builder
+            .endpoints(vec![url])
+            .map_err(|error| error.to_string())?;
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn update_check(app: AppHandle) -> Result<Option<UpdateInfoDto>, String> {
+    let updater = build_updater(&app)?;
+    let update = updater.check().await.map_err(|error| error.to_string())?;
+    Ok(update.map(|update| UpdateInfoDto {
+        version: update.version.clone(),
+        notes: update.body.clone().unwrap_or_default(),
+        date: update.date.map(|date| date.to_string()).unwrap_or_default(),
+    }))
+}
+
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Result<(), String> {
+    let updater = build_updater(&app)?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Err("没有可用的更新".to_string());
+    };
+
+    let progress_app = app.clone();
+    update
+        .download_and_install(
+            move |chunk, total| {
+                let _ = progress_app.emit("update-progress", UpdateProgress { chunk, total });
+            },
+            || {},
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Let the user click any window to pick it.
 #[tauri::command]
 fn pick_app(app: AppHandle) {
@@ -1235,6 +1300,8 @@ pub fn run() {
             sync_save,
             sync_push,
             sync_pull,
+            update_check,
+            update_install,
             pick_app,
             toggle_phrases_panel
         ])

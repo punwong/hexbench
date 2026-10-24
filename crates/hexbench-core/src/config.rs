@@ -20,6 +20,7 @@ pub struct Config {
     pub hotkeys: HotkeySettings,
     pub phrases: PhraseSettings,
     pub sync: SyncSettings,
+    pub updates: UpdateSettings,
     pub ui: UiSettings,
     pub meta: MetaSettings,
 }
@@ -33,6 +34,7 @@ impl Default for Config {
             hotkeys: HotkeySettings::default(),
             phrases: PhraseSettings::default(),
             sync: SyncSettings::default(),
+            updates: UpdateSettings::default(),
             ui: UiSettings::default(),
             meta: MetaSettings::default(),
         }
@@ -80,6 +82,15 @@ pub struct SyncSettings {
     pub password: String,
     pub last_push: i64,
     pub last_pull: i64,
+}
+
+/// Where the updater looks for `latest.json`. Empty means "use the endpoint
+/// compiled into the build"; setting it lets users pick a mirror without
+/// rebuilding (GitHub downloads are slow in some networks).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UpdateSettings {
+    pub endpoint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

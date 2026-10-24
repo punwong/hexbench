@@ -104,6 +104,7 @@ export default function App() {
       guard: { ...current.guard, ...patch.guard },
       hotkeys: { ...current.hotkeys, ...patch.hotkeys },
       phrases: { ...current.phrases, ...patch.phrases },
+      updates: { ...current.updates, ...patch.updates },
       ui: { ...current.ui, ...patch.ui },
     };
     configRef.current = next;
@@ -236,7 +237,7 @@ export default function App() {
             onOpenFolder={() => void openConfigFolder()}
           />
         ) : (
-          <AboutPage snap={snap} />
+          <AboutPage snap={snap} config={config} update={update} />
         )}
       </main>
 

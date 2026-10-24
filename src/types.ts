@@ -42,8 +42,13 @@ export interface Config {
   hotkeys: HotkeySettings;
   phrases: PhraseSettings;
   sync: SyncSettings;
+  updates: UpdateSettings;
   ui: UiSettings;
   meta: MetaSettings;
+}
+
+export interface UpdateSettings {
+  endpoint: string;
 }
 
 export interface SyncSettings {
