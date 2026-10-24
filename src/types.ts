@@ -49,6 +49,7 @@ export interface Config {
 
 export interface UpdateSettings {
   endpoint: string;
+  dismissedVersion: string;
 }
 
 export interface SyncSettings {

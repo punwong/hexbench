@@ -918,3 +918,26 @@ code,
   background: var(--accent);
   transition: width 0.2s ease;
 }
+
+.update-pill {
+  position: relative;
+}
+
+.update-dismiss {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.update-dismiss:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}

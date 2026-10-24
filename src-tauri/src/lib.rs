@@ -135,6 +135,17 @@ struct AppState {
     /// `update_install`. Kept in memory (a couple of MB) so the user can
     /// download first and restart later.
     pending_update: Mutex<Option<Vec<u8>>>,
+    /// Result of the last update check, shared by every window so opening the
+    /// main window does not hit the network again.
+    update_status: Mutex<UpdateStatus>,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStatus {
+    version: Option<String>,
+    error: Option<String>,
+    checked_at: i64,
 }
 
 #[tauri::command]
@@ -733,13 +744,42 @@ fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Strin
 
 #[tauri::command]
 async fn update_check(app: AppHandle) -> Result<Option<UpdateInfoDto>, String> {
-    let updater = build_updater(&app)?;
+    let result = check_once(&app).await;
+
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut status = state.update_status.lock().unwrap();
+        status.checked_at = now_secs();
+        match &result {
+            Ok(info) => {
+                status.version = info.as_ref().map(|info| info.version.clone());
+                status.error = None;
+            }
+            Err(error) => {
+                status.version = None;
+                status.error = Some(error.clone());
+            }
+        }
+        status.clone()
+    };
+    let _ = app.emit("update-status", snapshot);
+
+    result
+}
+
+async fn check_once(app: &AppHandle) -> Result<Option<UpdateInfoDto>, String> {
+    let updater = build_updater(app)?;
     let update = updater.check().await.map_err(|error| error.to_string())?;
     Ok(update.map(|update| UpdateInfoDto {
         version: update.version.clone(),
         notes: update.body.clone().unwrap_or_default(),
         date: update.date.map(|date| date.to_string()).unwrap_or_default(),
     }))
+}
+
+#[tauri::command]
+fn update_status(state: State<'_, AppState>) -> UpdateStatus {
+    state.update_status.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -1326,6 +1366,7 @@ pub fn run() {
             shared,
             config_path,
             pending_update: Mutex::new(None),
+            update_status: Mutex::new(UpdateStatus::default()),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -1353,6 +1394,7 @@ pub fn run() {
             sync_push,
             sync_pull,
             update_check,
+            update_status,
             update_download,
             update_install,
             pick_app,
@@ -1389,6 +1431,15 @@ pub fn run() {
                 // Setup runs before the event loop, so building here is safe.
                 open_main_now(&handle);
             }
+
+            // One update check per process, a few seconds in: windows come and
+            // go, but the version does not change while the app runs.
+            let check_handle = handle.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(3));
+                let _ = tauri::async_runtime::block_on(update_check(check_handle));
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {

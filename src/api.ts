@@ -25,7 +25,7 @@ const demoConfig: Config = {
     pauseHotkey: "Ctrl+Alt+Shift+P",
   },
   hotkeys: { pause: "Ctrl+Alt+Shift+P", phrasesPanel: "Ctrl+Alt+Shift+Q" },
-  updates: { endpoint: "" },
+  updates: { endpoint: "", dismissedVersion: "" },
   sync: {
     enabled: false,
     url: "",
@@ -241,6 +241,25 @@ export async function downloadUpdate(
 export async function installDownloaded(): Promise<void> {
   if (!isTauri) return;
   await invoke("update_install");
+}
+
+export interface UpdateStatus {
+  version: string | null;
+  error: string | null;
+  checkedAt: number;
+}
+
+/// Cached result of the process-wide check (no network round trip).
+export async function updateStatus(): Promise<UpdateStatus> {
+  if (!isTauri) return { version: null, error: null, checkedAt: 0 };
+  return invoke<UpdateStatus>("update_status");
+}
+
+export async function onUpdateStatus(
+  handler: (status: UpdateStatus) => void,
+): Promise<() => void> {
+  if (!isTauri) return () => undefined;
+  return listen<UpdateStatus>("update-status", (event) => handler(event.payload));
 }
 
 export async function pickApp(): Promise<void> {

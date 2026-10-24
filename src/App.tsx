@@ -19,6 +19,8 @@ import {
   downloadUpdate,
   getSnapshot,
   installDownloaded,
+  onUpdateStatus,
+  updateStatus,
   openConfigFolder,
   refreshLayout,
   saveConfig,
@@ -108,10 +110,41 @@ export default function App() {
     }
   }, []);
 
+  // The process checks once at startup; windows read that cached result and
+  // follow the live event, so opening the window costs no network round trip.
   useEffect(() => {
-    const timer = window.setTimeout(() => void runCheck(true), 3000);
-    return () => window.clearTimeout(timer);
-  }, [runCheck]);
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+
+    const applyStatus = (status: { version: string | null }) => {
+      if (!alive) return;
+      if (status.version) {
+        setUpdateVersion(status.version);
+        setUpdatePhase((phase) =>
+          phase === "downloading" || phase === "ready" ? phase : "available",
+        );
+      } else {
+        setUpdatePhase((phase) =>
+          phase === "downloading" || phase === "ready" ? phase : "idle",
+        );
+      }
+    };
+
+    void (async () => {
+      try {
+        applyStatus(await updateStatus());
+      } catch {
+        // A failed read only means no hint; the user can still check manually.
+      }
+      if (!alive) return;
+      unlisten = await onUpdateStatus(applyStatus);
+    })();
+
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, []);
 
   const configRef = useRef<Config | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
@@ -210,6 +243,15 @@ export default function App() {
 
   const showOnboarding = snap !== null && config !== null && !config.ui.onboarded;
 
+  // A dismissed version stays quiet until a different one shows up.
+  const updateDismissed =
+    updateVersion !== null && updateVersion === config?.updates.dismissedVersion;
+  const showUpdatePill =
+    updatePhase === "downloading" ||
+    updatePhase === "ready" ||
+    updatePhase === "error" ||
+    (updatePhase === "available" && !updateDismissed);
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -241,10 +283,7 @@ export default function App() {
         </div>
 
         <div className="sidebar-bottom">
-        {(updatePhase === "available" ||
-          updatePhase === "downloading" ||
-          updatePhase === "ready" ||
-          updatePhase === "error") && (
+        {showUpdatePill && (
           <div className={`update-pill ${updatePhase}`}>
             <button
               type="button"
@@ -268,6 +307,18 @@ export default function App() {
               <div className="update-bar">
                 <i style={{ width: `${updateProgress ?? 0}%` }} />
               </div>
+            )}
+            {updatePhase === "available" && (
+              <button
+                type="button"
+                className="update-dismiss"
+                title="忽略这个版本"
+                onClick={() => {
+                  update({ updates: { dismissedVersion: updateVersion ?? "" } });
+                }}
+              >
+                ×
+              </button>
             )}
           </div>
         )}

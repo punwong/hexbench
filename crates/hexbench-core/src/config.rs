@@ -91,6 +91,9 @@ pub struct SyncSettings {
 #[serde(default, rename_all = "camelCase")]
 pub struct UpdateSettings {
     pub endpoint: String,
+    /// Version the user dismissed from the sidebar hint; a newer release
+    /// clears it by simply being a different string.
+    pub dismissed_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
