@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -7,11 +8,15 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_updater::UpdaterExt;
+
+/// Set only by the tray "quit" item (and app.exit calls), so the exit veto can
+/// tell "the user closed the window" from "the user wants to quit".
+static QUITTING: AtomicBool = AtomicBool::new(false);
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 use hexbench_core::config::{self, Config, DockSide};
@@ -1044,6 +1049,14 @@ fn create_virtual_desktop(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn open_main(app: &AppHandle) {
+    // Same rule as the phrase panel: never build a webview inside an
+    // event-loop callback (tray menu, single-instance hand-off), it re-enters
+    // the loop and deadlocks. A worker thread is safe.
+    let handle = app.clone();
+    thread::spawn(move || open_main_now(&handle));
+}
+
+fn open_main_now(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1084,7 +1097,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => open_main(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                QUITTING.store(true, Ordering::SeqCst);
+                app.exit(0);
+            }
             "test" => {
                 let state = app.state::<AppState>();
                 let mut shared = state.shared.lock().unwrap();
@@ -1333,19 +1349,35 @@ pub fn run() {
             // in the tray (the plan's "开机自启绝不弹窗").
             let started_by_autostart = std::env::args().any(|arg| arg == "--autostart");
             if !started_by_autostart {
-                open_main(&handle);
+                // Setup runs before the event loop, so building here is safe.
+                open_main_now(&handle);
             }
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                // Hide instead of destroy: destroying the last window makes Tauri
-                // end the event loop, which quits a tray app. The WebView stays
-                // alive, so closing only wins the screen, not the RAM.
+            let WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            // Other windows (the phrase panel) keep the cheap hide/show toggle.
+            if window.label() != "main" {
                 api.prevent_close();
                 let _ = window.hide();
+                return;
             }
+            // Destroy instead of hide: a hidden window keeps its WebView2
+            // processes alive (~220 MB private for the main window). Dropping
+            // the window frees them; the app survives because ExitRequested is
+            // vetoed in the run handler below.
+            api.prevent_close();
+            let _ = window.destroy();
         })
-        .run(tauri::generate_context!())
-        .expect("error while running HexBench");
+        .build(tauri::generate_context!())
+        .expect("error while building HexBench")
+        .run(|_, event| {
+            if let RunEvent::ExitRequested { api, .. } = event {
+                if !QUITTING.load(Ordering::SeqCst) {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
