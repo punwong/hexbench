@@ -2,7 +2,7 @@
 
 > **Switch Windows virtual desktops by pushing the mouse to the outermost edge of your screens.**
 
-A small, tray-resident toolbox for Windows 11. Multi-monitor aware, zero configuration, and it does not need Quicker or any other host app.
+A small, tray-resident toolbox for Windows 11. Multi-monitor aware, zero configuration, and it runs on its own — no host app required.
 
 **[中文文档](README.md) · MIT · Tauri 2 + React**
 
