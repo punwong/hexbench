@@ -516,17 +516,6 @@ code,
   }
 }
 
-.cursor {
-  fill: var(--accent);
-  stroke: var(--panel);
-  stroke-width: 1.5;
-}
-
-.crosshair {
-  stroke: var(--accent);
-  stroke-opacity: 0.3;
-  stroke-dasharray: 3 4;
-}
 
 .legend {
   display: flex;

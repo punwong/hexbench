@@ -165,7 +165,7 @@ export default function App() {
       } catch (reason) {
         if (alive) setError(String(reason));
       }
-      if (alive) timer = window.setTimeout(poll, 120);
+      // The layout diagram polls the cursor on its own; this only refreshes\n        // config/stats, so it can be slow.\n        if (alive) timer = window.setTimeout(poll, 500);
     };
 
     void poll();

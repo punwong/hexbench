@@ -91,7 +91,6 @@ export function Overview({
           <MonitorMap
             monitors={snap.monitors}
             regions={snap.regions}
-            cursor={snap.cursor}
             hit={snap.hit}
             sides={config.trigger.sides}
             dimmed={snap.paused}

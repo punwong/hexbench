@@ -244,6 +244,7 @@ export async function installDownloaded(): Promise<void> {
   await invoke("update_install");
 }
 
+
 export interface UpdateStatus {
   version: string | null;
   error: string | null;

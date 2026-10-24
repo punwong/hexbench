@@ -1,4 +1,4 @@
-import type { HitDto, MonitorDto, Point, RegionDto, Sides } from "../types";
+import type { HitDto, MonitorDto, RegionDto, Sides } from "../types";
 
 const WIDTH = 660;
 const HEIGHT = 300;
@@ -7,14 +7,12 @@ const PAD = 36;
 export function MonitorMap({
   monitors,
   regions,
-  cursor,
   hit,
   sides,
   dimmed,
 }: {
   monitors: MonitorDto[];
   regions: RegionDto[];
-  cursor: Point | null;
   hit: HitDto | null;
   sides: Sides;
   dimmed?: boolean;
@@ -76,9 +74,7 @@ export function MonitorMap({
         const enabled =
           region.side === "left" ? sides !== "right" : sides !== "left";
         const active =
-          hit !== null &&
-          hit.monitor === region.monitor &&
-          hit.side === region.side;
+          hit !== null && hit.monitor === region.monitor && hit.side === region.side;
         const bandWidth = 6;
         const x =
           region.side === "left" ? sx(region.edgeX) : sx(region.edgeX) - bandWidth;
@@ -95,25 +91,7 @@ export function MonitorMap({
         );
       })}
 
-      {cursor && (
-        <g>
-          <line
-            className="crosshair"
-            x1={sx(cursor.x)}
-            y1={0}
-            x2={sx(cursor.x)}
-            y2={HEIGHT}
-          />
-          <line
-            className="crosshair"
-            x1={0}
-            y1={sy(cursor.y)}
-            x2={WIDTH}
-            y2={sy(cursor.y)}
-          />
-          <circle className="cursor" cx={sx(cursor.x)} cy={sy(cursor.y)} r={4.5} />
-        </g>
-      )}
+
     </svg>
   );
 }
