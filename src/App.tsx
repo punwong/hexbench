@@ -40,6 +40,7 @@ import {
   TriggerPage,
 } from "./pages";
 import type { Patch } from "./pages";
+import { TitleBar } from "./components/TitleBar";
 
 type Page = "overview" | "trigger" | "guards" | "phrases" | "hotkeys" | "general" | "about";
 
@@ -244,15 +245,9 @@ export default function App() {
 
   return (
     <div className="app">
+      <TitleBar />
+      <div className="shell">
       <aside className="sidebar">
-        <div className="brand">
-          <div className="logo" />
-          <div>
-            <div className="brand-name">HexBench</div>
-            <div className="brand-sub">海克斯</div>
-          </div>
-        </div>
-
         <div className="nav-group">
           <div className="nav-label">边缘切桌面</div>
           <NavItem page="overview" current={page} onClick={setPage} icon={<Gauge size={16} />} label="概览" />
@@ -389,6 +384,7 @@ export default function App() {
         )}
         </div>
       </main>
+      </div>
 
       {showOnboarding && (
         <Onboarding

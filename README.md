@@ -481,6 +481,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | 凭证 | DPAPI 加密存 `credentials.bin`，不进导出、不进同步 |
 | 热键 | `RegisterHotKey`，失败时提示占用并要求改键；不静默降级 |
 | 单实例 / 自启 | `tauri-plugin-single-instance` / `tauri-plugin-autostart`；自启带 `--autostart` 参数，不弹窗 |
+| 窗口 | 无系统边框（`decorations(false)`），38 px 自绘标题栏；拖动与双击最大化仍走系统 `HTCAPTION`，四边四角用 4 px 命中区做缩放 |
 | 视觉 | 中性灰阶 + 无边框 + 无阴影；靠底色深浅和留白分层；切页 220 ms 淡入位移，控件 160–180 ms 统一缓动 |
 | 日志 | `tauri-plugin-log`（Info 级，依赖库降到 Warn）：记录防误触状态变化与每次触发；关于页可一键复制诊断（状态 + 显示器 + 配置 + 日志尾部） |
 | 更新 | `tauri-plugin-updater` + 签名；关于页手动检查 + 可选自动检查 |
