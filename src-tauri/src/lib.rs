@@ -1198,6 +1198,14 @@ fn spawn_panel_follower(app: AppHandle) {
     });
 }
 
+/// Start moving the window from the custom title bar.
+#[tauri::command]
+fn begin_drag(window: tauri::WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        hexbench_core::sys::start_manual_drag(hwnd.0 as isize);
+    }
+}
+
 #[tauri::command]
 fn create_virtual_desktop(state: State<'_, AppState>) -> Result<(), String> {
     let origin = hexbench_core::sys::virtual_desktop_state().map(|(_, index)| index);
@@ -1265,6 +1273,8 @@ fn open_main_now(app: &AppHandle) {
         .title("HexBench")
         .inner_size(980.0, 660.0)
         .min_inner_size(840.0, 560.0)
+        // The app draws its own title bar and window buttons.
+        .decorations(false)
         .center()
         .build();
 }
@@ -1511,6 +1521,12 @@ pub fn run() {
                 // and changes size on collapse; letting the plugin restore a
                 // stale size would fight both.
                 .with_denylist(&["phrases", "overlay"])
+                // The window is frameless by design: restoring a saved
+                // "decorated" flag would bring the system title bar back.
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::DECORATIONS,
+                )
                 .build(),
         )
         .plugin(
@@ -1559,6 +1575,7 @@ pub fn run() {
             set_autostart,
             open_config_folder,
             create_virtual_desktop,
+            begin_drag,
             overlay_zones,
             show_trigger_overlay,
             running_apps,

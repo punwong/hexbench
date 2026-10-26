@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::geometry::EdgeProbe;
@@ -457,6 +457,47 @@ pub fn is_locked() -> bool {
     }
 }
 
+/// Drag the window from its custom title bar.
+///
+/// A window without a system frame does not answer the caption drag, so the
+/// title bar moves it from here: follow the cursor while the left button is
+/// held, then stop.
+pub fn start_manual_drag(hwnd: isize) {
+    thread::spawn(move || {
+        let hwnd = hwnd as HWND;
+        let mut origin = POINT::default();
+        let mut rect = RECT::default();
+        // SAFETY: plain queries on a live window owned by this process.
+        unsafe {
+            if GetCursorPos(&mut origin) == 0 || GetWindowRect(hwnd, &mut rect) == 0 {
+                return;
+            }
+        }
+        loop {
+            // SAFETY: same.
+            if unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } >= 0 {
+                break;
+            }
+            let mut now = POINT::default();
+            // SAFETY: same.
+            unsafe {
+                if GetCursorPos(&mut now) == 0 {
+                    break;
+                }
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left + (now.x - origin.x),
+                    rect.top + (now.y - origin.y),
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+    });
+}
 /// Move the cursor (used to nudge it back inside after a switch).
 pub fn set_cursor_pos(x: i32, y: i32) -> bool {
     // SAFETY: plain values.

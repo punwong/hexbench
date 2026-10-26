@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type ResizeDirection =
@@ -26,6 +27,7 @@ const EDGES: Array<[string, ResizeDirection]> = [
 
 export function TitleBar() {
   const [maximized, setMaximized] = useState(false);
+  const lastPress = useRef(0);
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -60,13 +62,27 @@ export function TitleBar() {
         />
       ))}
 
-      <header className="titlebar" data-tauri-drag-region>
-        <span className="titlebar-brand" data-tauri-drag-region>
+      <header
+        className="titlebar"
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          if ((event.target as HTMLElement).closest(".titlebar-actions")) return;
+          const now = Date.now();
+          if (now - lastPress.current < 350) {
+            lastPress.current = 0;
+            void win.toggleMaximize();
+            return;
+          }
+          lastPress.current = now;
+          void invoke("begin_drag");
+        }}
+      >
+        <span className="titlebar-brand">
           <span className="titlebar-logo" aria-hidden="true" />
-          <span className="titlebar-name" data-tauri-drag-region>
+          <span className="titlebar-name">
             HexBench
           </span>
-          <span className="titlebar-sub" data-tauri-drag-region>
+          <span className="titlebar-sub">
             海克斯
           </span>
         </span>
