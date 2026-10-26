@@ -1,33 +1,62 @@
+/* ============================================================================
+   HexBench · 视觉系统
+
+   规则只有三条：
+   1. 不用边框分隔，靠底色深浅与留白分层；
+   2. 不用高光、渐变、发光，任何"玻璃感"都不做；
+   3. 动效只做位移与淡入，180–220ms，一个缓动曲线到底。
+   ============================================================================ */
+
 :root {
-  --bg: #f4f6f9;
-  --panel: #ffffff;
-  --panel-2: #f8f9fb;
-  --border: #e3e7ed;
-  --text: #1b1f24;
-  --muted: #5f6a76;
-  --accent: #2f6fed;
-  --accent-soft: color-mix(in srgb, var(--accent) 10%, #ffffff);
-  --ok: #15803d;
-  --warn: #b45309;
-  --danger: #c62828;
-  --shadow: 0 1px 2px rgba(16, 24, 40, 0.05), 0 6px 20px rgba(16, 24, 40, 0.06);
-  --radius: 12px;
+  /* 表面：白底画布，内容用浅灰托起 */
+  --bg: #ffffff;
+  --sidebar: #f7f7f8;
+  --surface: #f7f7f8;
+  --surface-2: #efeff1;
+  --surface-3: #e6e6e9;
+
+  /* 文字：接近纯黑，辅助文字中灰 */
+  --text: #0d0d0d;
+  --text-2: #3d3d3d;
+  --muted: #6b6b6b;
+
+  /* 主色是黑：按钮、开关、选中态都走中性色 */
+  --accent: #0d0d0d;
+  --on-accent: #ffffff;
+  --accent-soft: #efeff1;
+
+  --ok: #10a37f;
+  --warn: #b8790c;
+  --danger: #d92d20;
+
+  --radius: 16px;
+  --radius-sm: 10px;
+
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur: 180ms;
+
   color-scheme: light;
 }
 
 :root[data-theme="dark"] {
-  --bg: #101216;
-  --panel: #181b20;
-  --panel-2: #1d2127;
-  --border: #2a2f37;
-  --text: #e8ecf1;
-  --muted: #98a2ae;
-  --accent: #6f9dff;
-  --accent-soft: color-mix(in srgb, var(--accent) 20%, #101216);
-  --ok: #4ade80;
-  --warn: #fbbf24;
-  --danger: #f87171;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --bg: #0d0d0d;
+  --sidebar: #131313;
+  --surface: #191919;
+  --surface-2: #232323;
+  --surface-3: #2c2c2c;
+
+  --text: #ececec;
+  --text-2: #c6c6c6;
+  --muted: #9b9b9b;
+
+  --accent: #ececec;
+  --on-accent: #0d0d0d;
+  --accent-soft: #232323;
+
+  --ok: #3ddc97;
+  --warn: #e0a24b;
+  --danger: #ff6b6b;
+
   color-scheme: dark;
 }
 
@@ -62,9 +91,13 @@ button {
   width: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 10px;
+  background: var(--surface-3);
+  border-radius: 999px;
   border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-track {
@@ -77,35 +110,78 @@ button {
   height: 100%;
 }
 
-/* ---------- sidebar ---------- */
+/* ---------- 动效 ---------- */
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.page {
+  animation: page-in 220ms var(--ease) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* ---------- 侧边栏 ---------- */
 
 .sidebar {
-  background: var(--panel-2);
-  border-right: 1px solid var(--border);
-  padding: 14px 10px 12px;
+  background: var(--sidebar);
+  padding: 16px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 4px 10px 16px;
+  padding: 2px 8px 18px;
 }
 
 .logo {
   width: 26px;
   height: 28px;
-  background: var(--accent);
+  background: var(--text);
   clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
   flex: 0 0 auto;
 }
 
 .brand-name {
   font-size: 15px;
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: -0.01em;
 }
 
@@ -116,46 +192,51 @@ button {
 }
 
 .nav-group {
-  margin-top: 10px;
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
 }
 
 .nav-label {
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
   color: var(--muted);
-  padding: 6px 10px;
+  padding: 4px 10px 6px;
 }
 
 .nav-item {
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 7px 10px;
-  border-radius: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
   border: none;
   background: transparent;
   width: 100%;
   text-align: left;
   font-size: 13.5px;
-  color: var(--text);
+  color: var(--text-2);
   cursor: pointer;
-  transition: background 0.12s ease;
+  transition:
+    background-color var(--dur) var(--ease),
+    color var(--dur) var(--ease);
 }
 
 .nav-item:hover {
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  background: var(--surface-2);
+  color: var(--text);
 }
 
 .nav-item.active {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--surface-2);
+  color: var(--text);
   font-weight: 600;
 }
 
-.nav-item svg {
-  opacity: 0.8;
+.nav-item:active {
+  background: var(--surface-3);
 }
 
 .sidebar-foot {
@@ -165,11 +246,11 @@ button {
   color: var(--muted);
 }
 
-/* ---------- main ---------- */
+/* ---------- 主区域 ---------- */
 
 .main {
   overflow-y: auto;
-  padding: 22px 26px 40px;
+  padding: 26px 30px 48px;
 }
 
 .page-head {
@@ -177,32 +258,33 @@ button {
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: 22px;
 }
 
 h1 {
   margin: 0;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: -0.01em;
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
 }
 
 .sub {
   color: var(--muted);
   font-size: 12.5px;
-  margin-top: 3px;
+  margin-top: 4px;
 }
 
 .stack {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 16px;
 }
 
 .grid2 {
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.85fr);
-  gap: 14px;
+  gap: 16px;
   align-items: start;
 }
 
@@ -213,17 +295,17 @@ h1 {
 }
 
 .card {
-  background: var(--panel);
-  border: 1px solid var(--border);
+  background: var(--surface);
+  border: none;
   border-radius: var(--radius);
-  padding: 16px 18px;
-  box-shadow: var(--shadow);
+  padding: 18px 20px;
 }
 
 .card h2 {
   margin: 0 0 14px;
-  font-size: 15px;
-  font-weight: 650;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 .card-head {
@@ -237,19 +319,18 @@ h1 {
   margin: 0;
 }
 
-/* ---------- status ---------- */
+/* ---------- 状态 ---------- */
 
 .status {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   font-size: 12.5px;
-  font-weight: 600;
-  padding: 4px 10px;
+  font-weight: 500;
+  padding: 5px 11px;
   border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  color: var(--muted);
+  background: var(--surface);
+  color: var(--text-2);
 }
 
 .dot {
@@ -267,10 +348,11 @@ h1 {
 }
 
 .big-number {
-  font-size: 30px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+  font-size: 32px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
   line-height: 1.1;
+  font-variant-numeric: tabular-nums;
 }
 
 .metric-label {
@@ -279,28 +361,27 @@ h1 {
   margin-bottom: 2px;
 }
 
-/* ---------- rows ---------- */
+/* ---------- 行 ---------- */
 
 .row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  padding: 11px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.row:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
+  padding: 10px 0;
 }
 
 .row:first-child {
   padding-top: 0;
 }
 
+.row:last-child {
+  padding-bottom: 0;
+}
+
 .row-label {
   font-size: 13.5px;
+  color: var(--text);
 }
 
 .row-hint {
@@ -324,18 +405,19 @@ h1 {
   text-align: right;
 }
 
-/* ---------- controls ---------- */
+/* ---------- 控件 ---------- */
 
 .toggle {
   width: 38px;
   height: 22px;
   border-radius: 999px;
-  background: var(--border);
+  background: var(--surface-3);
   border: none;
   position: relative;
   cursor: pointer;
-  transition: background 0.16s ease;
+  transition: background-color var(--dur) var(--ease);
   flex: 0 0 auto;
+  padding: 0;
 }
 
 .toggle::after {
@@ -346,8 +428,8 @@ h1 {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #fff;
-  transition: transform 0.16s ease;
+  background: var(--bg);
+  transition: transform var(--dur) var(--ease);
 }
 
 .toggle.on {
@@ -360,10 +442,10 @@ h1 {
 
 .seg {
   display: inline-flex;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 2px;
+  background: var(--surface-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 3px;
   gap: 2px;
 }
 
@@ -372,15 +454,21 @@ h1 {
   background: transparent;
   padding: 4px 11px;
   font-size: 12.5px;
-  border-radius: 6px;
+  border-radius: 7px;
   color: var(--muted);
   cursor: pointer;
+  transition:
+    background-color var(--dur) var(--ease),
+    color var(--dur) var(--ease);
+}
+
+.seg button:hover {
+  color: var(--text);
 }
 
 .seg button.active {
-  background: var(--panel);
+  background: var(--bg);
   color: var(--text);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
   font-weight: 600;
 }
 
@@ -390,56 +478,79 @@ input[type="range"] {
 }
 
 .btn {
-  border: 1px solid var(--border);
-  background: var(--panel);
-  border-radius: 8px;
+  border: none;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
   padding: 7px 14px;
   font-size: 13px;
+  color: var(--text);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  transition:
+    background-color var(--dur) var(--ease),
+    transform 90ms var(--ease);
 }
 
 .btn:hover {
-  background: var(--panel-2);
+  background: var(--surface-3);
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.985);
 }
 
 .btn.primary {
   background: var(--accent);
-  border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
 .btn.primary:hover {
-  filter: brightness(1.06);
+  background: color-mix(in srgb, var(--accent) 88%, var(--text-2));
 }
 
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: default;
 }
 
-textarea {
+textarea,
+.modal .search,
+.phrase-title,
+.phrase-text {
   width: 100%;
-  min-height: 92px;
-  resize: vertical;
-  background: var(--panel-2);
+  background: var(--surface-2);
   color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: none;
+  border-radius: var(--radius-sm);
   padding: 9px 11px;
   font: inherit;
   font-size: 12.5px;
+  line-height: 1.6;
+  outline: none;
+  transition: background-color var(--dur) var(--ease);
+}
+
+textarea {
+  min-height: 92px;
+  resize: vertical;
   line-height: 1.7;
 }
 
 textarea:focus,
+.modal .search:focus,
+.phrase-title:focus,
+.phrase-text:focus {
+  background: var(--surface-3);
+}
+
+textarea:focus-visible,
 .btn:focus-visible,
 .toggle:focus-visible,
 .nav-item:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--text);
   outline-offset: 2px;
 }
 
@@ -449,7 +560,7 @@ code,
   font-size: 12px;
 }
 
-/* ---------- monitor map ---------- */
+/* ---------- 显示器布局图 ---------- */
 
 .map {
   width: 100%;
@@ -458,14 +569,13 @@ code,
 }
 
 .monitor {
-  fill: color-mix(in srgb, var(--accent) 4%, var(--panel-2));
-  stroke: var(--text);
-  stroke-opacity: 0.32;
-  stroke-width: 1.3;
+  fill: var(--bg);
+  stroke: color-mix(in srgb, var(--text) 16%, transparent);
+  stroke-width: 1.1;
 }
 
 .monitor.primary {
-  stroke-opacity: 0.45;
+  stroke: color-mix(in srgb, var(--text) 24%, transparent);
 }
 
 .monitor.disabled {
@@ -483,45 +593,34 @@ code,
 
 .band {
   fill: var(--accent);
-  opacity: 0.3;
-  transition: opacity 0.12s ease;
+  opacity: 0.2;
+  transition: opacity 160ms var(--ease);
 }
 
 .band.hit {
-  opacity: 0.9;
-  animation: band-pulse 0.5s ease-out;
+  opacity: 0.55;
 }
 
 .band.off {
   fill: var(--muted);
-  opacity: 0.12;
+  opacity: 0.1;
 }
 
-/* Config preview on the trigger page: the whole band plus the reachable edges. */
+/* 触发页预览：整条带 + 可达边缘 */
 .band-area {
   fill: var(--accent);
-  opacity: 0.22;
+  opacity: 0.07;
 }
 
 .band.zone {
-  opacity: 0.65;
+  opacity: 0.2;
 }
-
-@keyframes band-pulse {
-  from {
-    opacity: 1;
-  }
-  to {
-    opacity: 0.75;
-  }
-}
-
 
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 14px;
-  margin-top: 12px;
+  gap: 16px;
+  margin-top: 14px;
   font-size: 12px;
   color: var(--muted);
 }
@@ -537,46 +636,52 @@ code,
   height: 10px;
   border-radius: 3px;
   background: var(--accent);
-  opacity: 0.3;
+  opacity: 0.18;
 }
 
 .swatch.solid {
-  opacity: 0.9;
+  opacity: 0.42;
 }
 
 .swatch.grey {
   background: var(--muted);
-  opacity: 0.25;
+  opacity: 0.18;
 }
 
 .swatch.area {
-  opacity: 0.22;
+  opacity: 0.1;
 }
 
-/* ---------- modal ---------- */
+/* ---------- 弹窗 ---------- */
 
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(8, 10, 14, 0.45);
+  background: rgba(0, 0, 0, 0.3);
   display: grid;
   place-items: center;
   z-index: 50;
-  backdrop-filter: blur(2px);
+  animation: fade-in 150ms var(--ease) both;
 }
 
 .modal {
   width: min(520px, calc(100vw - 48px));
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 22px 24px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.28);
+  background: var(--bg);
+  border-radius: 20px;
+  padding: 24px 26px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.16);
+  animation: modal-in 200ms var(--ease) both;
+}
+
+:root[data-theme="dark"] .modal {
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
 }
 
 .modal h2 {
   margin: 0 0 6px;
   font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
 .modal p {
@@ -588,41 +693,41 @@ code,
 .steps {
   display: flex;
   gap: 6px;
-  margin: 14px 0 18px;
+  margin: 16px 0 20px;
 }
 
 .step-dot {
-  height: 4px;
+  height: 3px;
   flex: 1;
   border-radius: 2px;
-  background: var(--border);
+  background: var(--surface-3);
+  transition: background-color var(--dur) var(--ease);
 }
 
 .step-dot.on {
-  background: var(--accent);
+  background: var(--text);
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
 }
 
 .big-icon {
   width: 40px;
   height: 40px;
   border-radius: 12px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--surface-2);
+  color: var(--text);
   display: grid;
   place-items: center;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 
 .callout {
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  border-radius: 10px;
+  background: var(--surface-2);
+  border-radius: 12px;
   padding: 12px 14px;
   font-size: 12.5px;
   color: var(--muted);
@@ -634,19 +739,18 @@ code,
 }
 
 .error {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--danger);
-  border-radius: 8px;
-  padding: 8px 12px;
+  border-radius: 10px;
+  padding: 9px 12px;
   font-size: 12.5px;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 
 .kv {
   display: grid;
   grid-template-columns: 120px 1fr;
-  gap: 8px 14px;
+  gap: 10px 14px;
   font-size: 13px;
 }
 
@@ -656,11 +760,18 @@ code,
 
 .kv dd {
   margin: 0;
+  color: var(--text);
 }
 
 .link {
-  color: var(--accent);
-  text-decoration: none;
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, var(--text) 30%, transparent);
+}
+
+.link:hover {
+  text-decoration-color: var(--text);
 }
 
 .footnote {
@@ -669,7 +780,7 @@ code,
   margin-top: 10px;
 }
 
-/* ---------- blacklist chips + app picker ---------- */
+/* ---------- 黑名单 chips / 应用选择 ---------- */
 
 .chips {
   display: flex;
@@ -682,9 +793,8 @@ code,
   align-items: center;
   gap: 6px;
   padding: 4px 8px 4px 10px;
-  border-radius: 8px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
   font-size: 12.5px;
   color: var(--text);
 }
@@ -697,6 +807,7 @@ code,
   line-height: 1;
   cursor: pointer;
   padding: 0 2px;
+  border-radius: 50%;
 }
 
 .chip button:hover {
@@ -709,7 +820,7 @@ code,
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .app-item {
@@ -718,17 +829,17 @@ code,
   align-items: flex-start;
   gap: 2px;
   padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  border: none;
   background: none;
   text-align: left;
   cursor: pointer;
   width: 100%;
+  transition: background-color var(--dur) var(--ease);
 }
 
 .app-item:hover {
-  background: var(--panel-2);
-  border-color: var(--border);
+  background: var(--surface-2);
 }
 
 .app-name {
@@ -745,60 +856,27 @@ code,
   white-space: nowrap;
 }
 
-/* ---------- phrases editor ---------- */
+/* ---------- 话术编辑 ---------- */
 
 .phrase-row {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel-2);
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
 }
 
 .phrase-title,
 .phrase-text {
-  width: 100%;
-  font: inherit;
-  color: var(--text);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 7px 9px;
-  outline: none;
-  resize: vertical;
-}
-
-.phrase-title:focus,
-.phrase-text:focus {
-  border-color: var(--accent);
+  background: var(--bg);
 }
 
 .phrase-row .btn {
   align-self: flex-end;
 }
 
-/* ---------- app picker ---------- */
-
-.modal .search {
-  width: 100%;
-  margin: 6px 0 10px;
-  font: inherit;
-  font-size: 12.5px;
-  color: var(--text);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-  outline: none;
-}
-
-.modal .search:focus {
-  border-color: var(--accent);
-}
-
-/* ---------- hotkeys ---------- */
+/* ---------- 热键 ---------- */
 
 .hotkey-cell {
   display: flex;
@@ -809,20 +887,19 @@ code,
 .hotkey-cell code {
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  background: var(--surface-2);
+  border-radius: 8px;
   padding: 4px 9px;
 }
 
-/* ---------- update indicator ---------- */
+/* ---------- 更新提示 ---------- */
 
 .sidebar-bottom {
   margin-top: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 0 10px 10px;
+  padding: 0 8px 8px;
 }
 
 .sidebar-bottom .sidebar-foot {
@@ -831,21 +908,20 @@ code,
 }
 
 .update-pill {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--accent-soft);
+  border-radius: 12px;
+  background: var(--surface-2);
   padding: 4px;
+  position: relative;
+  animation: fade-in 200ms var(--ease) both;
 }
 
 .update-pill.ready {
-  border-color: transparent;
   background: transparent;
   padding: 0;
 }
 
 .update-pill.error {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 
 .update-action {
@@ -855,18 +931,19 @@ code,
   width: 100%;
   border: 0;
   background: transparent;
-  color: var(--accent);
+  color: var(--text);
   font: inherit;
   font-size: 12px;
   line-height: 1.2;
   padding: 6px 8px;
-  border-radius: 8px;
+  border-radius: 9px;
   cursor: pointer;
   text-align: left;
+  transition: background-color var(--dur) var(--ease);
 }
 
 .update-action:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  background: var(--surface-3);
 }
 
 .update-action:disabled {
@@ -877,13 +954,13 @@ code,
 .update-pill.ready .update-action {
   justify-content: center;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-weight: 600;
   padding: 9px 10px;
 }
 
 .update-pill.ready .update-action:hover {
-  filter: brightness(1.06);
+  background: color-mix(in srgb, var(--accent) 88%, var(--text-2));
 }
 
 .update-pill.error .update-action {
@@ -893,7 +970,7 @@ code,
 .update-bar {
   height: 3px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  background: var(--surface-3);
   overflow: hidden;
 }
 
@@ -905,11 +982,7 @@ code,
   display: block;
   height: 100%;
   background: var(--accent);
-  transition: width 0.2s ease;
-}
-
-.update-pill {
-  position: relative;
+  transition: width 240ms var(--ease);
 }
 
 .update-dismiss {
@@ -928,5 +1001,13 @@ code,
 
 .update-dismiss:hover {
   color: var(--text);
-  background: color-mix(in srgb, var(--text) 8%, transparent);
+  background: var(--surface-3);
+}
+
+/* ---------- 杂项 ---------- */
+
+.empty,
+.collapsed {
+  color: var(--muted);
+  font-size: 12.5px;
 }

@@ -175,16 +175,6 @@ export default function App() {
     };
   }, []);
 
-  // Follow the Windows accent color when the user picked a chromatic one.
-  // `accent` is null for gray/black accents, and then the built-in blue stays.
-  useEffect(() => {
-    const accent = snap?.accent;
-    if (accent) {
-      document.documentElement.style.setProperty("--accent", accent);
-    } else {
-      document.documentElement.style.removeProperty("--accent");
-    }
-  }, [snap?.accent]);
 
 
   const update = useCallback((patch: Patch) => {
@@ -339,6 +329,7 @@ export default function App() {
           </div>
         </header>
 
+        <div className="page" key={page}>
         {error && <div className="error">保存失败：{error}</div>}
 
         {!snap || !config ? (
@@ -396,6 +387,7 @@ export default function App() {
             onInstall={() => void runInstall()}
           />
         )}
+        </div>
       </main>
 
       {showOnboarding && (
