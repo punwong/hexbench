@@ -201,6 +201,22 @@ fn diagnostics(app: AppHandle, state: State<'_, AppState>) -> String {
         }
     }
 
+    {
+        let state = app.state::<AppState>();
+        let open = state.panel_open.load(Ordering::Relaxed);
+        let recorded = state.panel_desktop_id.lock().unwrap().clone();
+        let current = hexbench_core::sys::current_desktop_id();
+        let visible = app
+            .get_webview_window("phrases")
+            .map(|w| w.is_visible().unwrap_or(false));
+        let same = matches!((&recorded, &current), (Some(a), Some(b)) if a == b);
+        out.push_str(&format!(
+            "panel open={open} sameDesktop={same} recorded={:?} current={:?} visible={visible:?}\n",
+            recorded.as_ref().map(|id| id.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()),
+            current.as_ref().map(|id| id.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+
     if let Ok(dir) = app.path().app_log_dir() {
         let path = dir.join("HexBench.log");
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -1044,6 +1060,8 @@ fn set_panel_open(app: &AppHandle, open: bool) {
 /// where the user opened it.
 fn spawn_panel_desktop_watch(app: AppHandle) {
     thread::spawn(move || {
+        // Only log transitions, not every poll.
+        let mut hidden_by_watch = false;
         loop {
             thread::sleep(Duration::from_millis(400));
             let (open, recorded) = {
@@ -1067,9 +1085,17 @@ fn spawn_panel_desktop_watch(app: AppHandle) {
             let visible = window.is_visible().unwrap_or(false);
             if current != recorded {
                 if visible {
+                    if !hidden_by_watch {
+                        log::info!("panel: desktop changed, hiding the panel");
+                        hidden_by_watch = true;
+                    }
                     let _ = window.hide();
                 }
             } else if !visible {
+                if hidden_by_watch {
+                    log::info!("panel: back on its desktop, showing the panel");
+                    hidden_by_watch = false;
+                }
                 place_panel(&app, &window);
                 let _ = window.show();
                 if let Ok(hwnd) = window.hwnd() {
