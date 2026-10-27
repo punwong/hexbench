@@ -1,3 +1,6 @@
+import { useEffect, useState } from "react";
+
+import { getHitState } from "../api";
 import type { HitDto, MonitorDto, RegionDto, Sides } from "../types";
 
 const WIDTH = 660;
@@ -10,13 +13,52 @@ export function MonitorMap({
   hit,
   sides,
   dimmed,
+  live,
 }: {
   monitors: MonitorDto[];
   regions: RegionDto[];
   hit: HitDto | null;
   sides: Sides;
   dimmed?: boolean;
+  /// Poll the trigger state locally so the highlight reacts immediately;
+  /// the full snapshot only refreshes twice a second.
+  live?: boolean;
 }) {
+  const [liveHit, setLiveHit] = useState<HitDto | null>(null);
+
+  useEffect(() => {
+    if (!live) return;
+    let alive = true;
+    let timer: number | undefined;
+
+    const tick = async () => {
+      try {
+        const next = await getHitState();
+        if (!alive) return;
+        setLiveHit((prev) => {
+          if (
+            prev?.monitor === next.hit?.monitor &&
+            prev?.side === next.hit?.side
+          ) {
+            return prev;
+          }
+          return next.hit;
+        });
+      } catch {
+        // A failed poll just leaves the highlight as is.
+      } finally {
+        if (alive) timer = window.setTimeout(tick, 80);
+      }
+    };
+
+    void tick();
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [live]);
+
+  const shownHit = live ? liveHit : hit;
   if (monitors.length === 0) {
     return <div className="callout">正在读取显示器…</div>;
   }
@@ -74,7 +116,9 @@ export function MonitorMap({
         const enabled =
           region.side === "left" ? sides !== "right" : sides !== "left";
         const active =
-          hit !== null && hit.monitor === region.monitor && hit.side === region.side;
+          shownHit !== null &&
+          shownHit.monitor === region.monitor &&
+          shownHit.side === region.side;
         const bandWidth = 6;
         const x =
           region.side === "left" ? sx(region.edgeX) : sx(region.edgeX) - bandWidth;

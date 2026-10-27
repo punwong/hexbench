@@ -99,6 +99,8 @@ pub struct UpdateSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PhraseSettings {
+    /// The panel is a tool of its own; this is its master switch.
+    pub enabled: bool,
     pub items: Vec<Phrase>,
     /// Executable name of the app the panel docks to; empty means "follow any
     /// foreground app that is not HexBench itself".
@@ -117,11 +119,28 @@ pub struct PhraseSettings {
     /// Clicking a phrase only fills the input by default; auto-sending a wrong
     /// message to a customer is far worse than one extra Enter.
     pub send_on_click: bool,
+    /// Which key submits the message after a phrase is filled.
+    pub send_key: SendKey,
+}
+
+/// Chat apps disagree: some send on Enter, others on Ctrl+Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SendKey {
+    Enter,
+    CtrlEnter,
+}
+
+impl Default for SendKey {
+    fn default() -> Self {
+        Self::Enter
+    }
 }
 
 impl Default for PhraseSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             items: vec![
                 Phrase::new("亲，在的，有什么可以帮您～"),
                 Phrase::new("稍等，我帮您查一下。"),
@@ -136,6 +155,7 @@ impl Default for PhraseSettings {
             panel_y: None,
             collapsed: false,
             send_on_click: false,
+            send_key: SendKey::Enter,
         }
     }
 }

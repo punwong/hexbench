@@ -72,6 +72,7 @@ export interface Phrase {
 }
 
 export interface PhraseSettings {
+  enabled: boolean;
   items: Phrase[];
   target: string;
   targetClass: string;
@@ -82,6 +83,7 @@ export interface PhraseSettings {
   panelY: number | null;
   collapsed: boolean;
   sendOnClick: boolean;
+  sendKey: "enter" | "ctrlEnter";
 }
 
 export interface MonitorDto {

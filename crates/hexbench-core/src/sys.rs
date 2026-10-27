@@ -8,14 +8,15 @@
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFOEXW,
-    MONITOR_DEFAULTTONULL,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, DESKTOP_READOBJECTS,
@@ -23,16 +24,19 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, VK_CONTROL, VK_D, VK_LBUTTON, VK_LEFT, VK_LWIN, VK_MBUTTON, VK_RBUTTON,
     VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    DispatchMessageW, EnumWindows, EVENT_SYSTEM_DESKTOPSWITCH, GetAncestor, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MSG,
+    SetCursorPos, SetWindowLongW, SetWindowPos, TranslateMessage, WindowFromPoint,
+    WINEVENT_OUTOFCONTEXT, GA_ROOT, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::geometry::EdgeProbe;
@@ -61,6 +65,36 @@ pub fn point_on_monitor(x: i32, y: i32) -> bool {
     !handle.is_null()
 }
 
+/// Work area (screen without the taskbar) of the monitor holding a point.
+pub fn work_area_at(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+    // SAFETY: plain queries on a live monitor handle.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        Some((
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+        ))
+    }
+}
+/// Pull a window rectangle back inside the work area of its monitor.
+pub fn clamp_to_work_area(x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+    match work_area_at(x + width / 2, y + height / 2) {
+        Some((left, top, right, bottom)) => {
+            (x.min(right - width).max(left), y.min(bottom - height).max(top))
+        }
+        None => (x, y),
+    }
+}
 /// All active displays, in enumeration order.
 pub fn enumerate_monitors() -> Vec<Monitor> {
     let mut out: Vec<Monitor> = Vec::new();
@@ -392,6 +426,24 @@ pub fn foreground_window_info() -> Option<WindowInfo> {
 }
 
 /// Press Enter in the focused window (used by "fill and send").
+/// Ctrl+Enter, for chat apps that send on that chord.
+pub fn press_ctrl_enter() -> bool {
+    let inputs = [
+        key_input(VK_CONTROL, false),
+        key_input(VK_RETURN, false),
+        key_input(VK_RETURN, true),
+        key_input(VK_CONTROL, true),
+    ];
+    // SAFETY: array lives for the call; INPUT is plain-old-data.
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        ) == inputs.len() as u32
+    }
+}
+
 pub fn press_enter() -> bool {
     let inputs = [key_input(VK_RETURN, false), key_input(VK_RETURN, true)];
     // SAFETY: two valid INPUT structures.
@@ -495,6 +547,57 @@ pub fn start_manual_drag(hwnd: isize) {
                 );
             }
             thread::sleep(Duration::from_millis(8));
+        }
+    });
+}
+/// Number of virtual desktop switches seen since the app started.
+static DESKTOP_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+pub fn desktop_switch_count() -> u64 {
+    DESKTOP_SWITCHES.load(Ordering::Relaxed)
+}
+
+unsafe extern "system" fn desktop_switch_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if event == EVENT_SYSTEM_DESKTOPSWITCH {
+        DESKTOP_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Count desktop switches as they happen.
+///
+/// Polling the current desktop can take a few hundred milliseconds, and during
+/// that window Windows has already carried the phrase panel to the new desktop
+/// (which shows up as a black rectangle flashing). The shell event fires as the
+/// switch starts, so the panel can be hidden in time.
+pub fn watch_desktop_switches() {
+    thread::spawn(|| {
+        // SAFETY: installing an out-of-context hook and pumping its messages.
+        unsafe {
+            let hook = SetWinEventHook(
+                EVENT_SYSTEM_DESKTOPSWITCH,
+                EVENT_SYSTEM_DESKTOPSWITCH,
+                std::ptr::null_mut(),
+                Some(desktop_switch_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            if hook.is_null() {
+                return;
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     });
 }

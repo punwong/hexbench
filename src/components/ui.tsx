@@ -90,6 +90,33 @@ export function Segmented<T extends string>({
   );
 }
 
+export function Tabs<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T;
+  options: readonly { value: T; label: string }[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="tabs" role="tablist">
+      {options.map((option) => (
+        <button
+          type="button"
+          key={option.value}
+          role="tab"
+          aria-selected={option.value === value}
+          className={`tab ${option.value === value ? "active" : ""}`}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function Slider({
   value,
   min,

@@ -143,7 +143,9 @@ function Panel() {
   const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest("button, input, textarea, .head-actions")) return;
-    pressAt.current = { x: event.clientX, y: event.clientY };
+    // Screen coordinates: while the window is being dragged it moves with the
+    // cursor, so client coordinates stay put and a drag would look like a click.
+    pressAt.current = { x: event.screenX, y: event.screenY };
     void invoke("panel_drag").catch(() => undefined);
   };
 
@@ -152,12 +154,12 @@ function Panel() {
     pressAt.current = null;
     if (!start) return;
     const moved =
-      Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 4;
+      Math.abs(event.screenX - start.x) + Math.abs(event.screenY - start.y) > 4;
     if (!moved) setPanelCollapsed(false);
   };
 
   const addPhrase = () => {
-    const phrased: Phrase = { id: `p${Date.now()}`, title: "新话术", text: "" };
+    const phrased: Phrase = { id: `p${Date.now()}`, title: "", text: "" };
     if (!editing) {
       setEditing(true);
       void invoke("panel_editing", { editing: true }).catch(() => undefined);
@@ -219,6 +221,14 @@ function Panel() {
           >
             {editing ? "✓" : "✎"}
           </button>
+          <button
+            type="button"
+            className="icon"
+            title="关闭面板"
+            onClick={() => void invoke("panel_close")}
+          >
+            ✕
+          </button>
         </span>
       </div>
 
@@ -234,21 +244,10 @@ function Panel() {
         {items.map((item) =>
           editing ? (
             <div className="edit-item" key={item.id}>
-              <input
-                value={item.title}
-                placeholder="标题"
-                onChange={(event) =>
-                  update(
-                    items.map((entry) =>
-                      entry.id === item.id ? { ...entry, title: event.target.value } : entry,
-                    ),
-                  )
-                }
-              />
               <textarea
                 rows={2}
                 value={item.text}
-                placeholder="要发送的内容"
+                placeholder="输入话术内容"
                 onChange={(event) =>
                   update(
                     items.map((entry) =>
@@ -272,8 +271,12 @@ function Panel() {
               className="item"
               onClick={() => void send(item)}
             >
-              <span className="title">{item.title}</span>
-              <span className="preview">{item.text}</span>
+              <span className="title">{item.text.split("\n")[0] || "（空话术）"}</span>
+              {item.text.split("\n").slice(1).join(" ").trim() && (
+                <span className="preview">
+                  {item.text.split("\n").slice(1).join(" ").trim()}
+                </span>
+              )}
             </button>
           ),
         )}

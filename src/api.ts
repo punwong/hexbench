@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Config, RunningApp, Snapshot } from "./types";
+import type { Config, HitDto, RunningApp, Snapshot } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -34,6 +34,7 @@ const demoConfig: Config = {
     lastPull: 0,
   },
   phrases: {
+    enabled: true,
     items: [
       { id: "p1", title: "在的", text: "亲，在的，有什么可以帮您～" },
       { id: "p2", title: "稍等", text: "稍等，我帮您查一下。" },
@@ -47,6 +48,7 @@ const demoConfig: Config = {
     panelY: null,
     collapsed: false,
     sendOnClick: false,
+    sendKey: "enter",
   },
   ui: { theme: "system", language: "auto", onboarded: false },
   meta: { schema: 1, updatedAt: 0, deviceId: "" },
@@ -118,6 +120,22 @@ export async function setPaused(paused: boolean): Promise<void> {
     return;
   }
   await invoke("set_paused", { paused });
+}
+
+/** Hit + guard, polled by the layout diagram so the highlight is immediate. */
+export async function getHitState(): Promise<{
+  hit: HitDto | null;
+  guard: string | null;
+  phase: string;
+}> {
+  if (!isTauri) return { hit: null, guard: null, phase: "idle" };
+  const [hit, guard, phase] = await invoke<[HitDto | null, string | null, string]>("hit_state");
+  return { hit, guard, phase };
+}
+
+export async function closePanel(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("panel_close");
 }
 
 export async function setTestMode(enabled: boolean): Promise<void> {

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -626,12 +626,26 @@ fn phrases_ui(state: State<'_, AppState>) -> PhrasesUi {
 
 /// Press Enter in the focused window after a phrase was typed in.
 #[tauri::command]
-fn phrase_submit() -> Result<(), String> {
-    if hexbench_core::sys::press_enter() {
+fn phrase_submit(state: State<'_, AppState>) -> Result<(), String> {
+    let send_key = state.shared.lock().unwrap().config.phrases.send_key;
+    let sent = match send_key {
+        hexbench_core::config::SendKey::CtrlEnter => hexbench_core::sys::press_ctrl_enter(),
+        hexbench_core::config::SendKey::Enter => hexbench_core::sys::press_enter(),
+    };
+    if sent {
         Ok(())
     } else {
         Err("发送失败：前台窗口不接受模拟按键".to_string())
     }
+}
+
+/// Hide the panel from its own close button.
+#[tauri::command]
+fn panel_close(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("phrases") {
+        let _ = window.hide();
+    }
+    set_panel_open(&app, false);
 }
 
 /// Persist the panel's "click to send" toggle.
@@ -655,6 +669,24 @@ fn panel_collapse(collapsed: bool, app: AppHandle) {
             tauri::LogicalSize::new(300.0, 460.0)
         };
         let _ = window.set_size(size);
+
+        // Growing from a bubble near the screen edge would push the panel
+        // off-screen; pull it back inside the work area.
+        if !collapsed {
+            if let (Ok(position), Ok(outer)) = (window.outer_position(), window.outer_size()) {
+                if let Some((left, top, right, bottom)) =
+                    hexbench_core::sys::work_area_at(position.x, position.y)
+                {
+                    let width = outer.width as i32;
+                    let height = outer.height as i32;
+                    let x = position.x.min(right - width).max(left);
+                    let y = position.y.min(bottom - height).max(top);
+                    if x != position.x || y != position.y {
+                        let _ = window.set_position(PhysicalPosition::new(x, y));
+                    }
+                }
+            }
+        }
     }
     let state = app.state::<AppState>();
     let config = {
@@ -959,6 +991,18 @@ fn phrase_send(text: String) -> Result<(), String> {
 
 #[tauri::command]
 fn toggle_phrases_panel(app: AppHandle) {
+    // A tool that is switched off should not answer its hotkey.
+    if !app
+        .state::<AppState>()
+        .shared
+        .lock()
+        .unwrap()
+        .config
+        .phrases
+        .enabled
+    {
+        return;
+    }
     open_phrases_panel(&app);
 }
 
@@ -1002,6 +1046,11 @@ fn place_panel(app: &AppHandle, window: &tauri::WebviewWindow) {
 
     if !docked {
         if let Some((x, y)) = saved {
+            let (width, height) = window
+                .outer_size()
+                .map(|size| (size.width as i32, size.height as i32))
+                .unwrap_or((300, 460));
+            let (x, y) = hexbench_core::sys::clamp_to_work_area(x, y, width, height);
             let _ = window.set_position(PhysicalPosition::new(x, y));
             return;
         }
@@ -1059,43 +1108,88 @@ fn set_panel_open(app: &AppHandle, open: bool) {
 /// while another desktop is active and show it again on return, so it stays
 /// where the user opened it.
 fn spawn_panel_desktop_watch(app: AppHandle) {
+    // The shell event fires as the switch starts; polling the desktop id would
+    // be too late and the panel would flash on the new desktop.
+    hexbench_core::sys::watch_desktop_switches();
+
     thread::spawn(move || {
-        // Only log transitions, not every poll.
         let mut hidden_by_watch = false;
+        let mut last_switch = hexbench_core::sys::desktop_switch_count();
+        let mut last_switch_at = Instant::now() - Duration::from_secs(5);
+        let mut ticks: u32 = 0;
+
         loop {
-            thread::sleep(Duration::from_millis(400));
-            let (open, recorded) = {
+            // 30 ms keeps the hide ahead of the desktop animation.
+            thread::sleep(Duration::from_millis(30));
+            let (open, enabled) = {
                 let state = app.state::<AppState>();
+                let shared = state.shared.lock().unwrap();
                 (
                     state.panel_open.load(Ordering::Relaxed),
-                    state.panel_desktop_id.lock().unwrap().clone(),
+                    shared.config.phrases.enabled,
                 )
             };
+            if !enabled {
+                if let Some(window) = app.get_webview_window("phrases") {
+                    if window.is_visible().unwrap_or(false) {
+                        let _ = window.hide();
+                        set_panel_open(&app, false);
+                        log::info!("panel: tool switched off, hiding");
+                    }
+                }
+                continue;
+            }
             if !open {
                 continue;
             }
+
+            let switches = hexbench_core::sys::desktop_switch_count();
+            let switched = switches != last_switch;
+            if switched {
+                last_switch = switches;
+                last_switch_at = Instant::now();
+                ticks = 0;
+            }
+
+            ticks += 1;
+            if !switched && ticks < 13 {
+                continue;
+            }
+
+            let Some(window) = app.get_webview_window("phrases") else {
+                continue;
+            };
+
+            if switched && window.is_visible().unwrap_or(false) {
+                let _ = window.hide();
+                hidden_by_watch = true;
+            }
+
+            let recorded = {
+                let state = app.state::<AppState>();
+                state.panel_desktop_id.lock().unwrap().clone()
+            };
             let (Some(recorded), Some(current)) =
                 (recorded, hexbench_core::sys::current_desktop_id())
             else {
                 continue;
             };
-            let Some(window) = app.get_webview_window("phrases") else {
-                continue;
-            };
+            // Right after a switch the registry can still report the old
+            // desktop; wait for it to settle before deciding to show again.
+            let settling = last_switch_at.elapsed() < Duration::from_millis(350);
             let visible = window.is_visible().unwrap_or(false);
+
             if current != recorded {
-                if visible {
-                    if !hidden_by_watch {
-                        log::info!("panel: desktop changed, hiding the panel");
-                        hidden_by_watch = true;
-                    }
-                    let _ = window.hide();
+                if visible || !hidden_by_watch {
+                    log::info!("panel: on another desktop, hiding");
                 }
-            } else if !visible {
+                hidden_by_watch = true;
+                let _ = window.hide();
+            } else if !visible && !settling {
                 if hidden_by_watch {
-                    log::info!("panel: back on its desktop, showing the panel");
-                    hidden_by_watch = false;
+                    log::info!("panel: back on its desktop, showing");
                 }
+                hidden_by_watch = false;
                 place_panel(&app, &window);
                 let _ = window.show();
                 if let Ok(hwnd) = window.hwnd() {
@@ -1161,8 +1255,12 @@ fn build_phrases_panel(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     let built = WebviewWindowBuilder::new(app, "phrases", WebviewUrl::App("phrases.html".into()))
         .title("快捷语")
         .inner_size(width, height)
-        .min_inner_size(240.0, 200.0)
+        // Must allow the collapsed circle; the expanded panel is bigger anyway.
+        .min_inner_size(72.0, 72.0)
         .decorations(false)
+        .transparent(true)
+        // A system shadow would draw a square around the round bubble.
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
@@ -1230,6 +1328,22 @@ fn begin_drag(window: tauri::WebviewWindow) {
     if let Ok(hwnd) = window.hwnd() {
         hexbench_core::sys::start_manual_drag(hwnd.0 as isize);
     }
+}
+
+/// Just the trigger state, for the live highlight in the layout diagram.
+/// The full snapshot is too heavy to drive that at 12 fps.
+#[tauri::command]
+fn hit_state(state: State<'_, AppState>) -> (Option<HitDto>, Option<String>, String) {
+    let shared = state.shared.lock().unwrap();
+    (
+        shared.hit.map(|hit| HitDto {
+            monitor: hit.monitor,
+            side: hit.side,
+            edge_x: hit.edge_x,
+        }),
+        shared.guard.clone(),
+        shared.engine_phase.clone(),
+    )
 }
 
 #[tauri::command]
@@ -1601,6 +1715,7 @@ pub fn run() {
             set_autostart,
             open_config_folder,
             create_virtual_desktop,
+            hit_state,
             begin_drag,
             overlay_zones,
             show_trigger_overlay,
@@ -1613,6 +1728,7 @@ pub fn run() {
             panel_collapse,
             phrases_ui,
             phrase_submit,
+            panel_close,
             phrase_send_mode,
             sync_test,
             sync_save,

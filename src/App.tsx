@@ -9,13 +9,11 @@ import {
   MessageSquare,
   RefreshCw,
   Settings,
-  ShieldCheck,
   Sparkles,
 } from "lucide-react";
 
 import {
   checkUpdate,
-  createVirtualDesktop,
   downloadUpdate,
   getSnapshot,
   installDownloaded,
@@ -25,34 +23,31 @@ import {
   refreshLayout,
   saveConfig,
   setAutostart,
-  setPaused,
   setTestMode,
   showTriggerOverlay,
 } from "./api";
 import type { Config, Snapshot } from "./types";
 import {
   AboutPage,
+  EdgePage,
   GeneralPage,
-  GuardsPage,
   HotkeysPage,
   Overview,
   PhrasesPage,
-  TriggerPage,
 } from "./pages";
 import type { Patch } from "./pages";
 import { TitleBar } from "./components/TitleBar";
 
-type Page = "overview" | "trigger" | "guards" | "phrases" | "hotkeys" | "general" | "about";
+type Page = "overview" | "edge" | "phrases" | "hotkeys" | "general" | "about";
 
 /// Where the updater currently is: nothing, a version to grab, downloading,
 /// a package waiting for a restart, or a failure worth showing.
 type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
 
 const TITLES: Record<Page, { title: string; subtitle: string }> = {
-  overview: { title: "概览", subtitle: "实时状态与显示器布局" },
-  trigger: { title: "触发", subtitle: "触发带位置、比例与时序" },
-  guards: { title: "防误触", subtitle: "哪些情况下不触发" },
-  phrases: { title: "快捷语", subtitle: "吸附在聊天窗口旁，点一下就发出去" },
+  overview: { title: "概览", subtitle: "两个工具，各自一个开关" },
+  edge: { title: "边缘切桌面", subtitle: "触发位置、时序与防误触" },
+  phrases: { title: "快捷语面板", subtitle: "吸附在聊天窗口旁，点一下就发出去" },
   hotkeys: { title: "热键", subtitle: "所有全局快捷键，集中在一处" },
   general: { title: "通用", subtitle: "外观、启动与配置文件" },
   about: { title: "关于", subtitle: "版本、许可证与诊断" },
@@ -216,6 +211,20 @@ export default function App() {
     return () => query.removeEventListener("change", apply);
   }, [config?.ui.theme]);
 
+  // Snapshot refreshes twice a second; the switch must react on click.
+  const [testModeLocal, setTestModeLocal] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (snap) setTestModeLocal(snap.testMode);
+  }, [snap?.testMode]);
+  const testMode = testModeLocal ?? snap?.testMode ?? false;
+
+  // A tool that gets switched off takes its settings page with it.
+  useEffect(() => {
+    if (!config) return;
+    if (page === "edge" && !config.enabled) setPage("overview");
+    if (page === "phrases" && !config.phrases.enabled) setPage("overview");
+  }, [config?.enabled, config?.phrases.enabled, page]);
+
   const finishOnboarding = () => {
     update({ ui: { onboarded: true } });
     void setTestMode(true);
@@ -249,16 +258,20 @@ export default function App() {
       <div className="shell">
       <aside className="sidebar">
         <div className="nav-group">
-          <div className="nav-label">边缘切桌面</div>
           <NavItem page="overview" current={page} onClick={setPage} icon={<Gauge size={16} />} label="概览" />
-          <NavItem page="trigger" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="触发" />
-          <NavItem page="guards" current={page} onClick={setPage} icon={<ShieldCheck size={16} />} label="防误触" />
         </div>
 
-        <div className="nav-group">
-          <div className="nav-label">快捷语</div>
-          <NavItem page="phrases" current={page} onClick={setPage} icon={<MessageSquare size={16} />} label="话术面板" />
-        </div>
+        {config && (config.enabled || config.phrases.enabled) && (
+          <div className="nav-group">
+            <div className="nav-label">工具</div>
+            {config.enabled && (
+              <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘切桌面" />
+            )}
+            {config.phrases.enabled && (
+              <NavItem page="phrases" current={page} onClick={setPage} icon={<MessageSquare size={16} />} label="快捷语面板" />
+            )}
+          </div>
+        )}
 
         <div className="nav-group">
           <div className="nav-label">全局</div>
@@ -330,27 +343,21 @@ export default function App() {
         {!snap || !config ? (
           <div className="card">正在读取状态…</div>
         ) : page === "overview" ? (
-          <Overview
-            snap={snap}
-            config={config}
-            update={update}
-            onPause={() => void setPaused(!snap.paused)}
-            onTest={(value) => void setTestMode(value)}
-            onCreateDesktop={() => {
-              void createVirtualDesktop().catch((reason) => setError(String(reason)));
-            }}
-          />
-        ) : page === "trigger" ? (
-          <TriggerPage
+          <Overview snap={snap} config={config} update={update} onOpen={setPage} />
+        ) : page === "edge" ? (
+          <EdgePage
             config={config}
             update={update}
             monitors={snap.monitors}
+            testMode={testMode}
+            onTest={(value) => {
+              setTestModeLocal(value);
+              void setTestMode(value);
+            }}
             onPreview={() => {
               void showTriggerOverlay().catch((reason) => setError(String(reason)));
             }}
           />
-        ) : page === "guards" ? (
-          <GuardsPage config={config} update={update} />
         ) : page === "phrases" ? (
           <PhrasesPage config={config} update={update} />
         ) : page === "hotkeys" ? (

@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
+import { Crosshair, MessageSquare } from "lucide-react";
 
 import type {
   Config,
@@ -25,9 +27,8 @@ import {
   syncTest,
   togglePhrasesPanel,
 } from "./api";
-import { MonitorMap } from "./components/MonitorMap";
 import { TriggerPreview } from "./components/TriggerPreview";
-import { Card, Row, Segmented, Slider, Toggle } from "./components/ui";
+import { Card, Row, Segmented, Slider, Tabs, Toggle } from "./components/ui";
 
 export type Patch = {
   enabled?: boolean;
@@ -41,149 +42,127 @@ export type Patch = {
 
 export type UpdateConfig = (patch: Patch) => void;
 
+function ToolRow({
+  icon,
+  name,
+  hint,
+  enabled,
+  onToggle,
+  onOpen,
+}: {
+  icon: ReactNode;
+  name: string;
+  hint: string;
+  enabled: boolean;
+  onToggle: (value: boolean) => void;
+  onOpen: () => void;
+}) {
+  return (
+    <div className="tool">
+      <span className="tool-icon">{icon}</span>
+      <span className="tool-text">
+        <span className="tool-name">{name}</span>
+        <span className="tool-hint">{hint}</span>
+      </span>
+      {enabled && (
+        <button type="button" className="btn" onClick={onOpen}>
+          设置
+        </button>
+      )}
+      <Toggle checked={enabled} onChange={onToggle} />
+    </div>
+  );
+}
+
 export function Overview({
   snap,
   config,
   update,
-  onPause,
-  onTest,
-  onCreateDesktop,
+  onOpen,
 }: {
   snap: Snapshot;
   config: Config;
   update: UpdateConfig;
-  onPause: () => void;
-  onTest: (value: boolean) => void;
-  onCreateDesktop: () => void;
+  onOpen: (page: "edge" | "phrases") => void;
 }) {
-  const status = snap.paused ? "已暂停" : snap.testMode ? "测试模式" : "运行中";
-  const statusClass = snap.paused ? "warn" : snap.testMode ? "warn" : "ok";
-
+  const desktops = snap.desktopCount;
   return (
     <div className="stack">
-      {snap.desktopCount === 1 && (
-        <div
-          className="callout"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 16,
-          }}
-        >
-          <div>
-            <b>当前只有 1 个虚拟桌面。</b>
-            推到边缘不会有反应——先新建一个。新建后会回到这里，把鼠标推到边缘就能过去。
-          </div>
-          <button type="button" className="btn primary" onClick={onCreateDesktop}>
-            新建虚拟桌面
-          </button>
-        </div>
-      )}
-
-      <div className="grid2">
-        <Card
-          title="显示器布局"
-          action={
-            <span className="sub">
-              {snap.monitors.length} 块屏 · {snap.regions.length} 段可触发
-            </span>
-          }
-        >
-          <MonitorMap
-            monitors={snap.monitors}
-            regions={snap.regions}
-            hit={snap.hit}
-            sides={config.trigger.sides}
-            dimmed={snap.paused}
+      <Card title="工具">
+        <div className="tools">
+          <ToolRow
+            icon={<Crosshair size={18} />}
+            name="边缘切桌面"
+            hint={
+              desktops
+                ? `鼠标推到屏幕最外侧边缘就切虚拟桌面（当前 ${desktops} 个）`
+                : "鼠标推到屏幕最外侧边缘就切虚拟桌面"
+            }
+            enabled={config.enabled}
+            onToggle={(value) => update({ enabled: value })}
+            onOpen={() => onOpen("edge")}
           />
-          <div className="legend">
-            <span>
-              <i className="swatch" />
-              可触发
-            </span>
-            <span>
-              <i className="swatch solid" />
-              命中
-            </span>
-            <span>
-              <i className="swatch grey" />
-              接缝 / 已禁用
-            </span>
-          </div>
-        </Card>
-
-        <div className="stack">
-          <Card title="运行状态">
-            <div className="status">
-              <i className={`dot ${statusClass}`} />
-              {status}
-            </div>
-            <div style={{ marginTop: 16 }}>
-              <div className="metric-label">本次运行切换</div>
-              <div className="big-number">
-                {snap.stats.fires}
-                <span style={{ fontSize: 13, color: "var(--muted)", marginLeft: 6 }}>
-                  次
-                </span>
-              </div>
-              <div
-                style={{
-                  marginTop: 8,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 10,
-                }}
-              >
-                <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                  虚拟桌面 {snap.desktopCount ?? "—"} 个
-                </span>
-                <button
-                  type="button"
-                  className="btn"
-                  style={{ padding: "3px 10px", fontSize: 12 }}
-                  onClick={onCreateDesktop}
-                >
-                  新建
-                </button>
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-              <button type="button" className="btn" onClick={onPause}>
-                {snap.paused ? "继续" : "暂停"}
-              </button>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => update({ enabled: !config.enabled })}
-              >
-                {config.enabled ? "关闭总开关" : "打开总开关"}
-              </button>
-            </div>
-          </Card>
-
-          <Card title="测试模式">
-            <Row label="只高亮，不切换" hint="先确认位置，再关掉去实际用">
-              <Toggle checked={snap.testMode} onChange={onTest} />
-            </Row>
-          </Card>
-        </div>
-      </div>
-
-      <Card title="怎么用">
-        <div className="callout">
-          <b>1.</b> 把鼠标推到屏幕最外侧边缘的角落区，默认是底部 10%。
-          <br />
-          <b>2.</b> 停住约 0.1 秒，不要一路划过去。
-          <br />
-          <b>3.</b> 切过去后光标会被推回 24 px，避免停在那儿连续触发。
+          <ToolRow
+            icon={<MessageSquare size={18} />}
+            name="快捷语面板"
+            hint="吸附在聊天应用旁边的话术面板，点一下就填进输入框"
+            enabled={config.phrases.enabled}
+            onToggle={(value) => update({ phrases: { enabled: value } })}
+            onOpen={() => onOpen("phrases")}
+          />
         </div>
       </Card>
     </div>
   );
 }
 
+export function EdgePage({
+  config,
+  update,
+  monitors,
+  onPreview,
+  testMode,
+  onTest,
+}: {
+  config: Config;
+  update: UpdateConfig;
+  monitors: MonitorDto[];
+  onPreview: () => void;
+  testMode: boolean;
+  onTest: (value: boolean) => void;
+}) {
+  const [tab, setTab] = useState<"trigger" | "guards">("trigger");
+
+  return (
+    <div className="stack">
+      <Tabs
+        value={tab}
+        options={[
+          { value: "trigger", label: "触发" },
+          { value: "guards", label: "防误触" },
+        ]}
+        onChange={setTab}
+      />
+      {tab === "trigger" ? (
+        <>
+          <TriggerPage
+            config={config}
+            update={update}
+            monitors={monitors}
+            onPreview={onPreview}
+          />
+          <Card title="测试模式">
+            <Row label="只高亮，不切换" hint="先确认位置，再关掉去实际用">
+              <Toggle checked={testMode} onChange={onTest} />
+            </Row>
+          </Card>
+        </>
+      ) : (
+        <GuardsPage config={config} update={update} />
+      )}
+    </div>
+  );
+}
 export function TriggerPage({
   config,
   update,
@@ -880,6 +859,7 @@ export function PhrasesPage({
 }) {
   const phrases = config.phrases;
   const [picking, setPicking] = useState(false);
+  const [tab, setTab] = useState<"settings" | "phrases">("settings");
 
   const setItems = (items: Phrase[]) => update({ phrases: { items } });
   const patch = (id: string, part: Partial<Phrase>) =>
@@ -887,6 +867,15 @@ export function PhrasesPage({
 
   return (
     <div className="stack">
+      <Tabs
+        value={tab}
+        options={[
+          { value: "settings", label: "设置" },
+          { value: "phrases", label: "话术" },
+        ]}
+        onChange={setTab}
+      />
+      {tab === "settings" ? (
       <Card
         title="吸附"
         action={
@@ -915,6 +904,18 @@ export function PhrasesPage({
               { value: "send", label: "填入并发送" },
             ]}
             onChange={(value) => update({ phrases: { sendOnClick: value === "send" } })}
+          />
+        </Row>
+        <Row label="发送按键" hint="有的聊天软件用 Ctrl+回车 才是发送">
+          <Segmented
+            value={phrases.sendKey}
+            options={[
+              { value: "enter", label: "回车" },
+              { value: "ctrlEnter", label: "Ctrl+回车" },
+            ]}
+            onChange={(value) =>
+              update({ phrases: { sendKey: value as "enter" | "ctrlEnter" } })
+            }
           />
         </Row>
         <Row label="外侧 / 内侧" hint="内侧会叠在目标窗口上，从窗口边缘往里展开">
@@ -954,7 +955,7 @@ export function PhrasesPage({
           )}
         </div>
       </Card>
-
+      ) : (
       <Card
         title="话术"
         action={
@@ -964,7 +965,7 @@ export function PhrasesPage({
             onClick={() =>
               setItems([
                 ...phrases.items,
-                { id: `p${Date.now()}`, title: "新话术", text: "" },
+                { id: `p${Date.now()}`, title: "", text: "" },
               ])
             }
           >
@@ -980,17 +981,11 @@ export function PhrasesPage({
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {phrases.items.map((item) => (
             <div className="phrase-row" key={item.id}>
-              <input
-                className="phrase-title"
-                value={item.title}
-                placeholder="标题"
-                onChange={(event) => patch(item.id, { title: event.target.value })}
-              />
               <textarea
                 className="phrase-text"
                 rows={2}
                 value={item.text}
-                placeholder="要发送的内容"
+                placeholder="输入话术内容"
                 onChange={(event) => patch(item.id, { text: event.target.value })}
               />
               <button
@@ -1006,6 +1001,7 @@ export function PhrasesPage({
           ))}
         </div>
       </Card>
+      )}
 
       {picking && (
         <AppPicker
