@@ -477,6 +477,7 @@ fn open_overlay(app: &AppHandle) -> Result<(), String> {
     let Some((origin_x, origin_y, width, height, payload)) =
         overlay_geometry(&monitors, &regions, trigger.ratio, trigger.position)
     else {
+        log::warn!("overlay: no monitors yet");
         return Err("还没有读到显示器".to_string());
     };
 
@@ -496,16 +497,23 @@ fn open_overlay(app: &AppHandle) -> Result<(), String> {
             .map_err(|error| error.to_string())?,
     };
 
-    overlay
-        .set_position(PhysicalPosition::new(origin_x, origin_y))
-        .map_err(|error| error.to_string())?;
-    overlay
-        .set_size(PhysicalSize::new(width, height))
-        .map_err(|error| error.to_string())?;
-    overlay
-        .set_ignore_cursor_events(true)
-        .map_err(|error| error.to_string())?;
-    overlay.show().map_err(|error| error.to_string())?;
+    if let Err(error) = overlay.set_position(PhysicalPosition::new(origin_x, origin_y)) {
+        log::warn!("overlay: set_position failed: {error}");
+        return Err(error.to_string());
+    }
+    if let Err(error) = overlay.set_size(PhysicalSize::new(width, height)) {
+        log::warn!("overlay: set_size failed: {error}");
+        return Err(error.to_string());
+    }
+    if let Err(error) = overlay.set_ignore_cursor_events(true) {
+        log::warn!("overlay: set_ignore_cursor_events failed: {error}");
+        return Err(error.to_string());
+    }
+    if let Err(error) = overlay.show() {
+        log::warn!("overlay: show failed: {error}");
+        return Err(error.to_string());
+    }
+    log::info!("overlay: shown at {origin_x},{origin_y} {width}x{height} ({} bands, {} zones)", payload.bands.len(), payload.zones.len());
     overlay
         .emit("overlay-zones", payload)
         .map_err(|error| error.to_string())?;
@@ -521,7 +529,15 @@ fn open_overlay(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn show_trigger_overlay(app: AppHandle) -> Result<(), String> {
-    open_overlay(&app)
+    // Building a WebView2 window re-enters the event loop: doing it on the
+    // command thread deadlocks the window creation, which is why the overlay
+    // used to appear as an invisible 800x600 window and nothing else.
+    thread::spawn(move || {
+        if let Err(error) = open_overlay(&app) {
+            log::warn!("overlay: {error}");
+        }
+    });
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
