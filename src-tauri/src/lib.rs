@@ -880,6 +880,9 @@ async fn update_check(app: AppHandle) -> Result<Option<UpdateInfoDto>, String> {
         }
         status.clone()
     };
+    if let Some(version) = &snapshot.version {
+        log::info!("update: {version} available");
+    }
     let _ = app.emit("update-status", snapshot);
 
     result
@@ -1074,22 +1077,29 @@ fn place_panel(app: &AppHandle, window: &tauri::WebviewWindow) {
     let mut y = rect.top + 48;
 
     // Keep the panel on the monitor that holds the target window; docking
-    // inside a narrow window could otherwise push it off screen.
+    // inside a narrow window could otherwise push it off screen. One point
+    // query instead of enumerating every display: this runs per frame.
     let center_x = (rect.left + rect.right) / 2;
     let center_y = (rect.top + rect.bottom) / 2;
-    let monitors = hexbench_core::sys::enumerate_monitors();
-    if let Some(monitor) = monitors.iter().find(|monitor| {
-        let area = monitor.rect;
-        center_x >= area.left && center_x < area.right && center_y >= area.top && center_y < area.bottom
-    }) {
-        let work = monitor.work;
-        let max_x = (work.right - width).max(work.left);
-        let max_y = (work.bottom - height).max(work.top);
-        x = x.clamp(work.left, max_x);
-        y = y.clamp(work.top, max_y);
+    if let Some((left, top, right, bottom)) =
+        hexbench_core::sys::work_area_at(center_x, center_y)
+    {
+        x = x.clamp(left, (right - width).max(left));
+        y = y.clamp(top, (bottom - height).max(top));
     }
 
-    let _ = window.set_position(PhysicalPosition::new(x, y));
+    move_panel_to(window, x, y);
+}
+
+/// Move the panel with the raw Win32 call when we have a handle, so the
+/// follow loop is not queued behind the Tauri event loop.
+fn move_panel_to(window: &tauri::WebviewWindow, x: i32, y: i32) {
+    match window.hwnd() {
+        Ok(hwnd) => hexbench_core::sys::move_window_now(hwnd.0 as isize, x, y),
+        Err(_) => {
+            let _ = window.set_position(PhysicalPosition::new(x, y));
+        }
+    }
 }
 
 /// Remember that the panel is open, and which desktop it was opened on.
@@ -1284,13 +1294,29 @@ fn build_phrases_panel(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 fn spawn_panel_follower(app: AppHandle) {
     thread::spawn(move || {
         let mut last: Option<(i32, i32, i32, i32)> = None;
+        // Frame rate only while something is actually moving; a docked panel
+        // that nobody drags must not cost 6% of a core.
+        let mut last_change = Instant::now() - Duration::from_secs(5);
         loop {
-            thread::sleep(Duration::from_millis(250));
+            let open = app.state::<AppState>().panel_open.load(Ordering::Relaxed);
+            if !open {
+                last = None;
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            let interval = if last_change.elapsed() < Duration::from_millis(350) {
+                16
+            } else {
+                60
+            };
+            thread::sleep(Duration::from_millis(interval));
             let Some(window) = app.get_webview_window("phrases") else {
                 last = None;
                 continue;
             };
             if !window.is_visible().unwrap_or(false) {
+                // Forget the last rect so the panel is placed again on show.
+                last = None;
                 continue;
             }
             let (target, target_class, target_title) = {
@@ -1303,12 +1329,8 @@ fn spawn_panel_follower(app: AppHandle) {
                     phrases.target_title.clone(),
                 )
             };
-            let Some(info) = hexbench_core::sys::foreground_window_info() else {
-                continue;
-            };
-            if !matches_target(&info, &target, &target_class, &target_title) {
-                continue;
-            }
+            // The rect is two cheap calls; only when it moves do we pay for
+            // the process lookup that proves it is still the target.
             let Some(rect) = hexbench_core::sys::foreground_window_rect() else {
                 continue;
             };
@@ -1317,6 +1339,20 @@ fn spawn_panel_follower(app: AppHandle) {
                 continue;
             }
             last = Some(key);
+            last_change = Instant::now();
+            // Nothing configured to dock to: the panel simply stays where the
+            // user put it, so there is nothing to follow.
+            if target.is_empty() && target_class.is_empty() && target_title.is_empty() {
+                last = None;
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            let Some(info) = hexbench_core::sys::foreground_window_info() else {
+                continue;
+            };
+            if !matches_target(&info, &target, &target_class, &target_title) {
+                continue;
+            }
             place_panel(&app, &window);
         }
     });
@@ -1401,7 +1437,25 @@ fn open_main(app: &AppHandle) {
     thread::spawn(move || open_main_now(&handle));
 }
 
+/// Refresh the update status when the window is opened, at most every couple of
+/// minutes: a release published a minute ago should not wait for the timer.
+fn check_update_if_stale(app: &AppHandle) {
+    let stale = {
+        let state = app.state::<AppState>();
+        let status = state.update_status.lock().unwrap();
+        status.checked_at > 0 && now_secs() - status.checked_at > 120
+    };
+    if !stale {
+        return;
+    }
+    let handle = app.clone();
+    thread::spawn(move || {
+        let _ = tauri::async_runtime::block_on(update_check(handle));
+    });
+}
+
 fn open_main_now(app: &AppHandle) {
+    check_update_if_stale(app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1774,12 +1828,16 @@ pub fn run() {
                 open_main_now(&handle);
             }
 
-            // One update check per process, a few seconds in: windows come and
-            // go, but the version does not change while the app runs.
+            // A tray app can run for days: checking only at launch would mean
+            // "restart to find out you have an update". latest.json is a few
+            // hundred bytes, so half-hourly is cheap.
             let check_handle = handle.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(3));
-                let _ = tauri::async_runtime::block_on(update_check(check_handle));
+                loop {
+                    let _ = tauri::async_runtime::block_on(update_check(check_handle.clone()));
+                    thread::sleep(Duration::from_secs(30 * 60));
+                }
             });
 
             Ok(())

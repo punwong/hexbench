@@ -35,8 +35,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MSG,
     SetCursorPos, SetWindowLongW, SetWindowPos, TranslateMessage, WindowFromPoint,
-    WINEVENT_OUTOFCONTEXT, GA_ROOT, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WINEVENT_OUTOFCONTEXT, GA_ROOT, GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::geometry::EdgeProbe;
@@ -600,6 +600,27 @@ pub fn watch_desktop_switches() {
             }
         }
     });
+}
+/// Move a window immediately, without activation or z-order changes.
+///
+/// `WebviewWindow::set_position` goes through the Tauri event loop, which
+/// adds a frame or two of latency; a follow loop needs the raw call.
+pub fn move_window_now(hwnd: isize, x: i32, y: i32) {
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: the handle is owned by this process and only repositioned.
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+    }
 }
 /// Move the cursor (used to nudge it back inside after a switch).
 pub fn set_cursor_pos(x: i32, y: i32) -> bool {

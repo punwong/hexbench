@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
-  ArrowUpCircle,
   Crosshair,
   Gauge,
   Info,
   Keyboard,
   MessageSquare,
-  RefreshCw,
   Settings,
   Sparkles,
+  AlertTriangle,
 } from "lucide-react";
 
 import {
@@ -105,6 +104,14 @@ export default function App() {
       setUpdatePhase("error");
     }
   }, []);
+
+  // Silent update: as soon as a newer version is known, fetch it in the
+  // background. The sidebar then only ever offers a single「安装」action.
+  useEffect(() => {
+    if (updatePhase !== "available" || !updateVersion) return;
+    if (updateVersion === config?.updates.dismissedVersion) return;
+    void runDownload();
+  }, [updatePhase, updateVersion, config?.updates.dismissedVersion, runDownload]);
 
   // The process checks once at startup; windows read that cached result and
   // follow the live event, so opening the window costs no network round trip.
@@ -246,11 +253,10 @@ export default function App() {
   // A dismissed version stays quiet until a different one shows up.
   const updateDismissed =
     updateVersion !== null && updateVersion === config?.updates.dismissedVersion;
+  // Downloading is invisible on purpose: the pill appears only when the
+  // package is on disk and one click finishes the job.
   const showUpdatePill =
-    updatePhase === "downloading" ||
-    updatePhase === "ready" ||
-    updatePhase === "error" ||
-    (updatePhase === "available" && !updateDismissed);
+    updatePhase === "error" || (updatePhase === "ready" && !updateDismissed);
 
   return (
     <div className="app">
@@ -283,39 +289,38 @@ export default function App() {
         <div className="sidebar-bottom">
         {showUpdatePill && (
           <div className={`update-pill ${updatePhase}`}>
-            <button
-              type="button"
-              className="update-action"
-              disabled={updatePhase === "downloading"}
-              onClick={() => {
-                if (updatePhase === "available") void runDownload();
-                else if (updatePhase === "ready") void runInstall();
-                else setPage("about");
-              }}
-            >
-              {updatePhase === "ready" ? <RefreshCw size={14} /> : <ArrowUpCircle size={14} />}
-              <span>
-                {updatePhase === "available" && `发现 ${updateVersion}，点击下载`}
-                {updatePhase === "downloading" && `下载中 ${updateProgress ?? 0}%`}
-                {updatePhase === "ready" && "更新并重启"}
-                {updatePhase === "error" && "更新失败，点此查看"}
-              </span>
-            </button>
-            {updatePhase === "downloading" && (
-              <div className="update-bar">
-                <i style={{ width: `${updateProgress ?? 0}%` }} />
-              </div>
-            )}
-            {updatePhase === "available" && (
+            {updatePhase === "ready" ? (
+              <>
+                <div className="update-note">
+                  <span className="update-version">新版本 {updateVersion}</span>
+                  <span className="update-sub">已下载，装好会重启</span>
+                </div>
+                <button
+                  type="button"
+                  className="btn primary update-install"
+                  onClick={() => void runInstall()}
+                >
+                  更新并安装
+                </button>
+                <button
+                  type="button"
+                  className="update-dismiss"
+                  title="忽略这个版本"
+                  onClick={() => {
+                    update({ updates: { dismissedVersion: updateVersion ?? "" } });
+                  }}
+                >
+                  ×
+                </button>
+              </>
+            ) : (
               <button
                 type="button"
-                className="update-dismiss"
-                title="忽略这个版本"
-                onClick={() => {
-                  update({ updates: { dismissedVersion: updateVersion ?? "" } });
-                }}
+                className="update-action"
+                onClick={() => setPage("about")}
               >
-                ×
+                <AlertTriangle size={14} />
+                <span>更新失败，点此查看</span>
               </button>
             )}
           </div>
