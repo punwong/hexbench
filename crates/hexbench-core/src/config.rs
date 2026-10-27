@@ -124,17 +124,12 @@ pub struct PhraseSettings {
 }
 
 /// Chat apps disagree: some send on Enter, others on Ctrl+Enter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SendKey {
+    #[default]
     Enter,
     CtrlEnter,
-}
-
-impl Default for SendKey {
-    fn default() -> Self {
-        Self::Enter
-    }
 }
 
 impl Default for PhraseSettings {
