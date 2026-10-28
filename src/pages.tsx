@@ -1,25 +1,41 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { Crosshair, MessageSquare } from "lucide-react";
+import { Crosshair, MessageSquare, Rocket } from "lucide-react";
 
+import type { CacheInfo } from "./api";
 import type {
   Config,
+  StagedFile,
   GuardSettings,
   HotkeySettings,
+  LauncherSettings,
   MonitorDto,
   Phrase,
   PhraseSettings,
   RunningApp,
+  StagingSettings,
   Snapshot,
   TriggerSettings,
   UiSettings,
   UpdateSettings,
 } from "./types";
 import {
+  beginStagingDrag,
+  cacheClear,
+  cacheStats,
   copyText,
+  onStagingChanged,
+  setStagingEnabled,
+  stagingClear,
+  stagingFiles,
+  stagingCopy,
+  stagingRemove,
+  stagingReveal,
   diagnostics,
   onAppPicked,
+  openPath,
   pickApp,
+  pickFolder,
   runningApps,
   syncPull,
   syncPush,
@@ -36,6 +52,8 @@ export type Patch = {
   guard?: Partial<GuardSettings>;
   hotkeys?: Partial<HotkeySettings>;
   phrases?: Partial<PhraseSettings>;
+  staging?: Partial<StagingSettings>;
+  launcher?: Partial<LauncherSettings>;
   updates?: Partial<UpdateSettings>;
   ui?: Partial<UiSettings>;
 };
@@ -83,7 +101,7 @@ export function Overview({
   snap: Snapshot;
   config: Config;
   update: UpdateConfig;
-  onOpen: (page: "edge" | "phrases") => void;
+  onOpen: (page: "edge" | "phrases" | "launcher") => void;
 }) {
   const desktops = snap.desktopCount;
   return (
@@ -91,8 +109,17 @@ export function Overview({
       <Card title="工具">
         <div className="tools">
           <ToolRow
+            icon={<Rocket size={18} />}
+            name="快捷启动"
+            hint="一个键呼出：按分类启动程序，顺手中转文件"
+            enabled={config.launcher.enabled}
+            onToggle={(value) => update({ launcher: { enabled: value } })}
+            onOpen={() => onOpen("launcher")}
+          />
+
+          <ToolRow
             icon={<Crosshair size={18} />}
-            name="边缘切桌面"
+            name="边缘桌面"
             hint={
               desktops
                 ? `鼠标推到屏幕最外侧边缘就切虚拟桌面（当前 ${desktops} 个）`
@@ -104,7 +131,7 @@ export function Overview({
           />
           <ToolRow
             icon={<MessageSquare size={18} />}
-            name="快捷语面板"
+            name="常用语"
             hint="吸附在聊天应用旁边的话术面板，点一下就填进输入框"
             enabled={config.phrases.enabled}
             onToggle={(value) => update({ phrases: { enabled: value } })}
@@ -205,7 +232,7 @@ export function TriggerPage({
             触发带（屏高的 {percent}%）
           </span>
           <span>
-            <i className="swatch" />
+            <i className="swatch edge" />
             可触发边缘
           </span>
         </div>
@@ -804,7 +831,7 @@ export function AboutPage({
           <dt>定位</dt>
           <dd>托盘常驻的 Windows 效率工具箱</dd>
           <dt>首个工具</dt>
-          <dd>边缘切桌面</dd>
+          <dd>边缘桌面</dd>
         </dl>
         <div className="footnote">
           项目名与图标不在 MIT 授权范围内；衍生分发请改名换图标。
@@ -1024,9 +1051,33 @@ export function PhrasesPage({
   );
 }
 
-const HOTKEY_ROWS: { key: "pause" | "phrasesPanel"; label: string; hint: string }[] = [
-  { key: "pause", label: "暂停 / 继续", hint: "随手停掉边缘切换，不用打开窗口" },
-  { key: "phrasesPanel", label: "快捷语面板", hint: "显示 / 隐藏话术面板" },
+/** 热键按工具分组：每个工具一组，工具页里不再重复配置。 */
+const HOTKEY_GROUPS: Array<{
+  tool: string;
+  hint: string;
+  rows: Array<{ key: "pause" | "phrasesPanel" | "launcher"; label: string; hint: string }>;
+}> = [
+  {
+    tool: "快捷启动",
+    hint: "呼出启动器 / 中转站面板",
+    rows: [
+      { key: "launcher", label: "呼出面板", hint: "任何时候按一下就能呼出" },
+    ],
+  },
+  {
+    tool: "边缘桌面",
+    hint: "停掉边缘切换不用打开窗口",
+    rows: [
+      { key: "pause", label: "暂停 / 继续", hint: "随手停掉边缘切换，不用打开窗口" },
+    ],
+  },
+  {
+    tool: "常用语",
+    hint: "话术面板的显示与隐藏",
+    rows: [
+      { key: "phrasesPanel", label: "显示 / 隐藏面板", hint: "在聊天窗口旁边叫出话术面板" },
+    ],
+  },
 ];
 
 function comboFrom(event: KeyboardEvent): string | null {
@@ -1078,6 +1129,174 @@ function HotkeyCapture({ onCapture }: { onCapture: (combo: string) => void }) {
   );
 }
 
+
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} KB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+export function StagingPage({
+  config,
+  update,
+}: {
+  config: Config;
+  update: UpdateConfig;
+}) {
+  const [items, setItems] = useState<StagedFile[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [toast, setToast] = useState("");
+
+  const flash = (message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 2600);
+  };
+
+  const copyItem = (name: string) => {
+    void stagingCopy([name]).then((count) => {
+      if (count > 0) flash("已复制到剪贴板，去目标窗口按 Ctrl+V");
+    });
+  };
+
+  const refresh = () => {
+    void stagingFiles().then(setItems);
+  };
+
+  useEffect(() => {
+    refresh();
+    let stop: (() => void) | undefined;
+    void onStagingChanged(() => {
+      setDragging(false);
+      refresh();
+    }).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, []);
+
+  const enabled = config.staging.enabled;
+
+  // 拖出去：按住某一行往窗外拖，交给系统接管（真正的 OLE 拖拽）。
+  const startDragOut = (item: StagedFile, event: React.PointerEvent) => {
+    if (event.button !== 0) return;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let started = false;
+
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    const move = (next: PointerEvent) => {
+      if (started) return;
+      if (Math.abs(next.clientX - startX) + Math.abs(next.clientY - startY) < 5) {
+        return;
+      }
+      started = true;
+      stop();
+      void beginStagingDrag(item.name).then((effect) => {
+        if (effect === 0) {
+          flash("没落到目标上，可以点「复制」再按 Ctrl+V");
+        }
+      });
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  };
+
+  return (
+    <div className="stack">
+      {!enabled && (
+        <div className="callout">
+          中转站没开。到「概览」把它打开，主界面才会跟着虚拟桌面走。
+        </div>
+      )}
+
+      <Card
+        action={
+          <button type="button" className="btn" onClick={() => void stagingReveal()}>
+            打开文件夹
+          </button>
+        }
+        title="中转站"
+      >
+        <div className={`drop-zone ${dragging ? "over" : ""}`}>
+          {items.length === 0 ? (
+            <div className="drop-empty">
+              <b>把文件拖到这里</b>
+              <span>文件会被收进中转站，切到别的桌面再拖出去就行</span>
+            </div>
+          ) : (
+            <div className="staged-list">
+              {items.map((item) => (
+                <div
+                  className="staged-row"
+                  key={item.name}
+                  onPointerDown={(event) => startDragOut(item, event)}
+                >
+                  <span className="staged-icon">{item.dir ? "📁" : "📄"}</span>
+                  <span className="staged-text">
+                    <span className="staged-name">{item.name}</span>
+                    <span className="staged-meta">
+                      {item.dir ? "文件夹" : formatBytes(item.size)}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void stagingReveal(item.name)}
+                  >
+                    定位
+                  </button>
+                  <button type="button" className="btn" onClick={() => copyItem(item.name)}>
+                    复制
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void stagingRemove([item.name]).then(setItems)}
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {toast && <div className="staging-toast">{toast}</div>}
+
+        <div className="staging-actions">
+          <span className="sub">
+            {items.length === 0 ? "还没有文件" : `共 ${items.length} 项`}
+          </span>
+          <button
+            type="button"
+            className="btn"
+            disabled={items.length === 0}
+            onClick={() => void stagingClear().then(setItems)}
+          >
+            清空
+          </button>
+        </div>
+      </Card>
+
+      <Card title="一起切桌面">
+        <Row label="主界面跟随虚拟桌面" hint="开着时，这个窗口在每个桌面上都在，方便来回搬文件">
+          <Toggle
+            checked={enabled}
+            onChange={(next) => {
+              update({ staging: { enabled: next } });
+              void setStagingEnabled(next);
+            }}
+          />
+        </Row>
+      </Card>
+    </div>
+  );
+}
 export function HotkeysPage({
   config,
   update,
@@ -1089,36 +1308,277 @@ export function HotkeysPage({
 }) {
   return (
     <div className="stack">
-      <Card title="全局热键">
-        <p className="sub" style={{ marginTop: 0 }}>
-          所有快捷键都在这里注册，工具再多也只抢这一处。点「设置」后按下组合键，Esc 取消。
+      <p className="sub" style={{ margin: 0 }}>
+        快捷键按工具分组，工具自己的设置页里不再单独配置。点「设置」后按下组合键，Esc 取消；改完立即生效。
+      </p>
+
+      {HOTKEY_GROUPS.map((group) => (
+        <Card key={group.tool} title={group.tool}>
+          <p className="sub" style={{ marginTop: 0 }}>
+            {group.hint}
+          </p>
+          {group.rows.map((row) => (
+            <Row key={row.key} label={row.label} hint={row.hint}>
+              <div className="hotkey-cell">
+                <code>{config.hotkeys[row.key] || "未设置"}</code>
+                <HotkeyCapture
+                  onCapture={(combo) => update({ hotkeys: { [row.key]: combo } })}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => update({ hotkeys: { [row.key]: "" } })}
+                >
+                  清除
+                </button>
+              </div>
+            </Row>
+          ))}
+        </Card>
+      ))}
+
+      {snap.hotkeyError && (
+        <p className="sub" style={{ color: "#b42318", margin: 0 }}>
+          {snap.hotkeyError}
         </p>
-        {HOTKEY_ROWS.map((row) => (
-          <Row key={row.key} label={row.label} hint={row.hint}>
-            <div className="hotkey-cell">
-              <code>{config.hotkeys[row.key] || "未设置"}</code>
-              <HotkeyCapture
-                onCapture={(combo) => update({ hotkeys: { [row.key]: combo } })}
-              />
-              <button
-                type="button"
-                className="btn"
-                onClick={() => update({ hotkeys: { [row.key]: "" } })}
-              >
-                清除
-              </button>
-            </div>
-          </Row>
-        ))}
-        {snap.hotkeyError && <p className="sub" style={{ color: "#b42318" }}>{snap.hotkeyError}</p>}
-      </Card>
+      )}
 
       <Card title="说明">
         <p className="sub" style={{ margin: 0, lineHeight: 1.8 }}>
-          热键修改后立即生效，不需要重启。
-          <br />
           如果组合键被其他程序占用，注册会失败并在上方提示——换一个组合即可。
+          <br />
+          工具关掉时，它的快捷键不会生效，但配置会保留。
         </p>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * 快捷启动：一个键呼出的面板。
+ *
+ * 面板里有两块内容，对应这里的两个标签：
+ *   启动项 —— 根目录下的每个子文件夹就是一个分类；
+ *   中转站 —— 一个普通文件夹，用来临时搬文件。
+ */
+export function LauncherPage({
+  config,
+  update,
+  tab,
+  onTabChange,
+}: {
+  config: Config;
+  update: UpdateConfig;
+  tab: "items" | "staging";
+  onTabChange: (tab: "items" | "staging") => void;
+}) {
+
+  const choose = async (target: "root" | "file") => {
+    const folder = await pickFolder();
+    if (!folder) return;
+    update({
+      launcher: target === "root" ? { root: folder } : { folder },
+    });
+  };
+
+  const root = config.launcher.root;
+  const folder = config.launcher.folder;
+
+  return (
+    <div className="stack">
+      <Tabs
+        value={tab}
+        onChange={(value) => onTabChange(value as "items" | "staging")}
+        options={[
+          { value: "items", label: "启动项" },
+          { value: "staging", label: "中转站" },
+        ]}
+      />
+
+      {tab === "items" ? (
+        <Card title="启动项">
+          <p className="sub" style={{ marginTop: 0 }}>
+            选一个根目录，它下面的每个子文件夹就是一个分类（比如 常用 / 软件 / 设计），
+            面板左侧按这些分类生成导航，右边显示分类里的程序。
+          </p>
+          <Row label="根目录" hint="例如 D:\启动器，里面放几个子文件夹当分类">
+            <div className="hotkey-cell">
+              <code>{root || "未选择"}</code>
+              <button type="button" className="btn" onClick={() => void choose("root")}>
+                选择
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => update({ launcher: { root: "" } })}
+              >
+                清空
+              </button>
+            </div>
+          </Row>
+          <Row
+            label="呼出位置"
+            hint="打开后贴着鼠标出现；关掉则固定在该屏幕的中间偏上"
+          >
+            <div className="hotkey-cell">
+              <Toggle
+                checked={config.launcher.followCursor}
+                onChange={(value) => update({ launcher: { followCursor: value } })}
+              />
+              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
+                {config.launcher.followCursor ? "贴着鼠标" : "屏幕居中"}
+              </span>
+            </div>
+          </Row>
+          <Row label="面板宽度" hint="占所在屏幕工作区宽度的百分比">
+            <Slider
+              value={config.launcher.widthPercent}
+              min={25}
+              max={80}
+              step={1}
+              onChange={(value) => update({ launcher: { widthPercent: value } })}
+              format={(value) => `${value}%`}
+            />
+          </Row>
+          <Row label="面板高度" hint="占所在屏幕工作区高度的百分比">
+            <Slider
+              value={config.launcher.heightPercent}
+              min={30}
+              max={80}
+              step={1}
+              onChange={(value) => update({ launcher: { heightPercent: value } })}
+              format={(value) => `${value}%`}
+            />
+          </Row>
+          <Row
+            label="记住上次位置"
+            hint="呼出时回到上次浏览的文件夹，不用每次重新选"
+          >
+            <Toggle
+              checked={config.launcher.rememberLocation}
+              onChange={(value) => update({ launcher: { rememberLocation: value } })}
+            />
+          </Row>
+
+        </Card>
+      ) : (
+        <Card title="中转站">
+          <p className="sub" style={{ marginTop: 0 }}>
+            面板左侧最后的「中转站」显示这个文件夹。往里拖文件就是移动进这个目录，
+            往外拖就是复制或移动出去——用来在网页、聊天窗口之间快速搬文件。
+          </p>
+          <Row label="文件夹" hint="建议用一个固定的目录，比如 D:\中转">
+            <div className="hotkey-cell">
+              <code>{folder || "未选择"}</code>
+              <button type="button" className="btn" onClick={() => void choose("file")}>
+                选择
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => update({ launcher: { folder: "" } })}
+              >
+                清空
+              </button>
+            </div>
+          </Row>
+          <Row label="打开文件夹" hint="在资源管理器里查看这个目录">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => folder && void openPath(folder)}
+            >
+              打开
+            </button>
+          </Row>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/// 设置页里的「缓存」：目前只有缩略图，以后别的工具也能挂在这里。
+export function CachePage() {
+  const [items, setItems] = useState<CacheInfo[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const load = () => {
+    void cacheStats()
+      .then(setItems)
+      .catch(() => setItems([]));
+  };
+  useEffect(load, []);
+
+  const total = items.reduce((sum, item) => sum + item.bytes, 0);
+
+  const clear = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const freed = await cacheClear();
+      setNote(freed > 0 ? `已释放 ${formatBytes(freed)}` : "缓存已经是空的");
+      load();
+    } catch (error) {
+      setNote(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="stack">
+      <Card title="缓存">
+        <div className="row-hint" style={{ marginBottom: 12 }}>
+          删掉不会丢东西，只是下次打开要重新生成一遍。
+        </div>
+
+        {items.length === 0 && <div className="row-hint">还没有任何缓存。</div>}
+
+        {items.map((item) => (
+          <div
+            key={item.key}
+            style={{
+              padding: "10px 12px",
+              border: "1px solid var(--line)",
+              borderRadius: 10,
+              marginBottom: 10,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+              <strong style={{ fontSize: 13 }}>{item.label}</strong>
+              <span className="sub">
+                {formatBytes(item.bytes)} · {item.files} 个文件
+              </span>
+            </div>
+            <div className="row-hint" style={{ margin: "4px 0 6px" }}>
+              {item.hint}
+            </div>
+            <div className="mono" style={{ wordBreak: "break-all", color: "var(--muted)", fontSize: 11.5 }}>
+              {item.path}
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <button type="button" className="btn" onClick={() => void openPath(item.path)}>
+                打开文件夹
+              </button>
+            </div>
+          </div>
+        ))}
+
+        <Row label="合计" hint="所有缓存加起来的占用">
+          <span className="sub">{formatBytes(total)}</span>
+        </Row>
+
+        <div style={{ marginTop: 12 }}>
+          <button type="button" className="btn" disabled={busy || total === 0} onClick={() => void clear()}>
+            {busy ? "清理中…" : "清空所有缓存"}
+          </button>
+        </div>
+        {note && (
+          <div className="row-hint" style={{ marginTop: 8 }}>
+            {note}
+          </div>
+        )}
       </Card>
     </div>
   );

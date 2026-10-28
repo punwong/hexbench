@@ -4,9 +4,12 @@
 //! and driven from a CLI (`hexbench run` / `hexbench --layout`).
 
 pub mod config;
+pub mod drop_target;
+pub mod shell_ops;
 #[cfg(windows)]
 pub mod dpapi;
 pub mod geometry;
+pub mod icons;
 pub mod model;
 pub mod sync;
 pub mod trigger;

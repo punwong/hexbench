@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Config, HitDto, RunningApp, Snapshot } from "./types";
+import type { Config, HitDto, RunningApp, Snapshot, StagedFile } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -23,7 +23,7 @@ const demoConfig: Config = {
     processBlacklist: [],
     pauseHotkey: "Ctrl+Alt+Shift+P",
   },
-  hotkeys: { pause: "Ctrl+Alt+Shift+P", phrasesPanel: "Ctrl+Alt+Shift+Q" },
+  hotkeys: { pause: "Ctrl+Alt+Shift+P", phrasesPanel: "Ctrl+Alt+Shift+Q", launcher: "Ctrl+Alt+Space" },
   updates: { endpoint: "", dismissedVersion: "" },
   sync: {
     enabled: false,
@@ -33,6 +33,17 @@ const demoConfig: Config = {
     lastPush: 0,
     lastPull: 0,
   },
+  staging: { enabled: false },
+  launcher: {
+      enabled: true,
+      folder: "",
+      root: "",
+      followCursor: false,
+      widthPercent: 70,
+      heightPercent: 70,
+      rememberLocation: true,
+      lastLocation: { kind: "", base: "", label: "", path: "" },
+    },
   phrases: {
     enabled: true,
     items: [
@@ -131,6 +142,64 @@ export async function getHitState(): Promise<{
   if (!isTauri) return { hit: null, guard: null, phase: "idle" };
   const [hit, guard, phase] = await invoke<[HitDto | null, string | null, string]>("hit_state");
   return { hit, guard, phase };
+}
+
+// ---------- 中转站 ----------
+
+export async function stagingFiles(): Promise<StagedFile[]> {
+  if (!isTauri) return [];
+  return invoke<StagedFile[]>("staging_list");
+}
+
+export async function stagingRemove(names: string[]): Promise<StagedFile[]> {
+  if (!isTauri) return [];
+  return invoke<StagedFile[]>("staging_remove", { names });
+}
+
+export async function stagingClear(): Promise<StagedFile[]> {
+  if (!isTauri) return [];
+  return invoke<StagedFile[]>("staging_clear");
+}
+
+export async function stagingReveal(name?: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke("staging_reveal", { name: name ?? null });
+}
+
+/** 用系统默认程序打开一个路径。 */
+export async function openPath(path: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke("launcher_open", { path });
+}
+
+/** 系统文件夹选择器（仅桌面端）。 */
+export async function pickFolder(): Promise<string | null> {
+  if (!isTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({ directory: true, multiple: false });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Puts staged files on the clipboard as real files (Ctrl+V pastes them). */
+export async function stagingCopy(names: string[]): Promise<number> {
+  if (!isTauri) return 0;
+  return invoke<number>("staging_copy", { names });
+}
+
+/** Hands a staged file to the OS so the user can drag it out of the window. */
+export async function beginStagingDrag(name: string): Promise<number> {
+  if (!isTauri) return 0;
+  return invoke<number>("begin_staging_drag", { name });
+}
+
+export async function setStagingEnabled(enabled: boolean): Promise<void> {
+  if (!isTauri) return;
+  await invoke("staging_set_enabled", { enabled });
+}
+
+/** Fires when files are dropped onto the window. */
+export function onStagingChanged(handler: () => void): Promise<() => void> {
+  return listen("staging-changed", handler);
 }
 
 export async function closePanel(): Promise<void> {
@@ -313,4 +382,24 @@ export async function onAppPicked(
 ): Promise<() => void> {
   if (!isTauri) return () => undefined;
   return listen<RunningApp>("app-picked", (event) => handler(event.payload));
+}
+
+/// 设置页「缓存」用到的信息。
+export type CacheInfo = {
+  key: string;
+  label: string;
+  hint: string;
+  path: string;
+  bytes: number;
+  files: number;
+};
+
+export async function cacheStats(): Promise<CacheInfo[]> {
+  if (!isTauri) return [];
+  return invoke<CacheInfo[]>("cache_stats");
+}
+
+export async function cacheClear(): Promise<number> {
+  if (!isTauri) return 0;
+  return invoke<number>("cache_clear");
 }

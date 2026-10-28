@@ -8,11 +8,24 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.23.1"
+log = "0.4"
+notify = "8.2.1"
+png = "0.18.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
 
 [target.'cfg(windows)'.dependencies]
+# 完整的 `windows` 绑定：IFileOperation / IShellItemImageFactory 这类接口
+# 手写 vtable 太容易出错，直接用生成好的。
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_Graphics_Gdi",
+] }
 winreg = "0.56"
 # Raw bindings, not the ergonomic `windows` crate: this crate only needs a
 # handful of user32/shell32 calls, and `windows-sys` has no wrapper cost.
@@ -20,10 +33,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }

@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import type { ReactNode } from "react";
 import {
   Crosshair,
+  Database,
   Gauge,
   Info,
   Keyboard,
   MessageSquare,
+  Rocket,
   Settings,
   Sparkles,
   AlertTriangle,
@@ -29,31 +32,52 @@ import type { Config, Snapshot } from "./types";
 import {
   AboutPage,
   EdgePage,
+  LauncherPage,
+  CachePage,
   GeneralPage,
   HotkeysPage,
   Overview,
   PhrasesPage,
+
 } from "./pages";
 import type { Patch } from "./pages";
 import { TitleBar } from "./components/TitleBar";
 
-type Page = "overview" | "edge" | "phrases" | "hotkeys" | "general" | "about";
+type Page = "overview" | "edge" | "phrases" | "launcher" | "hotkeys" | "general" | "cache" | "about";
 
 /// Where the updater currently is: nothing, a version to grab, downloading,
 /// a package waiting for a restart, or a failure worth showing.
 type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
 
 const TITLES: Record<Page, { title: string; subtitle: string }> = {
-  overview: { title: "概览", subtitle: "两个工具，各自一个开关" },
-  edge: { title: "边缘切桌面", subtitle: "触发位置、时序与防误触" },
-  phrases: { title: "快捷语面板", subtitle: "吸附在聊天窗口旁，点一下就发出去" },
+  overview: { title: "概览", subtitle: "按需打开，各占一个设置页" },
+  edge: { title: "边缘桌面", subtitle: "触发位置、时序与防误触" },
+  phrases: { title: "常用语", subtitle: "吸附在聊天窗口旁，点一下就发出去" },
+  launcher: { title: "快捷启动", subtitle: "一个键呼出：启动程序、搬运文件" },
   hotkeys: { title: "热键", subtitle: "所有全局快捷键，集中在一处" },
   general: { title: "通用", subtitle: "外观、启动与配置文件" },
+  cache: { title: "缓存", subtitle: "缩略图等缓存的占用与清理" },
   about: { title: "关于", subtitle: "版本、许可证与诊断" },
 };
 
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
+  const [launcherTab, setLauncherTab] = useState<"items" | "staging">("items");
+  // 面板里点「去设置」：切到指定页面（可带 tab）。
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<{ page: string; tab: string | null } | null>("navigate", (event) => {
+      const target = event.payload?.page ?? "overview";
+      const tab = event.payload?.tab ?? null;
+      if (target === "launcher" && (tab === "items" || tab === "staging")) {
+        setLauncherTab(tab);
+      }
+      setPage(target as Page);
+    }).then((fn) => {
+      dispose = fn;
+    });
+    return () => dispose?.();
+  }, []);
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -190,6 +214,8 @@ export default function App() {
       guard: { ...current.guard, ...patch.guard },
       hotkeys: { ...current.hotkeys, ...patch.hotkeys },
       phrases: { ...current.phrases, ...patch.phrases },
+      staging: { ...current.staging, ...patch.staging },
+      launcher: { ...current.launcher, ...patch.launcher },
       updates: { ...current.updates, ...patch.updates },
       ui: { ...current.ui, ...patch.ui },
     };
@@ -230,7 +256,8 @@ export default function App() {
     if (!config) return;
     if (page === "edge" && !config.enabled) setPage("overview");
     if (page === "phrases" && !config.phrases.enabled) setPage("overview");
-  }, [config?.enabled, config?.phrases.enabled, page]);
+    if (page === "launcher" && !config.launcher.enabled) setPage("overview");
+  }, [config?.enabled, config?.phrases.enabled, config?.launcher.enabled, page]);
 
   const finishOnboarding = () => {
     update({ ui: { onboarded: true } });
@@ -267,14 +294,17 @@ export default function App() {
           <NavItem page="overview" current={page} onClick={setPage} icon={<Gauge size={16} />} label="概览" />
         </div>
 
-        {config && (config.enabled || config.phrases.enabled) && (
+        {config && (config.enabled || config.phrases.enabled || config.launcher.enabled) && (
           <div className="nav-group">
             <div className="nav-label">工具</div>
+            {config.launcher.enabled && (
+              <NavItem page="launcher" current={page} onClick={setPage} icon={<Rocket size={16} />} label="快捷启动" />
+            )}
             {config.enabled && (
-              <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘切桌面" />
+              <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘桌面" />
             )}
             {config.phrases.enabled && (
-              <NavItem page="phrases" current={page} onClick={setPage} icon={<MessageSquare size={16} />} label="快捷语面板" />
+              <NavItem page="phrases" current={page} onClick={setPage} icon={<MessageSquare size={16} />} label="常用语" />
             )}
           </div>
         )}
@@ -283,6 +313,7 @@ export default function App() {
           <div className="nav-label">全局</div>
           <NavItem page="hotkeys" current={page} onClick={setPage} icon={<Keyboard size={16} />} label="热键" />
           <NavItem page="general" current={page} onClick={setPage} icon={<Settings size={16} />} label="通用" />
+          <NavItem page="cache" current={page} onClick={setPage} icon={<Database size={16} />} label="缓存" />
           <NavItem page="about" current={page} onClick={setPage} icon={<Info size={16} />} label="关于" />
         </div>
 
@@ -363,6 +394,14 @@ export default function App() {
               void showTriggerOverlay().catch((reason) => setError(String(reason)));
             }}
           />
+        ) : page === "launcher" ? (
+          <LauncherPage
+            config={config}
+            update={update}
+            tab={launcherTab}
+            onTabChange={setLauncherTab}
+          />
+
         ) : page === "phrases" ? (
           <PhrasesPage config={config} update={update} />
         ) : page === "hotkeys" ? (
@@ -378,6 +417,8 @@ export default function App() {
             onRefresh={() => void refreshLayout()}
             onOpenFolder={() => void openConfigFolder()}
           />
+        ) : page === "cache" ? (
+          <CachePage />
         ) : (
           <AboutPage
             snap={snap}

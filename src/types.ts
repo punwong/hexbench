@@ -40,6 +40,8 @@ export interface Config {
   guard: GuardSettings;
   hotkeys: HotkeySettings;
   phrases: PhraseSettings;
+  staging: StagingSettings;
+  launcher: LauncherSettings;
   sync: SyncSettings;
   updates: UpdateSettings;
   ui: UiSettings;
@@ -63,12 +65,43 @@ export interface SyncSettings {
 export interface HotkeySettings {
   pause: string;
   phrasesPanel: string;
+  launcher: string;
 }
 
 export interface Phrase {
   id: string;
   title: string;
   text: string;
+}
+
+export interface StagedFile {
+  name: string;
+  path: string;
+  size: number;
+  modified: number;
+  dir: boolean;
+}
+
+export interface LauncherSettings {
+  enabled: boolean;
+  /** 中转站映射的文件夹 */
+  folder: string;
+  /** 启动器根目录：每个子文件夹是一个分类 */
+  root: string;
+  /** 呼出时贴着鼠标，而不是屏幕居中 */
+  followCursor: boolean;
+  /** 面板宽度占工作区百分比 */
+  widthPercent: number;
+  /** 面板高度占工作区百分比 */
+  heightPercent: number;
+  /** 呼出时回到上次浏览的位置 */
+  rememberLocation: boolean;
+  /** 上次停留的位置 */
+  lastLocation: { kind: string; base: string; label: string; path: string };
+}
+
+export interface StagingSettings {
+  enabled: boolean;
 }
 
 export interface PhraseSettings {

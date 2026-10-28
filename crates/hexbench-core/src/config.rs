@@ -8,6 +8,47 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BandPosition, Side, TriggerConfig};
 
+/// 配置读取发生在日志系统初始化之前，提示先攒在这里，等 setup 里再输出。
+static NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note(message: String) {
+    log::warn!("{message}");
+    if let Ok(mut notes) = NOTES.lock() {
+        notes.push(message);
+    }
+}
+
+/// 取走这次读取攒下的提示（只返回一次）。
+pub fn take_notes() -> Vec<String> {
+    NOTES
+        .lock()
+        .map(|mut notes| std::mem::take(&mut *notes))
+        .unwrap_or_default()
+}
+
+/// 字符串枚举的宽容反序列化：不认识的值落到默认分支，而不是让整份配置解析失败。
+///
+/// 动机很实际：旧版本写下的值、被手改坏的值、或者从新版本降级回来的值，都不
+/// 应该让用户的其余配置一起失效。
+macro_rules! lenient_enum {
+    ($ty:ty, $default:expr, { $($text:literal => $variant:path),+ $(,)? }) => {
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let raw = String::deserialize(deserializer)?;
+                Ok(match raw.as_str() {
+                    $($text => $variant,)+
+                    other => {
+                        note(format!("config: 不认识的取值 {other:?}，已按默认值处理"));
+                        $default
+                    }
+                })
+            }
+        }
+    };
+}
 /// Directory name under `%APPDATA%`. Finalised together with the GitHub owner.
 pub const APP_DIR: &str = "io.github.hexbench";
 
@@ -19,6 +60,8 @@ pub struct Config {
     pub guard: GuardSettings,
     pub hotkeys: HotkeySettings,
     pub phrases: PhraseSettings,
+    pub staging: StagingSettings,
+    pub launcher: LauncherSettings,
     pub sync: SyncSettings,
     pub updates: UpdateSettings,
     pub ui: UiSettings,
@@ -33,6 +76,8 @@ impl Default for Config {
             guard: GuardSettings::default(),
             hotkeys: HotkeySettings::default(),
             phrases: PhraseSettings::default(),
+            staging: StagingSettings::default(),
+            launcher: LauncherSettings::default(),
             sync: SyncSettings::default(),
             updates: UpdateSettings::default(),
             ui: UiSettings::default(),
@@ -60,6 +105,8 @@ impl Config {
 pub struct HotkeySettings {
     pub pause: String,
     pub phrases_panel: String,
+    /// 呼出「面板」（快捷启动 + 文件区）的快捷键。
+    pub launcher: String,
 }
 
 impl Default for HotkeySettings {
@@ -67,6 +114,7 @@ impl Default for HotkeySettings {
         Self {
             pause: "Ctrl+Alt+Shift+P".to_string(),
             phrases_panel: "Ctrl+Alt+Shift+Q".to_string(),
+            launcher: "Alt+1".to_string(),
         }
     }
 }
@@ -94,6 +142,70 @@ pub struct UpdateSettings {
     /// Version the user dismissed from the sidebar hint; a newer release
     /// clears it by simply being a different string.
     pub dismissed_version: String,
+}
+
+///「中转站」：一个临时文件夹 + 主界面在所有虚拟桌面上可见。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StagingSettings {
+    pub enabled: bool,
+}
+
+/// 呼出面板的文件区：一个被映射的文件夹，显示在面板里。
+/// 面板上次停留的位置。只在 `remember_location` 打开时使用。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LauncherLocation {
+    /// `all` 或 `folder`
+    pub kind: String,
+    /// folder 时的根目录（分类目录或中转站目录）
+    pub base: String,
+    pub label: String,
+    pub path: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LauncherSettings {
+    /// 呼出面板的开关。
+    pub enabled: bool,
+    /// 文件区映射的文件夹；空字符串表示还没选。
+    pub folder: String,
+    /// 启动器的根目录：它的每个子文件夹就是一个分类。
+    pub root: String,
+    /// 呼出时贴着鼠标位置，而不是固定在屏幕中央。
+    pub follow_cursor: bool,
+    /// 面板宽度，占屏幕工作区的百分比。
+    pub width_percent: u32,
+    /// 面板高度，占屏幕工作区的百分比。
+    pub height_percent: u32,
+    /// 视图：grid（图标）或 list（列表）。
+    pub view: String,
+    /// 排序字段：name / modified / size / type。
+    pub sort_key: String,
+    /// 排序方向：1 升序，-1 降序。
+    pub sort_dir: i32,
+    /// 呼出时回到上次浏览的位置。
+    pub remember_location: bool,
+    /// 上次浏览的位置（`remember_location` 关掉时忽略）。
+    pub last_location: LauncherLocation,
+}
+
+impl Default for LauncherSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            folder: String::new(),
+            root: String::new(),
+            follow_cursor: false,
+            width_percent: 70,
+            height_percent: 70,
+            view: "grid".to_string(),
+            sort_key: "name".to_string(),
+            sort_dir: 1,
+            remember_location: true,
+            last_location: LauncherLocation::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -124,13 +236,18 @@ pub struct PhraseSettings {
 }
 
 /// Chat apps disagree: some send on Enter, others on Ctrl+Enter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SendKey {
     #[default]
     Enter,
     CtrlEnter,
 }
+
+lenient_enum!(SendKey, SendKey::Enter, {
+    "enter" => SendKey::Enter,
+    "ctrlEnter" => SendKey::CtrlEnter,
+});
 
 impl Default for PhraseSettings {
     fn default() -> Self {
@@ -174,12 +291,17 @@ impl Phrase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DockSide {
     Left,
     Right,
 }
+
+lenient_enum!(DockSide, DockSide::Right, {
+    "left" => DockSide::Left,
+    "right" => DockSide::Right,
+});
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -209,13 +331,19 @@ impl Default for TriggerSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sides {
     Both,
     Left,
     Right,
 }
+
+lenient_enum!(Sides, Sides::Both, {
+    "both" => Sides::Both,
+    "left" => Sides::Left,
+    "right" => Sides::Right,
+});
 
 impl Sides {
     pub fn includes(self, side: Side) -> bool {
@@ -265,13 +393,19 @@ impl Default for UiSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
     System,
     Light,
     Dark,
 }
+
+lenient_enum!(Theme, Theme::System, {
+    "system" => Theme::System,
+    "light" => Theme::Light,
+    "dark" => Theme::Dark,
+});
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -304,18 +438,70 @@ pub enum LoadSource {
     Default,
 }
 
-/// Load the config, falling back to the backup and then to defaults.
-pub fn load(path: &Path) -> (Config, LoadSource) {
-    if let Ok(bytes) = fs::read(path) {
-        if let Ok(config) = serde_json::from_slice::<Config>(&bytes) {
-            return (config, LoadSource::Main);
+/// 配置结构的版本号。
+///
+/// 加字段**不用**改它：每个结构体都是 `#[serde(default)]`，老配置缺的字段会
+/// 自动落到默认值。需要 +1 的只有三种情况：字段改名、删字段、改枚举的取值。
+pub const CURRENT_SCHEMA: u32 = 1;
+
+fn parse(path: &Path) -> Option<Config> {
+    let bytes = fs::read(path).ok()?;
+    match serde_json::from_slice::<Config>(&bytes) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            note(format!("config: 解析 {} 失败：{error}", path.display()));
+            None
         }
     }
+}
+
+/// 老配置升级。
+///
+/// 加字段不在这里处理（serde 的 default 已经覆盖），只搬「改名 / 删除 / 语义
+/// 变了」这类真正需要人工迁移的东西。将来加一条就用 `if schema < N`。
+fn migrate(config: &mut Config) {
+    if config.meta.schema > CURRENT_SCHEMA {
+        note(format!(
+            "config: 这份配置来自更新的版本（schema {} > {}），按当前能理解的部分使用",
+            config.meta.schema, CURRENT_SCHEMA
+        ));
+        return;
+    }
+    while config.meta.schema < CURRENT_SCHEMA {
+        // 目前还没有需要搬运的历史版本。
+        config.meta.schema += 1;
+    }
+}
+
+/// 解析不了的文件不删也不覆盖，改名留档，免得用户以为配置丢了。
+fn quarantine(path: &Path) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let target = path.with_extension(format!("broken-{stamp}.json"));
+    if fs::copy(path, &target).is_ok() {
+        note(format!(
+            "config: 原文件已留档到 {}，本次用默认配置启动",
+            target.display()
+        ));
+    }
+}
+
+/// Load the config, falling back to the backup and then to defaults.
+pub fn load(path: &Path) -> (Config, LoadSource) {
+    if let Some(mut config) = parse(path) {
+        migrate(&mut config);
+        return (config, LoadSource::Main);
+    }
     let backup = backup_path(path);
-    if let Ok(bytes) = fs::read(&backup) {
-        if let Ok(config) = serde_json::from_slice::<Config>(&bytes) {
-            return (config, LoadSource::Backup);
-        }
+    if let Some(mut config) = parse(&backup) {
+        note("config: 主文件不可用，已回退到备份".to_string());
+        migrate(&mut config);
+        return (config, LoadSource::Backup);
+    }
+    if path.exists() {
+        quarantine(path);
     }
     (Config::default(), LoadSource::Default)
 }
@@ -403,6 +589,54 @@ mod tests {
         let (config, source) = load(&path);
         assert_eq!(source, LoadSource::Default);
         assert!(config.enabled);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_enum_value_keeps_the_rest_of_the_config() {
+        // 旧版本写下的值、手改坏的值，都不该让整份配置一起失效。
+        let json = r#"{
+            "enabled": false,
+            "ui": { "theme": "neon" },
+            "trigger": { "position": "middle", "ratio": 0.25 },
+            "phrases": { "sendKey": "ctrl-enter-x" }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled, "其余字段要保住");
+        assert_eq!(config.ui.theme, Theme::System, "未知主题落回默认");
+        assert_eq!(config.trigger.position, BandPosition::Bottom);
+        assert_eq!(config.trigger.ratio, 0.25);
+        assert_eq!(config.phrases.send_key, SendKey::Enter);
+    }
+
+    #[test]
+    fn unknown_fields_from_a_newer_version_are_ignored() {
+        let json = r#"{ "enabled": false, "clipboardHistory": { "enabled": true } }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(
+            config.launcher.width_percent,
+            LauncherSettings::default().width_percent,
+            "缺的字段用默认值"
+        );
+    }
+
+    #[test]
+    fn unparsable_file_is_quarantined() {
+        let dir = temp_dir("quarantine");
+        let path = dir.join("config.json");
+        fs::write(&path, b"{ this is not json").unwrap();
+
+        let (config, source) = load(&path);
+        assert_eq!(source, LoadSource::Default);
+        assert!(config.enabled);
+
+        let kept = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("broken"));
+        assert!(kept, "坏掉的配置要留档，不能直接覆盖");
 
         let _ = fs::remove_dir_all(&dir);
     }

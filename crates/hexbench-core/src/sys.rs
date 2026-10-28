@@ -5,6 +5,7 @@
 //! `GetCursorPos`, and `windows-sys` gives us those with no runtime cost and no
 //! hand-maintained struct layouts.
 
+use std::ffi::c_void;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
@@ -30,11 +31,26 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_UNICODE, VK_CONTROL, VK_D, VK_LBUTTON, VK_LEFT, VK_LWIN, VK_MBUTTON, VK_RBUTTON,
     VK_RETURN, VK_RIGHT,
 };
+use windows_sys::core::GUID;
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
+use windows_sys::Win32::Foundation::GlobalFree;
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::Ole::{DoDragDrop, OleInitialize};
+use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows_sys::Win32::UI::Shell::{
+    CMINVOKECOMMANDINFO, SHBindToParent, SHCreateDataObject, SHGetIDListFromObject,
+    SHParseDisplayName,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, EVENT_SYSTEM_DESKTOPSWITCH, GetAncestor, GetClassNameW,
     GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MSG,
     SetCursorPos, SetWindowLongW, SetWindowPos, TranslateMessage, WindowFromPoint,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuStringW, InsertMenuW,
+    TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
     WINEVENT_OUTOFCONTEXT, GA_ROOT, GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
@@ -63,6 +79,234 @@ pub fn point_on_monitor(x: i32, y: i32) -> bool {
     // SAFETY: plain value in, handle out.
     let handle = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) };
     !handle.is_null()
+}
+
+// ---------------------------------------------------------------------------
+// 虚拟桌面：把窗口搬到当前桌面
+// ---------------------------------------------------------------------------
+
+/// `IVirtualDesktopManager` —— Windows SDK 里的公开接口，只对**本进程**的窗口
+/// 生效。资源管理器「在所有桌面上显示」用的那个未公开接口在 Windows 11 24H2
+/// 上已经被移除（CLSID 不再注册），所以这里改用公开的「搬窗口」。
+#[repr(C)]
+struct DesktopManagerVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    is_window_on_current_desktop: unsafe extern "system" fn(*mut c_void, HWND, *mut i32) -> i32,
+    get_window_desktop_id: unsafe extern "system" fn(*mut c_void, HWND, *mut GUID) -> i32,
+    move_window_to_desktop: unsafe extern "system" fn(*mut c_void, HWND, *const GUID) -> i32,
+}
+
+const CLSID_VIRTUAL_DESKTOP_MANAGER: GUID =
+    GUID::from_u128(0xAA50_9086_5CA9_4C25_8F95_589D_3C07_B48A);
+const IID_IVIRTUAL_DESKTOP_MANAGER: GUID =
+    GUID::from_u128(0xA5CD_92FF_29BE_454C_8D04_D828_79FB_3F1B);
+
+fn desktop_manager() -> Result<*mut c_void, String> {
+    // SAFETY: standard COM activation on the calling thread.
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let mut object: *mut c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_VIRTUAL_DESKTOP_MANAGER,
+            std::ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IVIRTUAL_DESKTOP_MANAGER,
+            &mut object,
+        );
+        if hr < 0 || object.is_null() {
+            return Err(format!("CoCreateInstance 0x{hr:08x}"));
+        }
+        Ok(object)
+    }
+}
+
+/// Registry layout (little-endian fields) → GUID.
+fn guid_from_desktop_id(bytes: &[u8; 16]) -> GUID {
+    GUID {
+        data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        data2: u16::from_le_bytes([bytes[4], bytes[5]]),
+        data3: u16::from_le_bytes([bytes[6], bytes[7]]),
+        data4: [
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ],
+    }
+}
+
+/// Move one of our windows to the desktop identified by the registry id.
+pub fn move_window_to_desktop(hwnd: isize, desktop: &[u8; 16]) -> Result<(), String> {
+    if hwnd == 0 {
+        return Err("no window handle".to_string());
+    }
+    let target = guid_from_desktop_id(desktop);
+    let object = desktop_manager()?;
+    // SAFETY: `object` is the interface just activated; only MoveWindowToDesktop
+    // is called, and it is documented to accept our own windows.
+    unsafe {
+        let vtable = *(object as *mut *const DesktopManagerVtbl);
+        let hr = ((*vtable).move_window_to_desktop)(object, hwnd as HWND, &target);
+        ((*vtable).release)(object);
+        if hr < 0 {
+            return Err(format!("MoveWindowToDesktop 0x{hr:08x}"));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 从窗口里把文件拖出去（OLE 拖拽源）
+// ---------------------------------------------------------------------------
+// 从窗口里把文件拖出去（OLE 拖拽源 + Shell 数据对象）
+// ---------------------------------------------------------------------------
+
+const DRAGDROP_S_DROP: i32 = 0x0004_0100u32 as i32;
+const DRAGDROP_S_CANCEL: i32 = 0x0004_0101u32 as i32;
+const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x0004_0102u32 as i32;
+
+const S_OK: i32 = 0;
+
+const CF_HDROP: u16 = 15;
+const DROPEFFECT_COPY_VAL: u32 = 1;
+const DROPEFFECT_MOVE_VAL: u32 = 2;
+
+/// 鼠标左键是否按着（`MK_LBUTTON`）。
+const MK_LBUTTON: u32 = 0x0001;
+
+// ---------------------------------------------------------------------------
+// IDropSource
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct DropSourceVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    query_continue_drag: unsafe extern "system" fn(*mut c_void, i32, u32) -> i32,
+    give_feedback: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+}
+
+#[repr(C)]
+struct DropSource {
+    vtbl: *const DropSourceVtbl,
+    refs: u32,
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn ds_query_interface(
+    this: *mut c_void,
+    _iid: *const GUID,
+    out: *mut *mut c_void,
+) -> i32 {
+    if !out.is_null() {
+        *out = this;
+        ds_add_ref(this);
+    }
+    S_OK
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn ds_add_ref(this: *mut c_void) -> u32 {
+    let source = &mut *(this as *mut DropSource);
+    source.refs += 1;
+    source.refs
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn ds_release(this: *mut c_void) -> u32 {
+    let source = &mut *(this as *mut DropSource);
+    source.refs = source.refs.saturating_sub(1);
+    if source.refs == 0 {
+        drop(Box::from_raw(this as *mut DropSource));
+        return 0;
+    }
+    source.refs
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn ds_query_continue_drag(
+    _this: *mut c_void,
+    escape_pressed: i32,
+    key_state: u32,
+) -> i32 {
+    if escape_pressed != 0 {
+        return DRAGDROP_S_CANCEL;
+    }
+    if key_state & MK_LBUTTON == 0 {
+        return DRAGDROP_S_DROP;
+    }
+    S_OK
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn ds_give_feedback(_this: *mut c_void, _effect: u32) -> i32 {
+    DRAGDROP_S_USEDEFAULTCURSORS
+}
+
+static DROP_SOURCE_VTBL: DropSourceVtbl = DropSourceVtbl {
+    query_interface: ds_query_interface,
+    add_ref: ds_add_ref,
+    release: ds_release,
+    query_continue_drag: ds_query_continue_drag,
+    give_feedback: ds_give_feedback,
+};
+
+/// 把一组宽字符路径包成 `DROPFILES`（fWide = 1，双 `\0` 结尾）放进 HGLOBAL。
+fn hdrop_for(files: &[u16]) -> *mut c_void {
+    // DROPFILES: pFiles(4) + pt(8) + fNC(4) + fWide(4) = 20 字节
+    const HEADER: usize = 20;
+    let bytes = HEADER + std::mem::size_of_val(files);
+    // SAFETY: 标准的内存分配/拷贝，失败时返回空指针由调用方处理。
+    unsafe {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if handle.is_null() {
+            return std::ptr::null_mut();
+        }
+        let base = GlobalLock(handle);
+        if base.is_null() {
+            GlobalFree(handle);
+            return std::ptr::null_mut();
+        }
+        std::ptr::write_bytes(base as *mut u8, 0, bytes);
+        (*(base as *mut u32)) = HEADER as u32; // pFiles
+        (*(base.add(16) as *mut i32)) = 1; // fWide
+        let names = base.add(HEADER) as *mut u16;
+        std::ptr::copy_nonoverlapping(files.as_ptr(), names, files.len());
+        GlobalUnlock(handle);
+        handle
+    }
+}
+/// 把若干文件放进剪贴板（`CF_HDROP`），资源管理器里 `Ctrl+V` 即可粘贴。
+pub fn copy_files_to_clipboard(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    if paths.is_empty() {
+        return Err("no files".to_string());
+    }
+    let mut files: Vec<u16> = Vec::new();
+    for path in paths {
+        files.extend(path.as_os_str().encode_wide());
+        files.push(0);
+    }
+    files.push(0);
+    // SAFETY: standard clipboard exchange; every handle is checked.
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("OpenClipboard failed".to_string());
+        }
+        let _ = EmptyClipboard();
+        let handle = hdrop_for(&files);
+        if handle.is_null() {
+            let _ = CloseClipboard();
+            return Err("out of memory".to_string());
+        }
+        if SetClipboardData(CF_HDROP as u32, handle).is_null() {
+            GlobalFree(handle);
+            let _ = CloseClipboard();
+            return Err("SetClipboardData failed".to_string());
+        }
+        let _ = CloseClipboard();
+    }
+    Ok(())
 }
 
 /// Work area (screen without the taskbar) of the monitor holding a point.
@@ -749,6 +993,577 @@ pub fn window_apps() -> Vec<AppEntry> {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
+
+/// 把一个窗口顶到前台并给它键盘焦点。
+///
+/// Windows 有前台锁：进程不在前台时 `SetForegroundWindow` 往往只是闪一下任务栏。
+/// 标准绕法是临时把自己挂到当前前台线程的输入队列上（`AttachThreadInput`），
+/// 拿到输入所有权后再设置前台，最后解挂。启动器按快捷键必须立刻能打字，靠的就是它。
+pub fn force_foreground(hwnd: isize) {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 全是标准窗口/线程 API，句柄由调用方保证有效。
+    unsafe {
+        let target = hwnd as HWND;
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let this_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0 && foreground_thread != this_thread;
+        if attached {
+            let _ = AttachThreadInput(foreground_thread, this_thread, 1);
+        }
+        ShowWindow(target, SW_SHOW);
+        let _ = SetForegroundWindow(target);
+        let _ = SetFocus(target);
+        if attached {
+            let _ = AttachThreadInput(foreground_thread, this_thread, 0);
+        }
+    }
+}
+
+/// 在主线程上初始化 OLE。窗口创建时要注册拖放目标，没有这个初始化的话
+/// 外部拖进来的文件一个事件都不会有（看着就像「拖不进来」）。
+pub fn init_ole() {
+    // SAFETY: 重复初始化返回 S_FALSE，已经初始化过也没关系。
+    unsafe {
+        let result = OleInitialize(std::ptr::null());
+        if result < 0 && result != RPC_E_CHANGED_MODE {
+            log::warn!("ole: OleInitialize 0x{result:08x}");
+        }
+    }
+}
+/// 当前鼠标位置（屏幕坐标）。
+pub fn cursor_position() -> (i32, i32) {
+    // SAFETY: GetCursorPos 只写一个 POINT，失败时保留零值。
+    unsafe {
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point) != 0 {
+            (point.x, point.y)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+/// 左键还按着吗？拖拽结束时用来区分「松手放下」和「按 Esc 取消」。
+pub fn left_button_down() -> bool {
+    // SAFETY: GetAsyncKeyState 只读键盘状态。
+    unsafe { GetAsyncKeyState(VK_LBUTTON as i32) < 0 }
+}
+/// 用系统默认程序打开一个文件或文件夹（和双击效果一致）。
+pub fn open_path(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let target: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe {
+        let result = ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        // ShellExecuteW 返回值 > 32 才算成功（老 API 的约定）。
+        if result as isize <= 32 {
+            return Err(format!("ShellExecuteW {}", result as isize));
+        }
+    }
+    Ok(())
+}
+
+const IID_IDATAOBJECT: GUID = GUID::from_u128(0x0000_010E_0000_0000_C000_0000_0000_0046);
+/// `IID_IShellFolder` —— 注意是 `14E6`，写成 `14E2` 会直接 `E_NOINTERFACE`。
+const IID_ISHELLFOLDER: GUID = GUID::from_u128(0x0002_14E6_0000_0000_C000_0000_0000_0046);
+/// 线程已经是别的单元模型时 `OleInitialize` 会返回这个，不算失败。
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+
+#[repr(C)]
+struct IUnknownVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+fn release_object(object: *mut c_void) {
+    // SAFETY: every COM object starts with its IUnknown vtable.
+    unsafe {
+        let vtbl = *(object as *mut *const IUnknownVtbl);
+        ((*vtbl).release)(object);
+    }
+}
+
+/// 让 Shell 生成数据对象：父文件夹 PIDL + 子项 PIDL。
+///
+/// 这条路踩过三个坑，记在这里免得再走一遍：
+/// 1. `SHCreateDataObject(NULL, 完整 PIDL)` 得到的对象什么格式都不给（`GetData`
+///    回 `DV_E_FORMATETC`），拖出去必然是 effect 0；
+/// 2. `IShellItemArray::BindToHandler(BHID_DataObject)` 在本机回 `E_NOINTERFACE`；
+/// 3. `SHBindToParent` 的 `IID_IShellFolder` 是 `000214E6`。
+unsafe fn shell_data_object(paths: &[std::path::PathBuf]) -> Result<*mut c_void, String> {
+    use std::os::windows::ffi::OsStrExt;
+    if paths.is_empty() {
+        return Err("nothing to drag".to_string());
+    }
+    unsafe {
+        // 保持每个绝对 pidl 存活：child pidl 是指向它们的。
+        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
+        let mut children: Vec<*const ITEMIDLIST> = Vec::with_capacity(paths.len());
+        let mut folder: *mut c_void = std::ptr::null_mut();
+
+        for (index, path) in paths.iter().enumerate() {
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            let mut attributes: u32 = 0;
+            let hr = SHParseDisplayName(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut pidl,
+                0,
+                &mut attributes,
+            );
+            if hr < 0 || pidl.is_null() {
+                for existing in &pidls {
+                    CoTaskMemFree(*existing as *const c_void);
+                }
+                if !folder.is_null() {
+                    release_object(folder);
+                }
+                return Err(format!("SHParseDisplayName 0x{hr:08x}"));
+            }
+
+            let mut this_folder: *mut c_void = std::ptr::null_mut();
+            let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+            let hr = SHBindToParent(pidl, &IID_ISHELLFOLDER, &mut this_folder, &mut child);
+            if hr < 0 || child.is_null() {
+                CoTaskMemFree(pidl as *const c_void);
+                for existing in &pidls {
+                    CoTaskMemFree(*existing as *const c_void);
+                }
+                if !folder.is_null() {
+                    release_object(folder);
+                }
+                return Err(format!("SHBindToParent 0x{hr:08x}"));
+            }
+            if index == 0 {
+                folder = this_folder;
+            } else {
+                // 只有第一个父目录会被用到；其余的接口释放掉。
+                release_object(this_folder);
+            }
+            pidls.push(pidl);
+            children.push(child as *const ITEMIDLIST);
+        }
+
+        let mut parent_pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        let hr = SHGetIDListFromObject(folder, &mut parent_pidl);
+        release_object(folder);
+        if hr < 0 || parent_pidl.is_null() {
+            for existing in &pidls {
+                CoTaskMemFree(*existing as *const c_void);
+            }
+            return Err(format!("SHGetIDListFromObject 0x{hr:08x}"));
+        }
+
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let hr = SHCreateDataObject(
+            parent_pidl,
+            children.len() as u32,
+            children.as_ptr(),
+            std::ptr::null_mut(),
+            &IID_IDATAOBJECT,
+            &mut data,
+        );
+        CoTaskMemFree(parent_pidl as *const c_void);
+        for existing in &pidls {
+            CoTaskMemFree(*existing as *const c_void);
+        }
+        if hr < 0 || data.is_null() {
+            return Err(format!("SHCreateDataObject 0x{hr:08x}"));
+        }
+        Ok(data)
+    }
+}
+
+/// 从窗口里把文件拖出去。必须在拥有窗口的线程上调用：OLE 的拖拽循环要靠那个
+/// 窗口捕获鼠标。返回值里 `DROPEFFECT_MOVE`（2）表示目标把文件拿走了。
+pub fn start_file_drag(paths: &[std::path::PathBuf]) -> Result<u32, String> {
+    if paths.is_empty() {
+        return Err("nothing to drag".to_string());
+    }
+    // SAFETY: 数据对象与拖拽源都有各自的引用计数，DoDragDrop 期间不会失效。
+    unsafe {
+        let init = OleInitialize(std::ptr::null());
+        if init < 0 && init != RPC_E_CHANGED_MODE {
+            return Err(format!("OleInitialize 0x{init:08x}"));
+        }
+        // 任意组合（可以跨目录）都做成一个数据对象；不行再退回「同一父目录那一组」。
+        let data = match crate::shell_ops::data_object_for(paths) {
+            Some(raw) => raw,
+            None => {
+                let parent = paths[0].parent().map(|p| p.to_path_buf());
+                let same_parent: Vec<std::path::PathBuf> = match &parent {
+                    Some(parent) => paths
+                        .iter()
+                        .filter(|path| path.parent() == Some(parent.as_path()))
+                        .cloned()
+                        .collect(),
+                    None => vec![paths[0].clone()],
+                };
+                log::warn!(
+                    "drag: shell item array failed, falling back to {} of {} item(s)",
+                    same_parent.len(),
+                    paths.len()
+                );
+                shell_data_object(&same_parent)?
+            }
+        };
+        let source = Box::into_raw(Box::new(DropSource {
+            vtbl: &DROP_SOURCE_VTBL,
+            refs: 1,
+        }));
+        let mut effect: u32 = 0;
+        let hr = DoDragDrop(
+            data,
+            source as *mut c_void,
+            DROPEFFECT_COPY_VAL | DROPEFFECT_MOVE_VAL,
+            &mut effect,
+        );
+        ds_release(source as *mut c_void);
+        release_object(data);
+        if hr < 0 {
+            return Err(format!("DoDragDrop 0x{hr:08x}"));
+        }
+        Ok(effect)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 原生右键菜单：把 Shell 自己那套菜单弹出来
+// ---------------------------------------------------------------------------
+
+const CMF_NORMAL: u32 = 0x0000_0000;
+const TPM_RETURNCMD: u32 = 0x0100;
+const TPM_RIGHTBUTTON: u32 = 0x0002;
+const SW_SHOWNORMAL: i32 = 1;
+
+/// `IShellFolder` 只用前 11 个槽，`GetUIObjectOf` 是第 11 个（下标 10）。
+#[repr(C)]
+struct ShellFolderVtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: usize,
+    parse_display_name: usize,
+    enum_objects: usize,
+    bind_to_object: usize,
+    bind_to_storage: usize,
+    compare_ids: usize,
+    create_view_object: usize,
+    get_attributes_of: usize,
+    // 参数顺序跟声明一致：hwnd, cidl, apidl, riid, rgfReserved, ppv
+    get_ui_object_of: unsafe extern "system" fn(
+        *mut c_void,
+        HWND,
+        u32,
+        *mut *const ITEMIDLIST,
+        *const GUID,
+        *mut u32,
+        *mut *mut c_void,
+    ) -> i32,
+}
+
+/// `IContextMenu`
+#[repr(C)]
+struct ContextMenuVtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: usize,
+    query_context_menu: unsafe extern "system" fn(*mut c_void, HMENU, u32, u32, u32, u32) -> i32,
+    invoke_command: unsafe extern "system" fn(*mut c_void, *const CMINVOKECOMMANDINFO) -> i32,
+    get_command_string: usize,
+}
+
+const IID_ICONTEXTMENU: GUID = GUID::from_u128(0x0002_14E4_0000_0000_C000_0000_0000_0046);
+
+/// 在某个位置弹出文件的「资源管理器右键菜单」。
+///
+/// 菜单本身由 Shell 绘制，所以外观、语言、已安装的扩展（7-Zip、Git 之类）都和
+/// 资源管理器一致。重命名 / 删除不是文件菜单里的项（那是视图层的命令），所以
+/// 这里在系统菜单后面补两项自己实现的，返回给调用方去处理。
+///
+/// `owner` 用作菜单的宿主窗口；传 0 时用当前前台窗口。
+pub fn show_shell_context_menu(
+    path: &std::path::Path,
+    x: i32,
+    y: i32,
+    owner: isize,
+) -> Result<Option<&'static str>, String> {
+    /// 自己加的菜单项用高位 id，和 Shell 的 1..0x7FFF 区分开。
+    const CMD_RENAME: u32 = 0x8000;
+
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut choice = None;
+    // SAFETY: PIDL / IShellFolder / IContextMenu 都在本函数内释放；菜单句柄同理。
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        let mut attributes: u32 = 0;
+        let hr = SHParseDisplayName(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut pidl,
+            0,
+            &mut attributes,
+        );
+        if hr < 0 || pidl.is_null() {
+            return Err(format!("SHParseDisplayName 0x{hr:08x}"));
+        }
+
+        let mut folder: *mut c_void = std::ptr::null_mut();
+        let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+        let hr = SHBindToParent(pidl, &IID_ISHELLFOLDER, &mut folder, &mut child);
+        if hr < 0 {
+            CoTaskMemFree(pidl as *const c_void);
+            return Err(format!("SHBindToParent 0x{hr:08x}"));
+        }
+
+        let folder_vtbl = *(folder as *mut *const ShellFolderVtbl);
+        let mut menu_object: *mut c_void = std::ptr::null_mut();
+        let mut reserved: u32 = 0;
+        let children: [*const ITEMIDLIST; 1] = [child as *const ITEMIDLIST];
+        let hr = ((*folder_vtbl).get_ui_object_of)(
+            folder,
+            std::ptr::null_mut(),
+            1,
+            children.as_ptr() as *mut *const ITEMIDLIST,
+            &IID_ICONTEXTMENU,
+            &mut reserved,
+            &mut menu_object,
+        );
+        release_object(folder);
+        CoTaskMemFree(pidl as *const c_void);
+        if hr < 0 || menu_object.is_null() {
+            return Err(format!("GetUIObjectOf 0x{hr:08x}"));
+        }
+
+        let menu_vtbl = *(menu_object as *mut *const ContextMenuVtbl);
+        let popup = CreatePopupMenu();
+        if popup.is_null() {
+            release_object(menu_object);
+            return Err("CreatePopupMenu failed".to_string());
+        }
+        let hr = ((*menu_vtbl).query_context_menu)(menu_object, popup, 0, 1, 0x7FFF, CMF_NORMAL);
+        if hr < 0 {
+            DestroyMenu(popup);
+            release_object(menu_object);
+            return Err(format!("QueryContextMenu 0x{hr:08x}"));
+        }
+
+        // 「重命名」在资源管理器里由视图层提供；这里插到「删除」上方。
+        // 先找「删除」，找不到再找「属性」，都没有就追加到末尾——至少功能还在。
+        let mut inserted = false;
+        for needle in ["删除", "属性"] {
+            let count = GetMenuItemCount(popup);
+            for index in 0..count {
+                let mut text = [0u16; 64];
+                let length = GetMenuStringW(
+                    popup,
+                    index as u32,
+                    text.as_mut_ptr(),
+                    text.len() as i32,
+                    MF_BYPOSITION,
+                );
+                if length <= 0 {
+                    continue;
+                }
+                let label = String::from_utf16_lossy(&text[..length as usize]);
+                if label.starts_with(needle) {
+                    InsertMenuW(
+                        popup,
+                        index as u32,
+                        MF_BYPOSITION | MF_STRING,
+                        CMD_RENAME as usize,
+                        windows_sys::core::w!("重命名(&M)"),
+                    );
+                    inserted = true;
+                    break;
+                }
+            }
+            if inserted {
+                break;
+            }
+        }
+        if !inserted {
+            AppendMenuW(popup, MF_SEPARATOR, 0, std::ptr::null());
+            AppendMenuW(popup, MF_STRING, CMD_RENAME as usize, windows_sys::core::w!("重命名(&M)"));
+        }
+
+        let owner_window = if owner != 0 {
+            owner as HWND
+        } else {
+            GetForegroundWindow()
+        };
+        let id = TrackPopupMenuEx(
+            popup,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            x,
+            y,
+            owner_window,
+            std::ptr::null(),
+        );
+        DestroyMenu(popup);
+        log::info!("context menu: picked id={id}");
+
+        match id as u32 {
+            0 => {}
+            CMD_RENAME => choice = Some("rename"),
+            other => {
+                // QueryContextMenu 从 1 开始编号，调用时要用相对偏移。
+                let command = CMINVOKECOMMANDINFO {
+                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                    fMask: 0,
+                    hwnd: owner_window,
+                    lpVerb: (other - 1) as usize as *const u8,
+                    lpParameters: std::ptr::null(),
+                    lpDirectory: std::ptr::null(),
+                    nShow: SW_SHOWNORMAL,
+                    dwHotKey: 0,
+                    hIcon: std::ptr::null_mut(),
+                };
+                let hr = ((*menu_vtbl).invoke_command)(menu_object, &command);
+                if hr < 0 {
+                    release_object(menu_object);
+                    return Err(format!("InvokeCommand 0x{hr:08x}"));
+                }
+                log::info!("context menu: invoked shell command {other}");
+            }
+        }
+        release_object(menu_object);
+    }
+    Ok(choice)
+}
+
+/// 把文件或文件夹删到回收站（可撤销）。
+pub fn delete_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        SHFileOperationW, SHFILEOPSTRUCTW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FO_DELETE,
+    };
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // SHFileOperation 要的是「双 NUL 结尾」的路径列表。
+    from.push(0);
+    from.push(0);
+    // SAFETY: 结构体按文档初始化，字符串在调用期间有效。
+    unsafe {
+        let mut operation: SHFILEOPSTRUCTW = std::mem::zeroed();
+        operation.wFunc = FO_DELETE;
+        operation.pFrom = from.as_ptr();
+        operation.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT) as u16;
+        let result = SHFileOperationW(&mut operation);
+        if result != 0 {
+            return Err(format!("SHFileOperationW 0x{result:04x}"));
+        }
+    }
+    log::info!("context menu: deleted {} to the recycle bin", path.display());
+    Ok(())
+}
+
+/// 在 `parent` 下新建一个文件夹，重名时自动加序号（新建文件夹、新建文件夹 (2)…）。
+pub fn create_folder(parent: &std::path::Path, base: &str) -> Result<std::path::PathBuf, String> {
+    if !parent.is_dir() {
+        return Err("这个位置不是一个文件夹".to_string());
+    }
+    for index in 1..1000 {
+        let name = if index == 1 {
+            base.to_string()
+        } else {
+            format!("{base} ({index})")
+        };
+        let target = parent.join(&name);
+        if target.exists() {
+            continue;
+        }
+        std::fs::create_dir(&target).map_err(|error| error.to_string())?;
+        log::info!("created folder {}", target.display());
+        return Ok(target);
+    }
+    Err("试了很多个名字都被占用了".to_string())
+}
+/// Windows 的文件名规则。
+///
+/// 之前只挡了非法字符，漏掉的几类会让系统「悄悄改名」或者直接失败：
+/// `CON`/`NUL` 这类设备名、结尾的点和空格（Windows 会吃掉）、超长名字。
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("名字不能为空".to_string());
+    }
+    if name
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
+        return Err("名字里有不允许的字符".to_string());
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Err("名字不能以空格或点结尾".to_string());
+    }
+    // 设备名不分大小写，带扩展名也算（`CON.txt` 同样保留）。
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&upper.as_str()) {
+        return Err(format!("「{stem}」是系统保留名，换一个"));
+    }
+    if name.encode_utf16().count() > 255 {
+        return Err("名字太长（超过 255 个字符）".to_string());
+    }
+    Ok(())
+}
+/// 在原目录里把文件改名。重名会被拒绝，不会覆盖。
+pub fn rename_path(
+    path: &std::path::Path,
+    new_name: &str,
+) -> Result<std::path::PathBuf, String> {
+    let name = new_name.trim();
+    validate_name(name)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "找不到所在文件夹".to_string())?;
+    let target = parent.join(name);
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err("已经有同名文件".to_string());
+    }
+    std::fs::rename(path, &target).map_err(|error| error.to_string())?;
+    log::info!("renamed {} -> {}", path.display(), target.display());
+    Ok(target)
+}
+
+
 
 #[cfg(test)]
 mod tests {

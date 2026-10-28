@@ -83,13 +83,33 @@ impl Side {
 }
 
 /// Where the trigger band sits on the monitor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BandPosition {
     Bottom,
     Top,
     /// Both bands: with both sides this is the four corners of a monitor.
     Both,
+}
+
+/// 不认识的取值按 `Bottom` 处理：旧版本写的、手改坏的、从新版本降级回来的，
+/// 都不该让整份配置解析失败。
+impl<'de> Deserialize<'de> for BandPosition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "top" => BandPosition::Top,
+            "both" => BandPosition::Both,
+            "bottom" => BandPosition::Bottom,
+            other => {
+                log::warn!("config: 不认识的触发位置 {other:?}，按 bottom 处理");
+                BandPosition::Bottom
+            }
+        })
+    }
 }
 
 /// User-facing trigger configuration (the subset the geometry needs).

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -272,6 +272,9 @@ fn save_config(
         shared.config = config;
     }
     register_hotkeys(&app);
+    // 面板打开着的时候也能看到路径/分类变化。
+    let _ = app.emit("launcher-changed", ());
+
     Ok(())
 }
 
@@ -285,12 +288,13 @@ fn set_paused(paused: bool, state: State<'_, AppState>) {
 /// Shortcuts are declared in one place (`config.hotkeys`) and dispatched here,
 /// so adding a tool cannot create a second, conflicting registration.
 fn register_hotkeys(app: &AppHandle) {
-    let (pause, panel) = {
+    let (pause, panel, launcher) = {
         let state = app.state::<AppState>();
         let shared = state.shared.lock().unwrap();
         (
             shared.config.hotkeys.pause.clone(),
             shared.config.hotkeys.phrases_panel.clone(),
+            shared.config.hotkeys.launcher.clone(),
         )
     };
 
@@ -298,7 +302,11 @@ fn register_hotkeys(app: &AppHandle) {
     let _ = manager.unregister_all();
 
     let mut error = None;
-    for (label, combo) in [("暂停 / 继续", &pause), ("快捷语面板", &panel)] {
+    for (label, combo) in [
+        ("暂停 / 继续", &pause),
+        ("常用语", &panel),
+        ("快速呼出", &launcher),
+    ] {
         if combo.trim().is_empty() {
             continue;
         }
@@ -463,6 +471,322 @@ fn overlay_zones(state: State<'_, AppState>) -> OverlayPayload {
 ///
 /// The overlay is click-through and unfocused, so it is a pure visual hint: the
 /// user can keep working while it fades away on its own.
+// ---------------------------------------------------------------------------
+// 中转站：一个临时的暂存文件夹，主界面跟着虚拟桌面走
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedDto {
+    name: String,
+    path: String,
+    size: u64,
+    modified: i64,
+    dir: bool,
+}
+
+fn staging_dir(app: &AppHandle) -> std::path::PathBuf {
+    let state = app.state::<AppState>();
+    state
+        .config_path
+        .parent()
+        .map(|dir| dir.join("staging"))
+        .unwrap_or_else(|| std::path::PathBuf::from("staging"))
+}
+
+fn staged_files(app: &AppHandle) -> Vec<StagedDto> {
+    let dir = staging_dir(app);
+    let mut items: Vec<StagedDto> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let meta = entry.metadata().ok()?;
+                    let modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|value| value.as_secs() as i64)
+                        .unwrap_or(0);
+                    Some(StagedDto {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        path: entry.path().to_string_lossy().to_string(),
+                        size: meta.len(),
+                        modified,
+                        dir: meta.is_dir(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    items.sort_by_key(|item| std::cmp::Reverse(item.modified));
+    items
+}
+
+/// `报告.txt` 已存在时变成 `报告 (1).txt`，和资源管理器一致。
+fn unique_target(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let mut candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let ext = path.extension().and_then(|value| value.to_str());
+    for index in 1..1000 {
+        let file = match ext {
+            Some(ext) => format!("{stem} ({index}).{ext}"),
+            None => format!("{stem} ({index})"),
+        };
+        candidate = dir.join(file);
+        if !candidate.exists() {
+            break;
+        }
+    }
+    candidate
+}
+
+/// Move dropped paths into the staging folder, the way dragging into a folder
+/// behaves. Returns how many entries made it.
+/// 把一批文件移动进某个目录：同盘是 rename（瞬间），跨盘退化成复制后删除。
+/// 重名自动变成 `文件 (1).txt`，和资源管理器一致。
+fn move_paths_into(dir: &std::path::Path, paths: &[std::path::PathBuf]) -> usize {
+    if std::fs::create_dir_all(dir).is_err() {
+        log::warn!("move: cannot create {}", dir.display());
+        return 0;
+    }
+    // 已经在目标目录里 / 把自己拖进自己的，先剔掉。
+    let sources: Vec<std::path::PathBuf> = paths
+        .iter()
+        .filter(|path| path.parent() != Some(dir) && path.as_path() != dir)
+        .cloned()
+        .collect();
+    if sources.is_empty() {
+        return 0;
+    }
+    // 交给 Shell：跨盘、进度条、重名询问、长路径都由它处理。
+    match hexbench_core::shell_ops::move_into(&sources, dir) {
+        Ok(count) => return count,
+        Err(error) => log::warn!("move: shell 失败（{error}），退回手写逻辑"),
+    }
+    let mut moved = 0;
+    for source in paths {
+        // 已经在目标目录里：不动，否则会复制成「文件 (1).txt」。
+        // 也不能把自己拖进自己。
+        if source.parent() == Some(dir) || source == dir {
+            continue;
+        }
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let target = unique_target(dir, &name.to_string_lossy());
+        let ok = std::fs::rename(source, &target).is_ok() || {
+            let copied = source.is_file() && std::fs::copy(source, &target).is_ok();
+            if copied {
+                let _ = std::fs::remove_file(source);
+            }
+            copied
+        };
+        if ok {
+            moved += 1;
+        } else {
+            log::warn!("move: could not take {}", source.display());
+        }
+    }
+    moved
+}
+
+fn stage_paths(app: &AppHandle, paths: &[std::path::PathBuf]) -> usize {
+    move_paths_into(&staging_dir(app), paths)
+}
+
+#[tauri::command]
+fn staging_list(app: AppHandle) -> Vec<StagedDto> {
+    staged_files(&app)
+}
+
+#[tauri::command]
+fn staging_add(paths: Vec<String>, app: AppHandle) -> Vec<StagedDto> {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let moved = stage_paths(&app, &paths);
+    log::info!("staging: took {moved} item(s)");
+    staged_files(&app)
+}
+
+#[tauri::command]
+fn staging_remove(names: Vec<String>, app: AppHandle) -> Vec<StagedDto> {
+    let dir = staging_dir(&app);
+    for name in names {
+        let target = dir.join(&name);
+        // Never let a crafted name escape the folder.
+        if !target.starts_with(&dir) {
+            continue;
+        }
+        let removed = if target.is_dir() {
+            std::fs::remove_dir_all(&target).is_ok()
+        } else {
+            std::fs::remove_file(&target).is_ok()
+        };
+        log::info!("staging: delete {name} -> {removed}");
+    }
+    staged_files(&app)
+}
+
+#[tauri::command]
+fn staging_clear(app: AppHandle) -> Vec<StagedDto> {
+    let dir = staging_dir(&app);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+    staged_files(&app)
+}
+
+/// Drag a staged file out of the window. `DoDragDrop` blocks its thread until
+/// the user drops it, so this hands the work to a worker and returns at once.
+/// 把选中的文件放进剪贴板：拖不动的时候，Ctrl+V 也能把文件搬过去。
+#[tauri::command]
+fn staging_copy(names: Vec<String>, app: AppHandle) -> Result<usize, String> {
+    let dir = staging_dir(&app);
+    let paths: Vec<std::path::PathBuf> = names
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.exists())
+        .collect();
+    if paths.is_empty() {
+        return Err("中转站里没有这些文件了".to_string());
+    }
+    hexbench_core::sys::copy_files_to_clipboard(&paths)?;
+    log::info!("staging: copied {} item(s) to the clipboard", paths.len());
+    Ok(paths.len())
+}
+#[tauri::command]
+fn begin_staging_drag(name: String, app: AppHandle) -> Result<u32, String> {
+    let path = staging_dir(&app).join(&name);
+    if !path.exists() {
+        return Err("文件已经不在中转站里了".to_string());
+    }
+    // OLE 的拖拽循环要在有窗口的线程上跑，命令正好跑在 UI 线程：DoDragDrop
+    // 会占住它直到用户松手，这期间界面不响应是正常的（原生拖拽都这样）。
+    match hexbench_core::sys::start_file_drag(std::slice::from_ref(&path)) {
+        Ok(effect) => {
+            // DROPEFFECT_MOVE = 2：目标要求「移动」，那就把暂存的这一份删掉。
+            let moved = effect & 2 != 0;
+            if moved && path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            log::info!("staging: dragged out effect={effect} moved={moved}");
+            let _ = app.emit("staging-changed", ());
+            Ok(effect)
+        }
+        Err(error) => {
+            log::warn!("staging: drag out failed: {error}");
+            Err(error)
+        }
+    }
+}
+#[tauri::command]
+fn staging_reveal(name: Option<String>, app: AppHandle) {
+    let dir = staging_dir(&app);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut command = std::process::Command::new("explorer.exe");
+    match name {
+        Some(name) => {
+            let target = dir.join(name);
+            if target.exists() {
+                command.arg(format!("/select,{}", target.display()));
+            } else {
+                command.arg(dir.display().to_string());
+            }
+        }
+        None => {
+            command.arg(dir.display().to_string());
+        }
+    }
+    let _ = command.spawn();
+}
+
+/// Move the main window onto the desktop the user is on, so it travels with
+/// them while the staging tool is on.
+fn follow_desktop(app: &AppHandle) {
+    let enabled = app
+        .state::<AppState>()
+        .shared
+        .lock()
+        .unwrap()
+        .config
+        .staging
+        .enabled;
+    if !enabled {
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let Some(id) = hexbench_core::sys::current_desktop_id() else {
+        return;
+    };
+    if id.len() != 16 {
+        return;
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&id[..16]);
+    match hexbench_core::sys::move_window_to_desktop(hwnd.0 as isize, &bytes) {
+        Ok(()) => log::info!("staging: moved window to the current desktop"),
+        Err(error) => log::warn!("staging: move failed: {error}"),
+    }
+}
+
+/// Follow every desktop switch while the staging tool is on.
+/// Follow every desktop switch while the staging tool is on.
+///
+/// Windows 11 24H2 no longer raises the shell's desktop-switch event, so the
+/// desktop id is read from the registry instead — the one signal that works on
+/// every build we care about.
+fn spawn_staging_watcher(app: AppHandle) {
+    thread::spawn(move || {
+        let mut last = hexbench_core::sys::current_desktop_id();
+        loop {
+            thread::sleep(Duration::from_millis(120));
+            let current = hexbench_core::sys::current_desktop_id();
+            if current == last {
+                continue;
+            }
+            last = current;
+            // Let the switch settle before dragging the window across.
+            thread::sleep(Duration::from_millis(150));
+            follow_desktop(&app);
+        }
+    });
+}
+
+#[tauri::command]
+fn staging_set_enabled(enabled: bool, app: AppHandle) -> Result<(), String> {
+    let config = {
+        let state = app.state::<AppState>();
+        let mut shared = state.shared.lock().unwrap();
+        shared.config.staging.enabled = enabled;
+        shared.config.clone()
+    };
+    let state = app.state::<AppState>();
+    config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
+    follow_desktop(&app);
+    Ok(())
+}
 fn open_overlay(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (monitors, regions, trigger) = {
@@ -486,6 +810,7 @@ fn open_overlay(app: &AppHandle) -> Result<(), String> {
         None => WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("overlay.html".into()))
             .title("HexBench")
             .decorations(false)
+        .zoom_hotkeys_enabled(false)
             .transparent(true)
             .always_on_top(true)
             .skip_taskbar(true)
@@ -1118,6 +1443,55 @@ fn move_panel_to(window: &tauri::WebviewWindow, x: i32, y: i32) {
     }
 }
 
+/// Quit for real: clear the screen, then exit hard so a slow WebView2
+/// teardown cannot look like a frozen app.
+fn request_quit(app: &AppHandle) {
+    QUITTING.store(true, Ordering::SeqCst);
+    hide_all_windows(app);
+    thread::spawn(|| {
+        // Safety net in case the hard exit below never runs.
+        thread::spawn(|| {
+            thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
+        });
+        thread::sleep(Duration::from_millis(80));
+        log::info!("quit: exiting");
+        log::logger().flush();
+        std::process::exit(0);
+    });
+}
+
+/// Hide every window we own, cheapest way to clear the screen before exiting.
+fn hide_all_windows(app: &AppHandle) {
+    for label in ["main", "phrases", "overlay"] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.hide();
+        }
+    }
+}
+
+/// Note how long the event loop is unavailable, so a "frozen" report can be
+/// traced instead of guessed at.
+fn spawn_stall_watchdog(app: AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(1000));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        if app
+            .run_on_main_thread(move || {
+                let _ = tx.send(());
+            })
+            .is_ok()
+        {
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
+        let waited = started.elapsed();
+        if waited > Duration::from_millis(400) {
+            log::warn!("ui: main thread busy {} ms", waited.as_millis());
+        }
+    });
+}
+
 /// Remember that the panel is open, and which desktop it was opened on.
 fn set_panel_open(app: &AppHandle, open: bool) {
     let state = app.state::<AppState>();
@@ -1178,7 +1552,9 @@ fn spawn_panel_desktop_watch(app: AppHandle) {
             }
 
             ticks += 1;
-            if !switched && ticks < 13 {
+            // Windows 11 24H2 no longer raises the desktop-switch event, so the
+            // registry is the only signal left: check it every ~150 ms.
+            if !switched && ticks < 5 {
                 continue;
             }
 
@@ -1279,11 +1655,12 @@ fn build_phrases_panel(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         .collapsed;
     let (width, height) = if collapsed { (72.0, 72.0) } else { (300.0, 460.0) };
     let built = WebviewWindowBuilder::new(app, "phrases", WebviewUrl::App("phrases.html".into()))
-        .title("快捷语")
+        .title("常用语")
         .inner_size(width, height)
         // Must allow the collapsed circle; the expanded panel is bigger anyway.
         .min_inner_size(72.0, 72.0)
         .decorations(false)
+        .zoom_hotkeys_enabled(false)
         .transparent(true)
         // A system shadow would draw a square around the round bubble.
         .shadow(false)
@@ -1476,6 +1853,7 @@ fn open_main_now(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        follow_desktop(app);
         return;
     }
 
@@ -1485,15 +1863,943 @@ fn open_main_now(app: &AppHandle) {
         .min_inner_size(840.0, 560.0)
         // The app draws its own title bar and window buttons.
         .decorations(false)
+        .zoom_hotkeys_enabled(false)
         .center()
         .build();
 }
 
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
+/// 呼出面板：一个窗口装「快捷启动 + 文件区」。
+///
+/// 懒创建、之后常驻隐藏：呼出要的是「按一下就出」，重建 WebView2 要几百毫秒，
+/// 手感立刻垮掉。第一次呼出慢一点，之后只是一次 show。
+/// 拖拽一开始就把文件列表记下来：光标进入面板后 OLE 就不再发事件了，
+/// 只能自己盯着光标，松手时若还在面板里就当成落在这里。
+static DRAG_WATCHING: AtomicBool = AtomicBool::new(false);
+
+fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
+    if paths.is_empty() || DRAG_WATCHING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        let mut last_inside = false;
+        loop {
+            thread::sleep(Duration::from_millis(60));
+            let (x, y) = hexbench_core::sys::cursor_position();
+            let frame = app.get_webview_window("launcher").and_then(|window| {
+                if !window.is_visible().unwrap_or(false) {
+                    return None;
+                }
+                let position = window.outer_position().ok()?;
+                let size = window.inner_size().ok()?;
+                Some((
+                    position.x,
+                    position.y,
+                    size.width as i32,
+                    size.height as i32,
+                ))
+            });
+            let inside = match frame {
+                Some((left, top, width, height)) => {
+                    x >= left && y >= top && x < left + width && y < top + height
+                }
+                None => false,
+            };
+            if inside != last_inside {
+                last_inside = inside;
+                let _ = if inside {
+                    app.emit("launcher-drag-pos", serde_json::json!({ "x": x, "y": y }))
+                } else {
+                    app.emit("launcher-drag-leave", ())
+                };
+            } else if inside {
+                let _ = app.emit("launcher-drag-pos", serde_json::json!({ "x": x, "y": y }));
+            }
+            if !hexbench_core::sys::left_button_down() {
+                // 松手：还在面板里就是落在这里了。
+                if inside {
+                    let _ = app.emit(
+                        "launcher-dropped",
+                        serde_json::json!({ "x": x, "y": y, "paths": paths }),
+                    );
+                } else {
+                    let _ = app.emit("launcher-drag-leave", ());
+                }
+                break;
+            }
+        }
+        DRAG_WATCHING.store(false, Ordering::SeqCst);
+    });
+}
+fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    let started = Instant::now();
+    // 这个窗口可能是在别的线程上创建的，拖放目标注册要求那线程也初始化过 OLE，
+    // 否则外部拖进来的文件会被系统交给主窗口，而不是这里。
+    hexbench_core::sys::init_ole();
+    let built = WebviewWindowBuilder::new(app, "launcher", WebviewUrl::App("launcher.html".into()))
+        .title("快速呼出")
+        .inner_size(780.0, 500.0)
+        .min_inner_size(520.0, 320.0)
+        .decorations(false)
+        .zoom_hotkeys_enabled(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .visible(false)
+        .build()
+        .ok();
+    if let Some(window) = &built {
+        // Tauri 只在先建的那个 webview 上登记拖放目标，面板是后建的，得自己挂一个，
+        // 否则外部拖进来的文件系统根本不会通知我们。
+        match window.hwnd() {
+            Ok(hwnd) => {
+                let app = app.clone();
+                let late_app = app.clone();
+                let attached = hexbench_core::drop_target::attach(
+                    hwnd.0 as isize,
+                    Box::new(move |event| {
+                        use hexbench_core::drop_target::DropEvent;
+                        match event {
+                            DropEvent::Enter { x, y, .. } | DropEvent::Over { x, y } => {
+                                let _ = app.emit(
+                                    "launcher-drag-pos",
+                                    serde_json::json!({ "x": x, "y": y }),
+                                );
+                            }
+                            DropEvent::Leave => {
+                                let _ = app.emit("launcher-drag-leave", ());
+                            }
+                            DropEvent::Drop { paths, x, y } => {
+                                let list: Vec<String> = paths
+                                    .iter()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .collect();
+                                let _ = app.emit(
+                                    "launcher-dropped",
+                                    serde_json::json!({ "x": x, "y": y, "paths": list }),
+                                );
+                            }
+                        }
+                    }),
+                );
+                match attached {
+                    Ok(()) => log::info!("launcher: drop target registered"),
+                    Err(error) => log::warn!("launcher: drop target failed: {error}"),
+                }
+                // WebView2 的子窗口是异步创建的：稍后再扫一遍补挂。
+                let late = late_app;
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(900));
+                    let retry = late.clone();
+                    let _ = late.run_on_main_thread(move || {
+                        if let Some(window) = retry.get_webview_window("launcher") {
+                            if let Ok(hwnd) = window.hwnd() {
+                                match hexbench_core::drop_target::attach_more(hwnd.0 as isize) {
+                                    Ok(()) => log::info!("launcher: drop target re-scanned"),
+                                    Err(error) => {
+                                        log::warn!("launcher: re-scan failed: {error}")
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            Err(error) => log::warn!("launcher: no hwnd: {error}"),
+        }
+    }
+    match built {
+        Some(_) => log::info!("launcher: built in {} ms", started.elapsed().as_millis()),
+        None => log::warn!("launcher: build failed"),
+    }
+    built
+}
+
+
+/// 面板出现在鼠标所在那块屏幕：水平居中、垂直偏上，就是命令面板该在的位置。
+fn place_launcher(window: &tauri::WebviewWindow, follow_cursor: bool, size_percent: (u32, u32)) {
+    let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
+    let area = hexbench_core::sys::work_area_at(cursor_x, cursor_y);
+    // 尺寸按工作区的百分比算，换显示器也不会一下子占满或小得没法用。
+    let (width, height) = match area {
+        Some((left, top, right, bottom)) => {
+            let width = ((right - left) * size_percent.0 as i32 / 100).clamp(520, 1400);
+            let height = ((bottom - top) * size_percent.1 as i32 / 100).clamp(320, 1100);
+            (width, height)
+        }
+        None => (780, 500),
+    };
+    let _ = window.set_size(tauri::PhysicalSize::new(
+        width as u32,
+        height as u32,
+    ));
+    let (mut x, mut y) = match area {
+        Some(_) if follow_cursor => {
+            // 贴着鼠标：面板中心落在光标上。
+            (cursor_x - width / 2, cursor_y - height / 2)
+        }
+        Some((left, top, right, bottom)) => (
+            left + ((right - left) - width) / 2,
+            top + ((bottom - top) - height) / 3,
+        ),
+        None => (cursor_x - width / 2, cursor_y - height / 2),
+    };
+    // 无论哪种模式，都不让它跑出工作区。
+    if let Some((left, top, right, bottom)) = area {
+        x = x.clamp(left, (right - width).max(left));
+        y = y.clamp(top, (bottom - height).max(top));
+    }
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+/// 面板显示时刻（毫秒）。「失焦即隐藏」需要一个宽限期：show 和抢焦点都是
+/// 异步的，刚显示那一刻还没拿到焦点，失焦事件会先到，窗口就会被立刻收起。
+static LAUNCHER_SHOWN_AT: AtomicU64 = AtomicU64::new(0);
+
+/// 右键菜单弹出时面板会短暂失去焦点，那期间不能自动收起。
+static LAUNCHER_MENU_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// 面板现在浏览到哪个文件夹：中转站可以进子目录，拖进来的文件就放进这里。
+static LAUNCHER_DROP_TARGET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// 配置是在日志系统起来之前读的，来源先存着，等 setup 里再报。
+static LOAD_SOURCE: std::sync::OnceLock<hexbench_core::config::LoadSource> = std::sync::OnceLock::new();
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 面板的呼出外观：是否贴着鼠标 + 尺寸百分比。
+fn launcher_appearance(app: &AppHandle) -> (bool, (u32, u32)) {
+    let shared = app.state::<AppState>();
+    let shared = shared.shared.lock().unwrap();
+    let launcher = &shared.config.launcher;
+    (
+        launcher.follow_cursor,
+        (
+            launcher.width_percent.clamp(25, 80),
+            launcher.height_percent.clamp(30, 80),
+        ),
+    )
+}
+fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))) {
+    LAUNCHER_SHOWN_AT.store(now_millis(), Ordering::Relaxed);
+    place_launcher(window, appearance.0, appearance.1);
+    let _ = window.show();
+    let _ = window.set_focus();
+    // Windows 的前台锁会吞掉单纯的 show+focus，必须走 force_foreground，
+    // 否则按完快捷键打不了字。
+    // show() 只是排进事件循环，此刻窗口可能还没真正绘制出来；延迟一点再抢
+    // 一次前台，比在同一帧里连调两次可靠。
+    let handle = window.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(130));
+        if let Ok(hwnd) = handle.hwnd() {
+            hexbench_core::sys::force_foreground(hwnd.0 as isize);
+        }
+    });
+    let _ = window.app_handle().emit("launcher-shown", ());
+    log::info!("launcher: shown");
+}
+
+fn open_launcher(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("launcher") {
+        reveal_launcher(&window, launcher_appearance(app));
+        return;
+    }
+    // Creating a WebView2 window re-enters the event loop: doing it on the UI
+    // thread froze the whole app for five seconds. Build it on a worker, then
+    // reveal it from there.
+    let handle = app.clone();
+    let appearance = launcher_appearance(app);
+    thread::spawn(move || {
+        if let Some(window) = build_launcher(&handle) {
+            reveal_launcher(&window, appearance);
+        }
+    });
+}
+
+
+fn show_launcher(app: &AppHandle) {
+    open_launcher(app);
+}
+
+fn hide_launcher(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("launcher") {
+        let _ = window.hide();
+    }
+}
+
+fn toggle_launcher(app: &AppHandle) {
+    let enabled = app
+        .state::<AppState>()
+        .shared
+        .lock()
+        .unwrap()
+        .config
+        .launcher
+        .enabled;
+    if !enabled {
+        return;
+    }
+    match app.get_webview_window("launcher") {
+        Some(window) if window.is_visible().unwrap_or(false) => hide_launcher(app),
+        _ => show_launcher(app),
+    }
+}
+
+/// 呼出面板里的一行（文件或文件夹）。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherItem {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+    modified: i64,
+    icon: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherListing {
+    folder: String,
+    exists: bool,
+    items: Vec<LauncherItem>,
+}
+
+/// 一个文件夹里的条目，按「先文件夹、再名字」排序。
+///
+/// 图标走 Shell 的缓存并且按扩展名复用，所以几百个文件也只做几次转换。
+/// 上限 300：面板是给人翻的，不是资源管理器。
+/// 读一个文件夹，生成面板用的条目（带上 Shell 图标）。
+fn list_folder(path: &std::path::Path, with_icons: bool) -> Vec<LauncherItem> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<LauncherItem> = Vec::new();
+    for entry in entries.flatten() {
+        if items.len() >= 300 {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = entry.metadata().ok();
+        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let icon = if with_icons {
+            hexbench_core::icons::file_icon_base64(&path, is_dir)
+        } else {
+            None
+        };
+        items.push(LauncherItem {
+            name,
+            path: path.to_string_lossy().to_string(),
+            is_dir,
+            size,
+            modified,
+            icon,
+        });
+    }
+    items.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    items
+}
+
+#[tauri::command]
+async fn launcher_listing(app: AppHandle) -> LauncherListing {
+    let folder = app
+        .state::<AppState>()
+        .shared
+        .lock()
+        .unwrap()
+        .config
+        .launcher
+        .folder
+        .clone();
+    if folder.trim().is_empty() {
+        return LauncherListing {
+            folder,
+            exists: false,
+            items: Vec::new(),
+        };
+    }
+    // 必须离开主线程：这里以前是同步命令，每次呼出都给整个中转站目录取图标，
+    // 加上缩略图之后直接把界面堵死十秒。
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&folder);
+        let exists = path.is_dir();
+        let items = if exists {
+            list_folder(&path, false)
+        } else {
+            Vec::new()
+        };
+        LauncherListing {
+            folder,
+            exists,
+            items,
+        }
+    })
+    .await
+    .unwrap_or_else(|_| LauncherListing {
+        folder: String::new(),
+        exists: false,
+        items: Vec::new(),
+    })
+}
+
+/// 启动器：根目录下的每个子文件夹就是一个分类。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherCategory {
+    name: String,
+    path: String,
+    count: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherRoot {
+    root: String,
+    categories: Vec<LauncherCategory>,
+    /// 中转站目录：恢复上次位置时要用它判断这个位置还存不存在。
+    staging: String,
+    /// 上次用的视图和排序。
+    view: String,
+    sort_key: String,
+    sort_dir: i32,
+    /// 下次呼出要不要回到上次的位置。
+    remember_location: bool,
+    last_kind: String,
+    last_base: String,
+    last_label: String,
+    last_path: String,
+}
+
+#[tauri::command]
+async fn launcher_categories(app: AppHandle) -> LauncherRoot {
+    // 同样要离开主线程：这里会逐个子文件夹 read_dir 数条目。
+    tauri::async_runtime::spawn_blocking(move || launcher_root(&app))
+        .await
+        .unwrap_or_else(|_| LauncherRoot {
+            root: String::new(),
+            categories: Vec::new(),
+            staging: String::new(),
+            view: "grid".to_string(),
+            sort_key: "name".to_string(),
+            sort_dir: 1,
+            remember_location: false,
+            last_kind: String::new(),
+            last_base: String::new(),
+            last_label: String::new(),
+            last_path: String::new(),
+        })
+}
+
+fn launcher_root(app: &AppHandle) -> LauncherRoot {
+    let state = app.state::<AppState>();
+    let shared = state.shared.lock().unwrap();
+    let root = shared.config.launcher.root.clone();
+    let location = shared.config.launcher.last_location.clone();
+    let remember_location = shared.config.launcher.remember_location;
+    let staging = shared.config.launcher.folder.clone();
+    let view = shared.config.launcher.view.clone();
+    let sort_key = shared.config.launcher.sort_key.clone();
+    let sort_dir = shared.config.launcher.sort_dir;
+    drop(shared);
+    let empty = |root: String| LauncherRoot {
+        root,
+        categories: Vec::new(),
+        staging: staging.clone(),
+        view: view.clone(),
+        sort_key: sort_key.clone(),
+        sort_dir,
+        remember_location,
+        last_kind: location.kind.clone(),
+        last_base: location.base.clone(),
+        last_label: location.label.clone(),
+        last_path: location.path.clone(),
+    };
+    if root.trim().is_empty() {
+        return empty(root);
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return empty(root);
+    };
+    let mut list: Vec<LauncherCategory> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let count = std::fs::read_dir(&path)
+            .map(|reader| reader.flatten().count())
+            .unwrap_or(0);
+        list.push(LauncherCategory {
+            name,
+            path: path.to_string_lossy().to_string(),
+            count,
+        });
+    }
+    list.sort_by_key(|category| category.name.to_lowercase());
+    LauncherRoot {
+        root,
+        categories: list,
+        staging,
+        view,
+        sort_key,
+        sort_dir,
+        remember_location,
+        last_kind: location.kind,
+        last_base: location.base,
+        last_label: location.label,
+        last_path: location.path,
+    }
+}
+
+/// 记住面板这次停在哪儿（只有开启「记住上次位置」时才写盘）。
+#[tauri::command]
+fn launcher_save_location(
+    kind: String,
+    base: String,
+    label: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut shared = state.shared.lock().unwrap();
+    let launcher = &mut shared.config.launcher;
+    if !launcher.remember_location {
+        return Ok(());
+    }
+    if launcher.last_location.kind == kind
+        && launcher.last_location.base == base
+        && launcher.last_location.path == path
+    {
+        return Ok(());
+    }
+    launcher.last_location = hexbench_core::config::LauncherLocation {
+        kind,
+        base,
+        label,
+        path,
+    };
+    let config = shared.config.clone();
+    drop(shared);
+    hexbench_core::config::save(&state.config_path, &config).map_err(|error| error.to_string())
+}
+
+/// 从面板跳到设置页：把主窗口叫出来，再告诉前端要打开哪一页。
+#[tauri::command]
+fn open_settings(page: String, tab: Option<String>, app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit("navigate", serde_json::json!({ "page": page, "tab": tab }));
+}
+/// 记住面板的视图和排序方式。
+#[tauri::command]
+fn launcher_save_view(
+    view: String,
+    sort_key: String,
+    sort_dir: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut shared = state.shared.lock().unwrap();
+    let launcher = &mut shared.config.launcher;
+    if launcher.view == view && launcher.sort_key == sort_key && launcher.sort_dir == sort_dir {
+        return Ok(());
+    }
+    launcher.view = view;
+    launcher.sort_key = sort_key;
+    launcher.sort_dir = sort_dir;
+    let config = shared.config.clone();
+    drop(shared);
+    hexbench_core::config::save(&state.config_path, &config).map_err(|error| error.to_string())
+}
+/// 把文件移进某个文件夹（面板内部拖拽用）。
+#[tauri::command]
+fn launcher_move_into(dest: String, paths: Vec<String>, app: AppHandle) -> Result<usize, String> {
+    let dir = PathBuf::from(&dest);
+    if !dir.is_dir() {
+        return Err("目标文件夹不存在".to_string());
+    }
+    let sources: Vec<PathBuf> = paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+    if sources.is_empty() {
+        return Err("文件已经不在了".to_string());
+    }
+    let moved = move_paths_into(&dir, &sources);
+    log::info!("launcher: moved {moved} item(s) into {}", dir.display());
+    let _ = app.emit("launcher-changed", ());
+    Ok(moved)
+}
+/// 面板告诉后端「我现在在哪个目录」，拖进来的文件就放进这里。
+#[tauri::command]
+fn launcher_set_drop_target(path: Option<String>) {
+    log::info!("launcher: drop target = {path:?}");
+    if let Ok(mut target) = LAUNCHER_DROP_TARGET.lock() {
+        *target = path.map(PathBuf::from);
+    }
+}
+
+/// 在中转站的当前目录里新建文件夹（重名自动加序号）。
+#[tauri::command]
+fn launcher_new_folder(parent: String) -> Result<String, String> {
+    let target = hexbench_core::sys::create_folder(std::path::Path::new(&parent), "新建文件夹")?;
+    Ok(target.to_string_lossy().to_string())
+}
+/// 某个分类（也就是某个子文件夹）里的条目。
+#[tauri::command]
+async fn launcher_items(path: String, with_icons: Option<bool>) -> Vec<LauncherItem> {
+    // 图标要问 Shell（每张几十毫秒），必须离开界面线程，否则一屏图标就能把
+    // 面板卡住一秒以上。也可以先只要名字，图标后面再补。
+    let with_icons = with_icons.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || {
+        list_folder(std::path::Path::new(&path), with_icons)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 批量补图标：面板先出名字，图标随后分批填进来。
+#[tauri::command]
+async fn launcher_icons(paths: Vec<String>) -> Vec<(String, Option<String>)> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|raw| {
+                let path = std::path::PathBuf::from(&raw);
+                let is_dir = path.is_dir();
+                let icon = hexbench_core::icons::file_icon_base64(&path, is_dir);
+                (raw, icon)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 面板里按住一个条目拖出去：交给 OLE，资源管理器 / 浏览器都认。
+#[tauri::command]
+fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String> {
+    let targets: Vec<PathBuf> = paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+    if targets.is_empty() {
+        log::warn!("launcher: drag targets all missing: {paths:?}");
+        return Err("文件已经不在了".to_string());
+    }
+    log::info!("launcher: drag requested for {} item(s)", targets.len());
+
+    // 面板在屏幕上的位置：松手时用它判断「还在面板里」。
+    let frame = app.get_webview_window("launcher").and_then(|window| {
+        let position = window.outer_position().ok()?;
+        let size = window.inner_size().ok()?;
+        Some((
+            position.x,
+            position.y,
+            size.width as i32,
+            size.height as i32,
+        ))
+    });
+
+    // 拖拽期间轮询光标：面板自己的拖放目标收不到 OLE 事件，只能自己看光标在哪。
+    let stop = Arc::new(AtomicBool::new(false));
+    let poller = {
+        let app = app.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let (x, y) = hexbench_core::sys::cursor_position();
+                let _ = app.emit(
+                    "launcher-drag-pos",
+                    serde_json::json!({ "x": x, "y": y }),
+                );
+                thread::sleep(Duration::from_millis(60));
+            }
+        })
+    };
+
+    hexbench_core::drop_target::set_drag_out(true);
+    let result = hexbench_core::sys::start_file_drag(&targets);
+    hexbench_core::drop_target::set_drag_out(false);
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = poller.join();
+
+    // 松手时如果还在面板里、而且左键已经松开（不是 Esc 取消），就把落点交给界面：
+    // 落在文件夹上 = 移进去，落在空白 = 放进当前目录。
+    if !hexbench_core::sys::left_button_down() {
+        if let Some((left, top, width, height)) = frame {
+            let (x, y) = hexbench_core::sys::cursor_position();
+            if x >= left && y >= top && x < left + width && y < top + height {
+                let list: Vec<String> = targets
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect();
+                let _ = app.emit(
+                    "launcher-drag-drop",
+                    serde_json::json!({ "x": x, "y": y, "paths": list }),
+                );
+            }
+        }
+    }
+
+    match result {
+        Ok(effect) => {
+            log::info!("launcher: dragged out {} item(s) effect={effect}", targets.len());
+            Ok(effect)
+        }
+        Err(error) => {
+            log::warn!("launcher: drag failed: {error}");
+            Err(error)
+        }
+    }
+}
+/// 面板里右键：弹出系统原生的文件菜单（和资源管理器同一套）。
+/// 面板里右键：系统原生菜单 + 自己补的重命名 / 删除。
+///
+/// 返回 `"rename"` 表示用户选了重命名（改名要用户输入，交给界面做），
+/// `"deleted"` 表示删到回收站了，`None` 表示没选或执行了系统命令。
+#[tauri::command]
+fn launcher_context_menu(path: String, app: AppHandle) -> Result<Option<String>, String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err("文件已经不在了".to_string());
+    }
+    let (x, y) = hexbench_core::sys::cursor_position();
+    let owner = app
+        .get_webview_window("launcher")
+        .and_then(|window| window.hwnd().ok())
+        .map(|hwnd| hwnd.0 as isize)
+        .unwrap_or(0);
+    log::info!("launcher: context menu for {path} at {x},{y}");
+    LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
+    let result = hexbench_core::sys::show_shell_context_menu(&target, x, y, owner);
+    LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
+    match result {
+        Ok(choice) => {
+            // 菜单关掉之后窗口不一定还拿着键盘焦点；要改名就必须先把焦点抢回来，
+            // 否则输入框看得见却收不到按键。
+
+            let _ = app.emit("launcher-changed", ());
+            Ok(choice.map(|value| value.to_string()))
+        }
+        Err(error) => {
+            log::warn!("launcher: context menu failed: {error}");
+            Err(error)
+        }
+    }
+}
+
+/// 在面板里给文件改名（同一目录内）。
+#[tauri::command]
+fn launcher_rename(path: String, name: String, app: AppHandle) -> Result<String, String> {
+    log::info!("launcher: rename {path} -> {name}");
+    let target = PathBuf::from(&path);
+    let renamed = match hexbench_core::sys::rename_path(&target, &name) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!("launcher: rename failed: {error}");
+            return Err(error);
+        }
+    };
+    let _ = app.emit("launcher-changed", ());
+    Ok(renamed.to_string_lossy().to_string())
+}
+/// 设置页「缓存」：每一项缓存的占用。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheInfo {
+    key: String,
+    label: String,
+    hint: String,
+    path: String,
+    bytes: u64,
+    files: usize,
+}
+
+#[tauri::command]
+fn cache_stats() -> Vec<CacheInfo> {
+    let mut list = Vec::new();
+    if let Some(dir) = hexbench_core::icons::cache_dir() {
+        let (bytes, files) = hexbench_core::icons::cache_usage();
+        list.push(CacheInfo {
+            key: "thumbs".to_string(),
+            label: "缩略图缓存".to_string(),
+            hint: "面板里的文件缩略图和图标。删掉不影响使用，下次打开时会重新生成。".to_string(),
+            path: dir.to_string_lossy().to_string(),
+            bytes,
+            files,
+        });
+    }
+    list
+}
+
+/// 清空所有缓存，返回释放的字节数。
+#[tauri::command]
+fn cache_clear(app: AppHandle) -> Result<u64, String> {
+    let freed = hexbench_core::icons::clear_cache();
+    log::info!("cache: cleared {freed} bytes");
+    let _ = app.emit("launcher-changed", ());
+    Ok(freed)
+}
+/// 面板里双击：交给系统默认程序。
+#[tauri::command]
+fn launcher_open(path: String) -> Result<(), String> {
+    hexbench_core::sys::open_path(PathBuf::from(path).as_path())
+}
+/// 选一个文件夹作为面板的文件区。
+/// 选文件夹。`target` 为 `"root"` 时设置启动器根目录，否则设置文件区。
+#[tauri::command]
+fn launcher_pick_folder(target: String, app: AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    let handle = app.clone();
+    let is_root = target == "root";
+    app.dialog().file().pick_folder(move |picked| {
+        let Some(picked) = picked else {
+            return;
+        };
+        let Some(path) = picked.as_path() else {
+            return;
+        };
+        let folder = path.to_string_lossy().to_string();
+        let state = handle.state::<AppState>();
+        let config = {
+            let mut shared = state.shared.lock().unwrap();
+            if is_root {
+                shared.config.launcher.root = folder.clone();
+            } else {
+                shared.config.launcher.folder = folder.clone();
+            }
+            shared.config.clone()
+        };
+        if let Err(error) = config::save(&state.config_path, &config) {
+            log::warn!("launcher: save folder failed: {error}");
+            return;
+        }
+        log::info!("launcher: folder set to {folder}");
+        // 选文件夹时面板会失焦收起，选完再把它叫回来，别让用户以为操作丢了。
+        if let Some(window) = handle.get_webview_window("launcher") {
+            reveal_launcher(&window, launcher_appearance(&handle));
+        }
+        let _ = handle.emit("launcher-changed", ());
+    });
+}
+
+#[tauri::command]
+fn launcher_clear_folder(app: AppHandle, state: State<'_, AppState>) {
+    let config = {
+        let mut shared = state.shared.lock().unwrap();
+        shared.config.launcher.folder.clear();
+        shared.config.clone()
+    };
+    let _ = config::save(&state.config_path, &config);
+    let _ = app.emit("launcher-changed", ());
+}
+
+/// 监听映射文件夹的变化：文件系统事件驱动，空闲时零开销。
+fn spawn_launcher_watcher(app: AppHandle) {
+    thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+        use std::sync::mpsc::RecvTimeoutError;
+
+        type Session = (
+            notify::RecommendedWatcher,
+            std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+        );
+        let mut current: Option<PathBuf> = None;
+        // 监听器和它的接收端必须一起活着：丢了监听器就等于丢了监听。
+        let mut session: Option<Session> = None;
+
+        loop {
+            let wanted = {
+                let state = app.state::<AppState>();
+                let shared = state.shared.lock().unwrap();
+                let raw = shared.config.launcher.folder.clone();
+                if raw.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(raw))
+                }
+            };
+
+            if wanted != current {
+                session = None;
+                if let Some(directory) = wanted.as_ref() {
+                    if directory.is_dir() {
+                        let (sender, rx) = std::sync::mpsc::channel();
+                        if let Ok(mut created) = notify::recommended_watcher(move |event| {
+                            let _ = sender.send(event);
+                        }) {
+                            if created.watch(directory, RecursiveMode::NonRecursive).is_ok() {
+                                session = Some((created, rx));
+                                log::info!("launcher: watching {}", directory.display());
+                            }
+                        }
+                    }
+                }
+                current = wanted;
+            }
+
+            match session.as_ref() {
+                Some((_watcher, rx)) => match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(Ok(_)) => {
+                        // 解压 / 批量复制会连发几百个事件，合并成一次刷新。
+                        thread::sleep(Duration::from_millis(250));
+                        while rx.try_recv().is_ok() {}
+                        let _ = app.emit("launcher-changed", ());
+                    }
+                    Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        session = None;
+                        current = None;
+                    }
+                },
+                None => thread::sleep(Duration::from_millis(500)),
+            }
+        }
+    });
+}
+
+/// 面板里按 Esc：前端喊一声，这里收起来。
+#[tauri::command]
+fn dismiss_launcher(app: AppHandle) {
+    hide_launcher(&app);
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
     let test = MenuItem::with_id(app, "test", "测试模式", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "暂停 / 继续", true, None::<&str>)?;
-    let phrases = MenuItem::with_id(app, "phrases", "快捷语面板", true, None::<&str>)?;
+    let phrases = MenuItem::with_id(app, "phrases", "常用语", true, None::<&str>)?;
     let separator_a = PredefinedMenuItem::separator(app)?;
     let separator_b = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -1514,20 +2820,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => open_main(app),
-            "quit" => {
-                QUITTING.store(true, Ordering::SeqCst);
-                // Leaving the event-loop callback before exiting, plus a hard
-                // watchdog: a hung shutdown otherwise looks like a frozen app
-                // with no way out.
-                let handle = app.clone();
-                thread::spawn(move || {
-                    thread::spawn(|| {
-                        thread::sleep(Duration::from_secs(3));
-                        std::process::exit(0);
-                    });
-                    handle.exit(0);
-                });
-            }
+            "quit" => request_quit(app),
             "test" => {
                 let state = app.state::<AppState>();
                 let mut shared = state.shared.lock().unwrap();
@@ -1681,6 +2974,8 @@ fn region_dto(region: &Region) -> RegionDto {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 必须在任何窗口创建之前：OLE 拖放目标要在这个线程上注册。
+    hexbench_core::sys::init_ole();
     // A GUI build has no console; keep the last panic where a bug report can
     // find it instead of dying silently with 0xC0000409.
     let default_hook = std::panic::take_hook();
@@ -1691,7 +2986,8 @@ pub fn run() {
         default_hook(info);
     }));
     let config_path = config::default_path().unwrap_or_else(|| PathBuf::from("config.json"));
-    let (loaded, _source) = config::load(&config_path);
+    let (loaded, source) = config::load(&config_path);
+    LOAD_SOURCE.set(source).ok();
     if !config_path.exists() {
         let _ = config::save(&config_path, &loaded);
     }
@@ -1703,8 +2999,13 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // `hexbench-app --overlay` is a convenience for scripts and for
             // checking the zones without opening the window first.
-            if args.iter().any(|arg| arg == "--overlay") {
-                let _ = open_overlay(app);
+            if args.iter().any(|arg| arg == "--quit") {
+                request_quit(app);
+            } else if args.iter().any(|arg| arg == "--overlay") {
+                let handle = app.clone();
+                thread::spawn(move || {
+                    let _ = open_overlay(&handle);
+                });
             } else if args.iter().any(|arg| arg == "--panel") {
                 open_phrases_panel(app);
             } else {
@@ -1730,7 +3031,7 @@ pub fn run() {
                 // The panel remembers its own geometry (config.phrases.panel*)
                 // and changes size on collapse; letting the plugin restore a
                 // stale size would fight both.
-                .with_denylist(&["phrases", "overlay"])
+                .with_denylist(&["phrases", "overlay", "launcher"])
                 // The window is frameless by design: restoring a saved
                 // "decorated" flag would bring the system title bar back.
                 .with_state_flags(
@@ -1745,24 +3046,28 @@ pub fn run() {
                     if event.state != ShortcutState::Pressed {
                         return;
                     }
-                    let (pause, panel) = {
+                    let (pause, panel, launcher) = {
                         let state = app.state::<AppState>();
                         let shared = state.shared.lock().unwrap();
                         (
                             shared.config.hotkeys.pause.clone(),
                             shared.config.hotkeys.phrases_panel.clone(),
+                            shared.config.hotkeys.launcher.clone(),
                         )
                     };
                     if shortcut_matches(shortcut, &pause) {
                         toggle_pause(app);
                     } else if shortcut_matches(shortcut, &panel) {
                         open_phrases_panel(app);
+                    } else if shortcut_matches(shortcut, &launcher) {
+                        toggle_launcher(app);
                     }
                 })
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
@@ -1799,6 +3104,33 @@ pub fn run() {
             phrases_ui,
             phrase_submit,
             panel_close,
+            staging_list,
+            staging_add,
+            staging_remove,
+            staging_clear,
+            staging_reveal,
+            begin_staging_drag,
+            dismiss_launcher,
+            launcher_listing,
+            launcher_categories,
+            launcher_items,
+            launcher_pick_folder,
+            launcher_open,
+            launcher_begin_drag,
+            launcher_context_menu,
+            launcher_rename,
+            open_settings,
+            launcher_set_drop_target,
+            launcher_new_folder,
+            launcher_save_location,
+            launcher_icons,
+            launcher_save_view,
+            launcher_move_into,
+            cache_stats,
+            cache_clear,
+            launcher_clear_folder,
+            staging_copy,
+            staging_set_enabled,
             phrase_send_mode,
             sync_test,
             sync_save,
@@ -1813,6 +3145,18 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            for note in hexbench_core::config::take_notes() {
+                log::warn!("{note}");
+            }
+            match LOAD_SOURCE.get() {
+                Some(hexbench_core::config::LoadSource::Backup) => {
+                    log::warn!("config: 主配置读取失败，已经回退到备份");
+                }
+                Some(hexbench_core::config::LoadSource::Default) => {
+                    log::info!("config: 没有可用配置，以默认值启动");
+                }
+                _ => {}
+            }
             build_tray(&handle)?;
 
             let enabled = handle.autolaunch().is_enabled().unwrap_or(false);
@@ -1826,6 +3170,7 @@ pub fn run() {
             spawn_engine(engine_shared.clone());
             spawn_panel_follower(handle.clone());
             spawn_panel_desktop_watch(handle.clone());
+
             if std::env::args().any(|arg| arg == "--panel") {
                 let panel_handle = handle.clone();
                 thread::spawn(move || {
@@ -1835,6 +3180,7 @@ pub fn run() {
             }
 
             register_hotkeys(&handle);
+            spawn_stall_watchdog(handle.clone());
 
             // Manual launch shows the window; only the autostart entry stays
             // in the tray (the plan's "开机自启绝不弹窗").
@@ -1843,6 +3189,8 @@ pub fn run() {
                 // Setup runs before the event loop, so building here is safe.
                 open_main_now(&handle);
             }
+            spawn_staging_watcher(handle.clone());
+            spawn_launcher_watcher(handle.clone());
 
             // A tray app can run for days: checking only at launch would mean
             // "restart to find out you have an update". latest.json is a few
@@ -1856,9 +3204,160 @@ pub fn run() {
                 }
             });
 
+            // 面板窗口在主线程上先建好（隐藏）：OLE 拖放目标必须挂在创建窗口的
+            // 那个线程上，工作线程建完就退出，注册会失效 —— 表现就是外部拖进来
+            // 的文件被系统送给下面的主窗口。
+            if app
+                .state::<AppState>()
+                .shared
+                .lock()
+                .unwrap()
+                .config
+                .launcher
+                .enabled
+            {
+                if let Some(window) = build_launcher(app.handle()) {
+                    let _ = window.hide();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let WindowEvent::DragDrop(drop) = event {
+                // 一旦有东西被拖进来，就记下文件列表并开始盯光标（面板可能在中途才呼出）。
+                if let tauri::DragDropEvent::Enter { paths, .. } = &drop {
+                    if hexbench_core::drop_target::is_dragging_out() {
+                        return;
+                    }
+                    let list: Vec<String> = paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect();
+                    watch_external_drag(window.app_handle().clone(), list);
+                }
+                // Windows 上拖放目标只挂在第一个 webview 上，事件会全部报给主窗口。
+                // 所以只要面板开着、光标又在面板里，就先交给面板处理。
+                let app = window.app_handle();
+                if let Some(launcher) = app.get_webview_window("launcher") {
+                    if launcher.is_visible().unwrap_or(false) {
+                        let frame = launcher.outer_position().ok().zip(launcher.inner_size().ok());
+                        if let Some((position, size)) = frame {
+                            let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
+                            let inside = cursor_x >= position.x
+                                && cursor_y >= position.y
+                                && cursor_x < position.x + size.width as i32
+                                && cursor_y < position.y + size.height as i32;
+                            if inside {
+                                match drop {
+                                    tauri::DragDropEvent::Enter { .. }
+                                    | tauri::DragDropEvent::Over { .. } => {
+                                        let _ = app.emit(
+                                            "launcher-drag-pos",
+                                            serde_json::json!({ "x": cursor_x, "y": cursor_y }),
+                                        );
+                                    }
+                                    tauri::DragDropEvent::Drop { paths, .. } => {
+                                        let list: Vec<String> = paths
+                                            .iter()
+                                            .map(|path| path.to_string_lossy().to_string())
+                                            .collect();
+                                        let _ = app.emit(
+                                            "launcher-dropped",
+                                            serde_json::json!({
+                                                "x": cursor_x,
+                                                "y": cursor_y,
+                                                "paths": list,
+                                            }),
+                                        );
+                                    }
+                                    tauri::DragDropEvent::Leave => {
+                                        let _ = app.emit("launcher-drag-leave", ());
+                                    }
+                                    _ => {}
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+                if window.label() == "launcher" {
+                    // 拖到面板上时，把坐标交给界面：由它判断落点在哪个格子上
+                    // （文件夹 = 移进去，空白 = 放进当前目录）。
+                    let app = window.app_handle();
+                    match drop {
+                        tauri::DragDropEvent::Enter { position, .. }
+                        | tauri::DragDropEvent::Over { position } => {
+
+                            let _ = app.emit(
+                                "launcher-drag-over",
+                                serde_json::json!({ "x": position.x, "y": position.y }),
+                            );
+                        }
+                        tauri::DragDropEvent::Drop { paths, position } => {
+                            log::info!("launcher: drop event at {},{}", position.x, position.y);
+                            let list: Vec<String> = paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect();
+                            let _ = app.emit(
+                                "launcher-dropped",
+                                serde_json::json!({
+                                    "x": position.x,
+                                    "y": position.y,
+                                    "paths": list,
+                                }),
+                            );
+                        }
+                        tauri::DragDropEvent::Leave => {
+                            log::info!("launcher: drag left");
+                            let _ = app.emit("launcher-drag-leave", ());
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if window.label() == "main" {
+                    match drop {
+                        tauri::DragDropEvent::Enter { .. } => {
+                            log::info!("staging: drag entered");
+                        }
+                        tauri::DragDropEvent::Drop { paths, .. } => {
+                            log::info!("staging: drop with {} path(s)", paths.len());
+                            let app = window.app_handle();
+                            let enabled = app
+                                .state::<AppState>()
+                                .shared
+                                .lock()
+                                .unwrap()
+                                .config
+                                .staging
+                                .enabled;
+                            if enabled && !paths.is_empty() {
+                                let moved = stage_paths(app, paths);
+                                log::info!("staging: took {moved} item(s)");
+                            }
+                            let _ = app.emit("staging-changed", ());
+                        }
+                        tauri::DragDropEvent::Leave => {
+                            log::info!("staging: drag left");
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            // 面板是「呼出即用」的：点到别处就收起来。
+            if window.label() == "launcher" {
+                if let WindowEvent::Focused(false) = event {
+                    // 刚显示的那 500ms、以及右键菜单开着的时候，都别收起。
+                    let since = LAUNCHER_SHOWN_AT.load(Ordering::Relaxed);
+                    let menu_open = LAUNCHER_MENU_OPEN.load(Ordering::Relaxed);
+                    if !menu_open && now_millis().saturating_sub(since) > 500 {
+                        let _ = window.hide();
+                    }
+                }
+                return;
+            }
             let WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
@@ -1868,20 +3367,41 @@ pub fn run() {
                 let _ = window.hide();
                 return;
             }
-            // Destroy instead of hide: a hidden window keeps its WebView2
-            // processes alive (~220 MB private for the main window). Dropping
-            // the window frees them; the app survives because ExitRequested is
-            // vetoed in the run handler below.
+            // The app lives in the tray, so closing the window must not quit.
+            // See below: it is hidden now and destroyed a little later.
             api.prevent_close();
-            let _ = window.destroy();
+            // Hide, never destroy on the spot: destroying a WebView2 can block
+            // the event loop for a noticeable moment, and rebuilding it on the
+            // next open costs even more. The window is torn down later, once it
+            // is clear the user is not coming straight back.
+            let _ = window.hide();
+            let window = window.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(30));
+                if window.is_visible().unwrap_or(false) {
+                    return; // reopened meanwhile, keep the warm window
+                }
+                let started = Instant::now();
+                let _ = window.destroy();
+                log::info!(
+                    "window: main destroyed after close in {} ms",
+                    started.elapsed().as_millis()
+                );
+            });
         })
         .build(tauri::generate_context!())
         .expect("error while building HexBench")
-        .run(|_, event| {
-            if let RunEvent::ExitRequested { api, .. } = event {
+        .run(|_, event| match event {
+            RunEvent::ExitRequested { api, .. } => {
+                log::info!(
+                    "quit: ExitRequested (quitting={})",
+                    QUITTING.load(Ordering::SeqCst)
+                );
                 if !QUITTING.load(Ordering::SeqCst) {
                     api.prevent_exit();
                 }
             }
+            RunEvent::Exit => log::info!("quit: Exit"),
+            _ => {}
         });
 }

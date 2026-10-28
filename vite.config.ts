@@ -17,6 +17,7 @@ export default defineConfig({
         main: "index.html",
         overlay: "overlay.html",
         phrases: "phrases.html",
+        launcher: "launcher.html",
       },
     },
   },

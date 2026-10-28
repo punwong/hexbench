@@ -26,3 +26,5 @@ serde_json = "1"
 hexbench-core = { path = "../crates/hexbench-core" }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-dialog = "2.7.3"
+notify = "8.2.1"

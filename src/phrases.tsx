@@ -1,3 +1,4 @@
+import "./shell";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { createRoot } from "react-dom/client";
@@ -178,7 +179,7 @@ function Panel() {
           className="bubble"
           role="button"
           tabIndex={0}
-          title="展开快捷语"
+          title="展开常用语"
           onPointerDown={startDrag}
           onPointerUp={expandIfStill}
         >
@@ -200,7 +201,7 @@ function Panel() {
         >
           <LogoIcon size={18} />
         </button>
-        <span className="head-title">快捷语</span>
+        <span className="head-title">常用语</span>
         <span className="head-actions">
           <button
             type="button"
