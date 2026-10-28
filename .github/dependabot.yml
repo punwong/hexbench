@@ -1,0 +1,19 @@
+version: 2
+
+# 只自动跟 GitHub Actions 的版本。
+#
+# Actions 声明的运行时（node20 → node24）会随大版本更新，过期了 GitHub 会一直
+# 告警，而且总有一天会直接不再支持。让 Dependabot 每周提一个 PR，比隔几个月
+# 手动翻一遍仓库省事。
+#
+# 刻意没有开 cargo / npm：Tauri 的 Rust crate 和 NPM 包必须保持 major/minor
+# 一致，自动升级很容易把两边拆散（0.2.0 发布时就因此失败过一次）。
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
