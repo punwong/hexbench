@@ -969,7 +969,7 @@ function Launcher() {
     hoverTimer.current = window.setTimeout(() => {
       hoverTimer.current = null;
       action();
-    }, 45);
+    }, 25);
   };
   const hoverCancel = () => {
     if (hoverTimer.current !== null) {
