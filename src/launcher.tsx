@@ -450,6 +450,22 @@ function Launcher() {
     };
   }, [root.sites, siteIcons]);
 
+  // 空白处右键：弹资源管理器的「文件夹背景菜单」（新建 / 粘贴 / 属性 / 刷新）。
+  useEffect(() => {
+    const handler = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target || !target.closest(".content")) return;
+      if (target.closest(".tile, .row")) return;
+      const dir = currentDir || root.root;
+      if (!dir) return;
+      event.preventDefault();
+      void invoke("launcher_background_menu", { path: dir }).catch((error) =>
+        showToastRef.current(String(error)),
+      );
+    };
+    document.addEventListener("contextmenu", handler);
+    return () => document.removeEventListener("contextmenu", handler);
+  }, [currentDir, root.root]);
   // 拖到面板上的文件放进当前浏览的目录。
   useEffect(() => {
     currentDirRef.current = currentDir;

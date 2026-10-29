@@ -1581,6 +1581,143 @@ pub fn foreground_is_current_process() -> bool {
     }
 }
 
+
+/// 在文件夹的**空白处**弹出资源管理器原生右键菜单（新建 / 粘贴 / 属性 / 刷新 …）。
+///
+/// 和文件项菜单的区别只在「怎么拿 IContextMenu」：
+/// * 文件项：`IShellFolder::GetUIObjectOf(child)`
+/// * 空白处：先 `BindToObject` 拿到该文件夹自己的 `IShellFolder`，
+///   再 `CreateViewObject(NULL, IID_IContextMenu)`——这就是「文件夹背景菜单」。
+pub fn show_folder_background_menu(
+    dir: &std::path::Path,
+    x: i32,
+    y: i32,
+    owner: isize,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: PIDL / IShellFolder / IContextMenu 都在本函数内释放；菜单句柄同理。
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        let mut attributes: u32 = 0;
+        let hr = SHParseDisplayName(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut pidl,
+            0,
+            &mut attributes,
+        );
+        if hr < 0 || pidl.is_null() {
+            return Err(format!("SHParseDisplayName 0x{hr:08x}"));
+        }
+
+        let mut parent: *mut c_void = std::ptr::null_mut();
+        let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+        let hr = SHBindToParent(pidl, &IID_ISHELLFOLDER, &mut parent, &mut child);
+        if hr < 0 || parent.is_null() {
+            CoTaskMemFree(pidl as *const c_void);
+            return Err(format!("SHBindToParent 0x{hr:08x}"));
+        }
+
+        // 1) 拿到这个目录自己的 IShellFolder
+        let parent_vtbl = *(parent as *mut *const ShellFolderVtbl);
+        // 注意参数个数：BindToObject(pidl, pbc, riid, ppv) —— 多一个 IBindCtx，
+        // 少写一个会让调用栈错位，直接崩进程（之前就是这么崩的）。
+        let bind_to_object: unsafe extern "system" fn(
+            *mut c_void,
+            *const ITEMIDLIST,
+            *mut c_void,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute((*parent_vtbl).bind_to_object);
+        let mut dir_folder: *mut c_void = std::ptr::null_mut();
+        let hr = bind_to_object(
+            parent,
+            child as *const ITEMIDLIST,
+            std::ptr::null_mut(),
+            &IID_ISHELLFOLDER,
+            &mut dir_folder,
+        );
+        release_object(parent);
+        CoTaskMemFree(pidl as *const c_void);
+        if hr < 0 || dir_folder.is_null() {
+            return Err(format!("BindToObject 0x{hr:08x}"));
+        }
+
+        // 2) 背景菜单 = CreateViewObject(NULL, IID_IContextMenu)
+        let dir_vtbl = *(dir_folder as *mut *const ShellFolderVtbl);
+        let create_view_object: unsafe extern "system" fn(
+            *mut c_void,
+            HWND,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute((*dir_vtbl).create_view_object);
+        let mut menu_object: *mut c_void = std::ptr::null_mut();
+        let hr = create_view_object(
+            dir_folder,
+            std::ptr::null_mut(),
+            &IID_ICONTEXTMENU,
+            &mut menu_object,
+        );
+        release_object(dir_folder);
+        if hr < 0 || menu_object.is_null() {
+            return Err(format!("CreateViewObject 0x{hr:08x}"));
+        }
+
+        // 3) 弹菜单（和文件项菜单同一套流程）
+        let menu_vtbl = *(menu_object as *mut *const ContextMenuVtbl);
+        let popup = CreatePopupMenu();
+        if popup.is_null() {
+            release_object(menu_object);
+            return Err("CreatePopupMenu failed".to_string());
+        }
+        let hr = ((*menu_vtbl).query_context_menu)(menu_object, popup, 0, 1, 0x7FFF, CMF_NORMAL);
+        if hr < 0 {
+            DestroyMenu(popup);
+            release_object(menu_object);
+            return Err(format!("QueryContextMenu 0x{hr:08x}"));
+        }
+
+        let owner_window = if owner != 0 {
+            owner as HWND
+        } else {
+            GetForegroundWindow()
+        };
+        let id = TrackPopupMenuEx(
+            popup,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            x,
+            y,
+            owner_window,
+            std::ptr::null(),
+        );
+        DestroyMenu(popup);
+        log::info!("background menu: picked id={id}");
+
+        if id != 0 {
+            // QueryContextMenu 从 1 开始编号，InvokeCommand 用相对偏移。
+            let command = CMINVOKECOMMANDINFO {
+                cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                fMask: 0,
+                hwnd: owner_window,
+                lpVerb: (id as u32 - 1) as usize as *const u8,
+                lpParameters: std::ptr::null(),
+                lpDirectory: std::ptr::null(),
+                nShow: SW_SHOWNORMAL,
+                dwHotKey: 0,
+                hIcon: std::ptr::null_mut(),
+            };
+            let _ = ((*menu_vtbl).invoke_command)(menu_object, &command);
+        }
+        release_object(menu_object);
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::format_accent;

@@ -2891,6 +2891,27 @@ fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String
         }
     }
 }
+/// 文件夹空白处的原生右键菜单（新建 / 粘贴 / 属性 / 刷新）。
+#[tauri::command]
+fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> {
+    log::info!("bg menu: invoked for {path}");
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err("目录已经不在了".to_string());
+    }
+    let (x, y) = hexbench_core::sys::cursor_position();
+    let owner = app
+        .get_webview_window("launcher")
+        .and_then(|window| window.hwnd().ok())
+        .map(|hwnd| hwnd.0 as isize)
+        .unwrap_or(0);
+    LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
+    let result = hexbench_core::sys::show_folder_background_menu(&dir, x, y, owner);
+    LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
+    // 菜单里可能新建了文件、也可能是「撤销」之类的操作：统一刷新一次。
+    let _ = app.emit("launcher-changed", ());
+    result
+}
 /// 面板里右键：弹出系统原生的文件菜单（和资源管理器同一套）。
 /// 面板里右键：系统原生菜单 + 自己补的重命名 / 删除。
 ///
@@ -3512,6 +3533,7 @@ pub fn run() {
             launcher_open,
             launcher_begin_drag,
             launcher_context_menu,
+    launcher_background_menu,
             launcher_rename,
             open_settings,
             launcher_set_drop_target,
