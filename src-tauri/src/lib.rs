@@ -2908,8 +2908,41 @@ fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> 
     LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
     let result = hexbench_core::sys::show_folder_background_menu(&dir, x, y, owner);
     LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
-    // 菜单里可能新建了文件、也可能是「撤销」之类的操作：统一刷新一次。
-    let _ = app.emit("launcher-changed", ());
+
+    // Explorer 的「新建 ▸ 文件夹」是先建出来再进入重命名的异步操作：
+    // 菜单一关就刷新往往太早，新条目还没落盘。这里轮询几秒，
+    // 目录一变就通知面板刷新；就算没变，最后也补一次。
+    let watch_dir = dir.clone();
+    let handle = app.clone();
+    thread::spawn(move || {
+        let snapshot = |path: &std::path::Path| -> (usize, u128) {
+            let mut count = 0usize;
+            let mut newest = 0u128;
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    count += 1;
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(delta) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                newest = newest.max(delta.as_millis());
+                            }
+                        }
+                    }
+                }
+            }
+            (count, newest)
+        };
+        let before = snapshot(&watch_dir);
+        for _ in 0..15 {
+            thread::sleep(Duration::from_millis(200));
+            if snapshot(&watch_dir) != before {
+                let _ = handle.emit("launcher-changed", ());
+                return;
+            }
+        }
+        let _ = handle.emit("launcher-changed", ());
+    });
+
     result
 }
 /// 面板里右键：弹出系统原生的文件菜单（和资源管理器同一套）。
