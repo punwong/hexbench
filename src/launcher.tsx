@@ -962,6 +962,23 @@ function Launcher() {
 
   // 侧边栏是「悬停即切换」，但鼠标划过整列时会一路触发，
   // 列表跟着重排，看起来就是分类和常用文件夹来回亮、来回跳。
+  // 主题跟随设置（不只是系统）：面板要跟设置窗口一致
+  useEffect(() => {
+    const apply = () =>
+      void invoke<string>("ui_theme_preference").then((preference) => {
+        const dark =
+          preference === "dark" ||
+          (preference === "system" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      });
+    apply();
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => apply();
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
+  }, []);
+
   // 高亮由 CSS :hover 立刻响应，这里只控制"切换内容"的时机。
   const hoverTimer = useRef<number | null>(null);
   const hoverOpen = (action: () => void) => {

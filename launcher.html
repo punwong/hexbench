@@ -19,19 +19,17 @@
         --ease: cubic-bezier(0.2, 0, 0, 1);
       }
 
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #0d0d0d;
-          --sidebar: #131313;
-          --surface: #191919;
-          --surface-2: #232323;
-          --text: #ececec;
-          --muted: #9b9b9b;
-          --line: rgba(255, 255, 255, 0.1);
-          --pick: rgba(255, 255, 255, 0.14);
-          --marquee-line: rgba(255, 255, 255, 0.35);
-          --marquee-fill: rgba(255, 255, 255, 0.07);
-        }
+      :root[data-theme="dark"] {
+        --bg: #0d0d0d;
+        --sidebar: #131313;
+        --surface: #191919;
+        --surface-2: #232323;
+        --text: #ececec;
+        --muted: #9b9b9b;
+        --line: rgba(255, 255, 255, 0.1);
+        --pick: rgba(255, 255, 255, 0.14);
+        --marquee-line: rgba(255, 255, 255, 0.35);
+        --marquee-fill: rgba(255, 255, 255, 0.07);
       }
 
       html,
@@ -95,18 +93,16 @@
         background-clip: padding-box;
       }
 
-      @media (prefers-color-scheme: dark) {
-        ::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.16);
-          border: 2px solid transparent;
-          background-clip: padding-box;
-        }
+      :root[data-theme="dark"] ::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.16);
+        border: 2px solid transparent;
+        background-clip: padding-box;
+      }
 
-        ::-webkit-scrollbar-thumb:hover {
-          background: rgba(255, 255, 255, 0.28);
-          border: 2px solid transparent;
-          background-clip: padding-box;
-        }
+      :root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 255, 255, 0.28);
+        border: 2px solid transparent;
+        background-clip: padding-box;
       }
       /* ---------- 侧边栏：从顶上一直到下，和设置窗口一致 ---------- */
 

@@ -17,17 +17,15 @@
         --accent: #2f6fed;
       }
 
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #0d0d0d;
-          --sidebar: #131313;
-          --surface: #191919;
-          --surface-2: #232323;
-          --text: #ececec;
-          --muted: #9b9b9b;
-          --line: rgba(255, 255, 255, 0.1);
-          --pick: rgba(255, 255, 255, 0.14);
-        }
+      :root[data-theme="dark"] {
+        --bg: #0d0d0d;
+        --sidebar: #131313;
+        --surface: #191919;
+        --surface-2: #232323;
+        --text: #ececec;
+        --muted: #9b9b9b;
+        --line: rgba(255, 255, 255, 0.1);
+        --pick: rgba(255, 255, 255, 0.14);
       }
 
       * { box-sizing: border-box; }
@@ -201,6 +199,17 @@
             /* 忽略 */
           }
           render();
+// 主题跟随设置（不只是系统）：网页窗口要和面板、设置窗口一致
+invoke("ui_theme_preference")
+  .then(function (preference) {
+    var dark =
+      preference === "dark" ||
+      (preference === "system" &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  })
+  .catch(function () {});
+
           invoke("web_page_open", { url: site.url }).catch(function (error) {
             showHint("打开失败：" + String(error));
           });

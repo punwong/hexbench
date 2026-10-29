@@ -260,6 +260,17 @@ fn snapshot(state: State<'_, AppState>) -> Snapshot {
     }
 }
 
+/// 主题偏好：system / light / dark。面板和网页窗口自己解析 system。
+#[tauri::command]
+fn ui_theme_preference(state: State<'_, AppState>) -> String {
+    let theme = state.shared.lock().unwrap().config.ui.theme;
+    match theme {
+        hexbench_core::config::Theme::Dark => "dark",
+        hexbench_core::config::Theme::Light => "light",
+        hexbench_core::config::Theme::System => "system",
+    }
+    .to_string()
+}
 #[tauri::command]
 fn save_config(
     config: Config,
@@ -3870,6 +3881,7 @@ pub fn run() {
             snapshot,
             diagnostics,
             save_config,
+    ui_theme_preference,
             set_paused,
             set_test_mode,
             refresh_layout,
