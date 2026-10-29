@@ -3606,6 +3606,7 @@ pub fn run() {
                 open_main_now(&handle);
             }
                     spawn_launcher_watcher(handle.clone());
+            #[cfg(debug_assertions)]
             spawn_selftest(handle.clone());
 
             // A tray app can run for days: checking only at launch would mean
