@@ -67,7 +67,7 @@ const SORT_LABELS: Record<SortKey, string> = {
 type Scope =
   | { kind: "all" }
   /** 一棵真实的目录树：某个分类，或者一个常用文件夹。 */
-  | { kind: "folder"; base: string; label: string };
+  | { kind: "folder"; base: string; label: string; pinned?: boolean };
 
 /** 快捷方式不显示后缀，和资源管理器的观感一致。 */
 function displayName(name: string): string {
@@ -631,7 +631,7 @@ function Launcher() {
   const openPinned = useCallback(
     (folder: string) => {
       go({
-        scope: { kind: "folder", base: folder, label: folderLabel(folder) },
+        scope: { kind: "folder", base: folder, label: folderLabel(folder), pinned: true },
         path: folder,
       });
     },
@@ -1034,7 +1034,9 @@ function Launcher() {
   };
 
   const hasRoot = root.root.trim().length > 0;
-  const activeId = scope.kind === "all" ? "__all__" : scope.base;
+  // 同一个路径可能既是分类又是常用文件夹，id 要带来源，否则两个一起亮。
+  const activeId =
+    scope.kind === "all" ? "__all__" : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
   const baseLabel = scope.kind === "all" ? "全部" : scope.label;
 
   // 无边框窗口没有系统缩放边框，放 8 个小手柄交给系统去做缩放。
@@ -1125,7 +1127,7 @@ function Launcher() {
           <button
             type="button"
             key={category.path}
-            className={`side-item${activeId === category.path ? " active" : ""}`}
+            className={`side-item${activeId === `cat:${category.path}` ? " active" : ""}`}
             data-side={category.path}
             onClick={() => openCategory(category)}
             onContextMenu={(event) => {
@@ -1139,10 +1141,9 @@ function Launcher() {
               });
             }}
             onMouseEnter={() => {
-              if (activeId !== category.path) hoverOpen(() => openCategory(category));
+              if (activeId !== `cat:${category.path}`) hoverOpen(() => openCategory(category));
             }}
             onMouseLeave={hoverCancel}
-            title={category.path}
           >
             <span>{category.name}</span>
           </button>
@@ -1156,7 +1157,7 @@ function Launcher() {
           <button
             type="button"
             key={folder}
-            className={`side-item${activeId === folder ? " active" : ""}`}
+            className={`side-item${activeId === `pin:${folder}` ? " active" : ""}`}
             data-side={folder}
             onClick={() => openPinned(folder)}
             onContextMenu={(event) => {
@@ -1165,10 +1166,9 @@ function Launcher() {
               setSideMenu({ x: event.clientX, y: event.clientY, path: folder, label: folderLabel(folder) });
             }}
             onMouseEnter={() => {
-              if (activeId !== folder) hoverOpen(() => openPinned(folder));
+              if (activeId !== `pin:${folder}`) hoverOpen(() => openPinned(folder));
             }}
             onMouseLeave={hoverCancel}
-            title={folder}
           >
             <span>{folderLabel(folder)}</span>
           </button>
