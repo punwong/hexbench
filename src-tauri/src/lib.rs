@@ -2927,9 +2927,16 @@ fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> 
         .and_then(|window| window.hwnd().ok())
         .map(|hwnd| hwnd.0 as isize)
         .unwrap_or(0);
+    // 剪贴板里有文件时才让「粘贴」可用
+    let can_paste = hexbench_core::shell_ops::clipboard_get_files().is_some();
     LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
-    let result = hexbench_core::sys::show_folder_background_menu(&dir, x, y, owner);
+    let result = hexbench_core::sys::show_folder_background_menu(&dir, x, y, owner, can_paste);
     LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
+    if let Ok(Some("paste")) = &result {
+        if let Err(error) = hexbench_core::shell_ops::paste_into(&dir) {
+            log::warn!("background menu: paste failed: {error}");
+        }
+    }
 
     // Explorer 的「新建 ▸ 文件夹」是先建出来再进入重命名的异步操作：
     // 菜单一关就刷新往往太早，新条目还没落盘。这里轮询几秒，
@@ -2965,7 +2972,7 @@ fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> 
         let _ = handle.emit("launcher-changed", ());
     });
 
-    result
+    result.map(|_| ())
 }
 /// 面板里右键：弹出系统原生的文件菜单（和资源管理器同一套）。
 /// 面板里右键：系统原生菜单 + 自己补的重命名 / 删除。

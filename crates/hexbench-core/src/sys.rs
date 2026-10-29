@@ -50,7 +50,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MSG,
     SetCursorPos, SetWindowLongW, SetWindowPos, TranslateMessage, WindowFromPoint,
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuStringW, InsertMenuW,
-    TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
+    TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_GRAYED, MF_SEPARATOR, MF_STRING,
     WINEVENT_OUTOFCONTEXT, GA_ROOT, GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
@@ -1593,7 +1593,11 @@ pub fn show_folder_background_menu(
     x: i32,
     y: i32,
     owner: isize,
-) -> Result<(), String> {
+    can_paste: bool,
+) -> Result<Option<&'static str>, String> {
+    /// 自己加的「粘贴」用高位 id，避开 Shell 的 1..0x7FFF。
+    const CMD_PASTE: u32 = 0x8001;
+    let choice: Option<&'static str> = None;
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = dir
         .as_os_str()
@@ -1683,6 +1687,17 @@ pub fn show_folder_background_menu(
             return Err(format!("QueryContextMenu 0x{hr:08x}"));
         }
 
+        // 文件夹自身的 IContextMenu 只有扩展项（Git / VS / 新建…）；
+        // 标准项（粘贴 / 查看 / 刷新）在 Shell 视图对象里，这里自己补一个「粘贴」。
+        InsertMenuW(
+            popup,
+            0,
+            MF_BYPOSITION | MF_STRING | if can_paste { 0 } else { MF_GRAYED },
+            CMD_PASTE as usize,
+            windows_sys::core::w!("粘贴(&P)"),
+        );
+        InsertMenuW(popup, 1, MF_BYPOSITION | MF_SEPARATOR, 0, std::ptr::null());
+
         let owner_window = if owner != 0 {
             owner as HWND
         } else {
@@ -1698,6 +1713,11 @@ pub fn show_folder_background_menu(
         );
         DestroyMenu(popup);
         log::info!("background menu: picked id={id}");
+
+        if id as u32 == CMD_PASTE {
+            release_object(menu_object);
+            return Ok(Some("paste"));
+        }
 
         if id != 0 {
             // QueryContextMenu 从 1 开始编号，InvokeCommand 用相对偏移。
@@ -1715,7 +1735,7 @@ pub fn show_folder_background_menu(
             let _ = ((*menu_vtbl).invoke_command)(menu_object, &command);
         }
         release_object(menu_object);
-        Ok(())
+        Ok(choice)
     }
 }
 #[cfg(test)]

@@ -310,16 +310,25 @@ pub fn clipboard_get_files() -> Option<(Vec<PathBuf>, bool)> {
 /// 粘贴：读剪贴板，再按「复制 / 剪切」执行到 `dest`。
 pub fn paste_into(dest: &Path) -> Result<usize, String> {
     let Some((paths, cut)) = clipboard_get_files() else {
+        log::warn!("paste: clipboard has no files");
         return Err("剪贴板里没有文件".to_string());
     };
+    log::info!(
+        "paste: {} items cut={cut} -> {}",
+        paths.len(),
+        dest.display()
+    );
     if cut {
         let moved = move_into(&paths, dest)?;
+        log::info!("paste: moved {moved}");
         // 剪切完成后清空剪贴板里的「剪切」标记（换成复制语义），
         // 否则再粘贴一次会重复搬同一个文件。
         let _ = clipboard_set_files(&[], false);
         Ok(moved)
     } else {
-        copy_into(&paths, dest)
+        let copied = copy_into(&paths, dest)?;
+        log::info!("paste: copied {copied}");
+        Ok(copied)
     }
 }
 
