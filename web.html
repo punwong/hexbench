@@ -55,7 +55,7 @@
       }
 
       /* 与面板 .toolbar 完全一致：40px 高、左右 12 留白、发丝下边框 */
-      #bar {
+      #bar { -webkit-app-region: drag;
         display: flex;
         align-items: center;
         gap: 4px;
@@ -79,7 +79,7 @@
       #tabs::-webkit-scrollbar { display: none; }
 
       /* 站点标签：和面板里的图标按钮同样的尺寸与圆角 */
-      .tab {
+      .tab { -webkit-app-region: no-drag;
         flex: 0 0 auto;
         display: inline-flex;
         align-items: center;
@@ -138,7 +138,7 @@
     </style>
   </head>
   <body>
-    <div id="bar">
+    <div id="bar" data-tauri-drag-region>
       <div id="tabs"><span class="hint">加载中…</span></div>
       <button class="btn" id="reload" title="刷新网页">⟳</button>
     </div>

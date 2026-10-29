@@ -1946,6 +1946,8 @@ fn hide_launcher(app: &AppHandle) {
         let _ = window.hide();
     // 网页窗口是独立窗口：面板收起时一起隐藏
     if let Some(web) = web_window_handle() {
+        // 收起前存一次：节流可能把最后一次拖动丢掉，这里以窗口实际状态为准
+        store_current_web_geometry(&web);
         let _ = web.hide();
     }
     }
@@ -2199,6 +2201,20 @@ fn store_web_geometry(app: &AppHandle, x: i32, y: i32, w: u32, h: u32) {
     }
 }
 
+/// 按窗口当前实际位置和大小写一次配置（收起/摆放后调用最可靠）。
+fn store_current_web_geometry(window: &tauri::WebviewWindow) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
+        return;
+    };
+    store_web_geometry(
+        window.app_handle(),
+        (position.x as f64 / scale).round() as i32,
+        (position.y as f64 / scale).round() as i32,
+        (size.width as f64 / scale).round() as u32,
+        (size.height as f64 / scale).round() as u32,
+    );
+}
 /// 用户拖动网页窗口（移动或拖边角改大小）后：重排子网页 + 记住几何。
 fn remember_web_geometry(window: &tauri::WebviewWindow) {
     // 隐藏/显示过程中系统会上报一个临时位置（比如 130,130），
