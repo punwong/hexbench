@@ -271,6 +271,39 @@ fn ui_theme_preference(state: State<'_, AppState>) -> String {
     }
     .to_string()
 }
+/// 主题变了就主动推给常驻窗口。
+///
+/// 呼出面板和网页窗口是常驻的（只是 hide/show），改设置不会让它们重新加载，
+/// 页面里那一次 useEffect 也就不会重跑，所以必须从这边发一段 JS 过去。
+fn push_theme_to_windows(app: &AppHandle) {
+    let theme = app.state::<AppState>().shared.lock().unwrap().config.ui.theme;
+    let system_dark = app
+        .get_webview_window("launcher")
+        .and_then(|window| window.theme().ok())
+        .map(|theme| matches!(theme, tauri::Theme::Dark))
+        .unwrap_or(false);
+    let value = match theme {
+        hexbench_core::config::Theme::Dark => "dark",
+        hexbench_core::config::Theme::Light => "light",
+        hexbench_core::config::Theme::System => {
+            if system_dark {
+                "dark"
+            } else {
+                "light"
+            }
+        }
+    };
+    let script = format!("document.documentElement.dataset.theme = '{value}';");
+    for label in ["launcher", WEB_PANEL] {
+        if label == WEB_PANEL {
+            if let Some(window) = web_window_handle() {
+                let _ = window.eval(&script);
+            }
+        } else if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&script);
+        }
+    }
+}
 #[tauri::command]
 fn save_config(
     config: Config,
@@ -1910,6 +1943,8 @@ fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))
     // 网页模式下窗口是竖版的：这时候再按配置的 50%×50% 摆一次，
     // 网页仍按竖版矩形挂着，两边尺寸对不上就是「排版错位」。
     let _ = window.show();
+    // 每次呼出都同步一次主题：设置里改了颜色，常驻窗口要跟上。
+    push_theme_to_windows(window.app_handle());
     // 设置里开了内置网页：把预建好的网页窗口摆到右侧并显示
     // （只 show，不在这里创建窗口——运行中建窗口会卡住面板）。
     {
