@@ -2073,53 +2073,95 @@ fn ensure_web_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Ok(mut held) = WEB_WINDOW.lock() {
         *held = Some(built.clone());
     }
+    // 拖动 / 改大小：重排子网页并记住几何
+    {
+        let probe = built.clone();
+        built.on_window_event(move |event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+            ) {
+                remember_web_geometry(&probe);
+            }
+        });
+    }
     Ok(built)
 }
 
 /// 摆网页窗口：默认固定贴屏幕一侧；勾了「跟随面板」才贴到面板右边。
 fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
-    let (width_percent, height_percent, follow, side) = {
+    let (width_percent, height_percent, follow, side, saved) = {
         let state = app.state::<AppState>();
         let shared = state.shared.lock().unwrap();
+        let launcher = &shared.config.launcher;
+        let pct_w = launcher.site_width_percent.clamp(10, 90);
+        let pct_h = launcher.site_height_percent.clamp(20, 100);
+        // 拖动保存的几何只在百分比没被改过时才算数；
+        // 用户在设置里改了百分比，就重新按百分比摆。
+        let saved = (launcher.site_w > 0
+            && launcher.site_pct_w == pct_w
+            && launcher.site_pct_h == pct_h)
+            .then_some((
+                launcher.site_x,
+                launcher.site_y,
+                launcher.site_w as f64,
+                launcher.site_h as f64,
+            ));
         (
-            shared.config.launcher.site_width_percent.clamp(10, 90),
-            shared.config.launcher.site_height_percent.clamp(20, 100),
-            shared.config.launcher.site_follow_panel,
-            shared.config.launcher.site_side.clone(),
+            pct_w,
+            pct_h,
+            launcher.site_follow_panel,
+            launcher.site_side.clone(),
+            saved,
         )
     };
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
     let (area_x, area_y, area_w, area_h) =
         hexbench_core::sys::work_area_at(cursor_x, cursor_y).unwrap_or((0, 0, 1920, 1080));
-    let width = (area_w as f64 * width_percent as f64 / 100.0).max(240.0);
-    let height = (area_h as f64 * height_percent as f64 / 100.0).max(240.0);
 
-    let (left, top) = if follow {
-        match app.get_webview_window("launcher") {
-            Some(panel) => {
-                let scale = panel.scale_factor().unwrap_or(1.0);
-                match (panel.outer_position(), panel.inner_size()) {
-                    (Ok(position), Ok(size)) => (
-                        (position.x as f64 / scale + size.width as f64 / scale + 8.0).round(),
-                        (position.y as f64 / scale).round(),
-                    ),
-                    _ => (area_x as f64, area_y as f64),
-                }
-            }
-            None => (area_x as f64, area_y as f64),
-        }
-    } else if side == "left" {
-        (area_x as f64, area_y as f64 + (area_h as f64 - height) / 2.0)
+    let (width, height, left, top) = if let Some((saved_x, saved_y, saved_w, saved_h)) = saved {
+        // 用户拖过：位置和大小都按他拖出来的来
+        (saved_w, saved_h, saved_x as f64, saved_y as f64)
     } else {
-        (
-            area_x as f64 + area_w as f64 - width,
-            area_y as f64 + (area_h as f64 - height) / 2.0,
-        )
+        let width = (area_w as f64 * width_percent as f64 / 100.0).max(240.0);
+        let height = (area_h as f64 * height_percent as f64 / 100.0).max(240.0);
+        let (left, top) = if follow {
+            match app.get_webview_window("launcher") {
+                Some(panel) => {
+                    let scale = panel.scale_factor().unwrap_or(1.0);
+                    match (panel.outer_position(), panel.inner_size()) {
+                        (Ok(position), Ok(size)) => (
+                            (position.x as f64 / scale + size.width as f64 / scale + 8.0).round(),
+                            (position.y as f64 / scale).round(),
+                        ),
+                        _ => (area_x as f64, area_y as f64),
+                    }
+                }
+                None => (area_x as f64, area_y as f64),
+            }
+        } else if side == "left" {
+            (area_x as f64, area_y as f64 + (area_h as f64 - height) / 2.0)
+        } else {
+            (
+                area_x as f64 + area_w as f64 - width,
+                area_y as f64 + (area_h as f64 - height) / 2.0,
+            )
+        };
+        (width, height, left, top)
     };
+
     let _ = web.set_size(tauri::LogicalSize::new(width, height));
     let _ = web.set_position(tauri::LogicalPosition::new(left, top));
-    // 子 WebView 是按创建时的窗口尺寸摆的，窗口改过大小必须重排一次，
-    // 否则它会留在旧位置/旧尺寸，看起来就是「网页内容空白」。
+    reflow_site_page(app, width, height);
+    log::info!("web: placed at {left},{top} {width}x{height} follow={follow}");
+    store_web_geometry(app, left.round() as i32, top.round() as i32, width.round() as u32, height.round() as u32);
+}
+
+/// 子 WebView 按窗口尺寸重新排版。
+///
+/// 它是按创建时的窗口尺寸摆的，窗口一旦改大小（程序改或用户拖边角），
+/// 不重排就会留在旧位置/旧尺寸 —— 表现就是「网页内容空白」。
+fn reflow_site_page(app: &AppHandle, width: f64, height: f64) {
     if let Some(page) = app.get_webview(SITE_WEBVIEW) {
         let _ = page.set_position(tauri::LogicalPosition::new(1.0, WEB_TOOLBAR));
         let _ = page.set_size(tauri::LogicalSize::new(
@@ -2127,9 +2169,74 @@ fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
             (height - WEB_TOOLBAR - 1.0).max(80.0),
         ));
     }
-    log::info!("web: placed at {left},{top} {width}x{height} follow={follow}");
 }
 
+/// 把网页窗口的几何写进配置（立即落盘，调用方负责防抖）。
+fn store_web_geometry(app: &AppHandle, x: i32, y: i32, w: u32, h: u32) {
+    let config = {
+        let state = app.state::<AppState>();
+        let mut shared = state.shared.lock().unwrap();
+        let launcher = &mut shared.config.launcher;
+        launcher.site_x = x;
+        launcher.site_y = y;
+        launcher.site_w = w;
+        launcher.site_h = h;
+        launcher.site_pct_w = launcher.site_width_percent.clamp(10, 90);
+        launcher.site_pct_h = launcher.site_height_percent.clamp(20, 100);
+        shared.config.clone()
+    };
+    let state = app.state::<AppState>();
+    if let Err(error) = hexbench_core::config::save(&state.config_path, &config) {
+        log::warn!("web: save geometry failed: {error}");
+    } else {
+        log::info!("web: geometry saved {w}x{h} at {x},{y}");
+    }
+}
+
+/// 用户拖动网页窗口（移动或拖边角改大小）后：重排子网页 + 记住几何。
+fn remember_web_geometry(window: &tauri::WebviewWindow) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
+        return;
+    };
+    let x = (position.x as f64 / scale).round() as i32;
+    let y = (position.y as f64 / scale).round() as i32;
+    let w = (size.width as f64 / scale).round() as u32;
+    let h = (size.height as f64 / scale).round() as u32;
+    // 拖边角时子网页要跟着变，否则看起来像卡住了
+    reflow_site_page(window.app_handle(), w as f64, h as f64);
+
+    // 拖动过程会持续触发，落盘做 800ms 防抖
+    static LAST_SAVE: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|delta| delta.as_millis() as u64)
+        .unwrap_or(0);
+    if now.saturating_sub(LAST_SAVE.load(Ordering::Relaxed)) < 800 {
+        return;
+    }
+    LAST_SAVE.store(now, Ordering::Relaxed);
+
+    let handle = window.app_handle().clone();
+    let config = {
+        let state = handle.state::<AppState>();
+        let mut shared = state.shared.lock().unwrap();
+        let launcher = &mut shared.config.launcher;
+        launcher.site_x = x;
+        launcher.site_y = y;
+        launcher.site_w = w;
+        launcher.site_h = h;
+        launcher.site_pct_w = launcher.site_width_percent.clamp(10, 90);
+        launcher.site_pct_h = launcher.site_height_percent.clamp(20, 100);
+        shared.config.clone()
+    };
+    let state = handle.state::<AppState>();
+    if let Err(error) = hexbench_core::config::save(&state.config_path, &config) {
+        log::warn!("web: save geometry failed: {error}");
+    } else {
+        log::info!("web: geometry saved {w}x{h} at {x},{y}");
+    }
+}
 
 
 

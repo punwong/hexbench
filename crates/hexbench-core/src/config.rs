@@ -188,6 +188,14 @@ pub struct LauncherSettings {
     pub site_follow_panel: bool,
     /// 固定位置时贴哪一侧："left" 或 "right"。
     pub site_side: String,
+    /// 用户拖动出来的位置和大小（逻辑像素）。0 表示没拖过。
+    pub site_x: i32,
+    pub site_y: i32,
+    pub site_w: u32,
+    pub site_h: u32,
+    /// 保存这份几何时用的百分比：设置里改了百分比就作废，重新按百分比算。
+    pub site_pct_w: u32,
+    pub site_pct_h: u32,
     /// 在面板里隐藏的项：分类名，或 `__all__` 表示「全部」那一项。
     /// 默认只列分类，不要「全部」——启动器里它太干扰。
     pub hidden_categories: Vec<String>,
@@ -228,6 +236,12 @@ impl Default for LauncherSettings {
             site_height_percent: 85,
             site_follow_panel: false,
             site_side: "right".to_string(),
+            site_x: 0,
+            site_y: 0,
+            site_w: 0,
+            site_h: 0,
+            site_pct_w: 0,
+            site_pct_h: 0,
             legacy_folder: String::new(),
             // 默认就是「贴着鼠标 + 面板占一半」，和产品设定一致。
             follow_cursor: true,
