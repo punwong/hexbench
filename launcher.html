@@ -132,6 +132,7 @@
         border: none;
         border-radius: 9px;
         background: transparent;
+        transition: background 110ms ease;
         color: var(--text);
         font: inherit;
         font-size: 13px;
@@ -144,6 +145,11 @@
       .side-item span:first-child {
         overflow: hidden;
         text-overflow: ellipsis;
+      }
+
+      /* 悬停立刻给反馈，切换内容可以稍慢，避免"高亮跟不上鼠标" */
+      .side-item:hover {
+        background: var(--surface-2, rgba(0, 0, 0, 0.05));
       }
 
       .side-item.active {

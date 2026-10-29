@@ -962,14 +962,14 @@ function Launcher() {
 
   // 侧边栏是「悬停即切换」，但鼠标划过整列时会一路触发，
   // 列表跟着重排，看起来就是分类和常用文件夹来回亮、来回跳。
-  // 改成停留一小会儿才切。
+  // 高亮由 CSS :hover 立刻响应，这里只控制"切换内容"的时机。
   const hoverTimer = useRef<number | null>(null);
   const hoverOpen = (action: () => void) => {
     if (hoverTimer.current !== null) window.clearTimeout(hoverTimer.current);
     hoverTimer.current = window.setTimeout(() => {
       hoverTimer.current = null;
       action();
-    }, 160);
+    }, 45);
   };
   const hoverCancel = () => {
     if (hoverTimer.current !== null) {
