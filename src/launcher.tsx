@@ -4,6 +4,20 @@ import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } fr
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+/** "top:0;left:8px" → { top: "0", left: "8px" }，省得写 8 组 style 对象。 */
+function cssFrom(source: string): Record<string, string> {
+  return Object.fromEntries(
+    source
+      .split(";")
+      .filter(Boolean)
+      .map((pair) => {
+        const [name, value] = pair.split(":");
+        return [name.replace(/-(\w)/g, (_, letter: string) => letter.toUpperCase()), value];
+      }),
+  );
+}
 
 type LauncherItem = {
   name: string;
@@ -1005,6 +1019,34 @@ function Launcher() {
   const activeId = scope.kind === "all" ? "__all__" : scope.base;
   const baseLabel = scope.kind === "all" ? "全部" : scope.label;
 
+  // 无边框窗口没有系统缩放边框，放 8 个小手柄交给系统去做缩放。
+  const resizeHandles = (
+    <>
+      {(
+        [
+          ["n", "North", "ns-resize", "top:0;left:8px;right:8px;height:5px"],
+          ["s", "South", "ns-resize", "bottom:0;left:8px;right:8px;height:5px"],
+          ["w", "West", "ew-resize", "left:0;top:8px;bottom:8px;width:5px"],
+          ["e", "East", "ew-resize", "right:0;top:8px;bottom:8px;width:5px"],
+          ["nw", "NorthWest", "nwse-resize", "top:0;left:0;width:10px;height:10px"],
+          ["ne", "NorthEast", "nesw-resize", "top:0;right:0;width:10px;height:10px"],
+          ["sw", "SouthWest", "nesw-resize", "bottom:0;left:0;width:10px;height:10px"],
+          ["se", "SouthEast", "nwse-resize", "bottom:0;right:0;width:10px;height:10px"],
+        ] as const
+      ).map(([key, direction, cursor, style]) => (
+        <div
+          key={key}
+          style={{ position: "fixed", zIndex: 9999, cursor, ...cssFrom(style) }}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void getCurrentWindow().startResizeDragging(direction);
+          }}
+        />
+      ))}
+    </>
+  );
+
   return (
     <div
       className="palette"
@@ -1013,6 +1055,7 @@ function Launcher() {
         if (sideMenu) setSideMenu(null);
       }}
     >
+      {resizeHandles}
       <aside
         className="sidebar"
         onContextMenu={(event) => {

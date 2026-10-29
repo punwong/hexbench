@@ -1697,6 +1697,7 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         .inner_size(780.0, 500.0)
         .min_inner_size(520.0, 320.0)
         .decorations(false)
+        .resizable(true)
         .zoom_hotkeys_enabled(false)
         // 透明窗口 + 改尺寸是已知坏组合（issue #13906、PR #16192）：
         // 页面会错位/溢出，窗口尺寸也可能不生效。圆角改用 DWM 设置。
@@ -1784,14 +1785,29 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 fn place_launcher(window: &tauri::WebviewWindow, follow_cursor: bool, size_percent: (u32, u32)) {
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
     let area = hexbench_core::sys::work_area_at(cursor_x, cursor_y);
+    // 拖过就按拖出来的尺寸；否则按百分比。
+    let saved_size = {
+        let state = window.state::<AppState>();
+        let shared = state.shared.lock().unwrap();
+        let launcher = &shared.config.launcher;
+        (launcher.panel_remember_size
+            && launcher.panel_w > 0
+            && launcher.panel_pct_w == launcher.width_percent.clamp(10, 100)
+            && launcher.panel_pct_h == launcher.height_percent.clamp(10, 100))
+            .then_some((launcher.panel_w, launcher.panel_h))
+    };
+
     // 尺寸按工作区的百分比算，换显示器也不会一下子占满或小得没法用。
-    let (width, height) = match area {
+    let (width, height) = match saved_size {
+        Some((saved_w, saved_h)) => (saved_w as i32, saved_h as i32),
+        None => match area {
         Some((left, top, right, bottom)) => {
             let width = ((right - left) * size_percent.0 as i32 / 100).clamp(520, 1400);
             let height = ((bottom - top) * size_percent.1 as i32 / 100).clamp(320, 1100);
             (width, height)
         }
         None => (780, 500),
+        },
     };
     let _ = window.set_size(tauri::PhysicalSize::new(
         width as u32,
@@ -1943,6 +1959,7 @@ fn hide_launcher(app: &AppHandle) {
         app.get_webview_window(SITE_WEBVIEW).is_some()
     );
     if let Some(window) = app.get_webview_window("launcher") {
+        store_panel_size(&window);
         let _ = window.hide();
     // 网页窗口是独立窗口：面板收起时一起隐藏
     if let Some(web) = web_window_handle() {
@@ -2267,6 +2284,35 @@ fn remember_web_geometry(window: &tauri::WebviewWindow) {
 
 
 
+/// 记下用户拖出来的面板尺寸（收起时调用最可靠）。
+fn store_panel_size(window: &tauri::WebviewWindow) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let Ok(size) = window.inner_size() else {
+        return;
+    };
+    let width = (size.width as f64 / scale).round() as u32;
+    let height = (size.height as f64 / scale).round() as u32;
+    if width < 240 || height < 160 {
+        return;
+    }
+    let app = window.app_handle();
+    let config = {
+        let state = app.state::<AppState>();
+        let mut shared = state.shared.lock().unwrap();
+        let launcher = &mut shared.config.launcher;
+        launcher.panel_w = width;
+        launcher.panel_h = height;
+        launcher.panel_pct_w = launcher.width_percent.clamp(10, 100);
+        launcher.panel_pct_h = launcher.height_percent.clamp(10, 100);
+        shared.config.clone()
+    };
+    let state = app.state::<AppState>();
+    if let Err(error) = hexbench_core::config::save(&state.config_path, &config) {
+        log::warn!("launcher: save size failed: {error}");
+    } else {
+        log::info!("launcher: size saved {width}x{height}");
+    }
+}
 /// 网页窗口的句柄。
 ///
 /// 不能用 `get_webview_window("web")` 去找：实测这个窗口的 webview 注册了、

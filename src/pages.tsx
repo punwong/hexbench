@@ -1447,6 +1447,13 @@ export function LauncherPage({
               </span>
             </div>
           </Row>
+
+          <Row label="记住拖出来的面板大小">
+            <Toggle
+              checked={config.launcher.panelRememberSize ?? true}
+              onChange={(next) => update({ launcher: { panelRememberSize: next } })}
+            />
+          </Row>
           <Row label="面板宽度" hint="占所在屏幕工作区宽度的百分比">
             <Slider
               value={config.launcher.widthPercent}

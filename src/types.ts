@@ -103,6 +103,8 @@ export interface LauncherSettings {
   followCursor: boolean;
   /** 面板宽度占工作区百分比 */
   widthPercent: number;
+  /** 是否记住拖出来的面板大小 */
+  panelRememberSize: boolean;
   /** 面板高度占工作区百分比 */
   heightPercent: number;
   /** 呼出时回到上次浏览的位置 */

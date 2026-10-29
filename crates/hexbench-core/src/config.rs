@@ -210,6 +210,14 @@ pub struct LauncherSettings {
     pub width_percent: u32,
     /// 面板高度，占屏幕工作区的百分比。
     pub height_percent: u32,
+    /// 是否记住拖出来的面板大小。
+    pub panel_remember_size: bool,
+    /// 拖出来的面板尺寸（逻辑像素），0 表示没拖过。
+    pub panel_w: u32,
+    pub panel_h: u32,
+    /// 保存这份尺寸时用的百分比，改百分比就作废。
+    pub panel_pct_w: u32,
+    pub panel_pct_h: u32,
     /// 视图：grid（图标）或 list（列表）。
     pub view: String,
     /// 排序字段：name / modified / size / type。
@@ -249,6 +257,11 @@ impl Default for LauncherSettings {
             // 默认就是「贴着鼠标 + 面板占一半」，和产品设定一致。
             follow_cursor: true,
             width_percent: 50,
+            panel_remember_size: true,
+            panel_w: 0,
+            panel_h: 0,
+            panel_pct_w: 0,
+            panel_pct_h: 0,
             height_percent: 50,
             view: "grid".to_string(),
             sort_key: "name".to_string(),
