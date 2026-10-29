@@ -62,15 +62,15 @@ const TITLES: Record<Page, { title: string; subtitle: string }> = {
 
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
-  const [launcherTab, setLauncherTab] = useState<"items" | "staging">("items");
+  const [launcherTab, setLauncherTab] = useState<"items" | "folders">("items");
   // 面板里点「去设置」：切到指定页面（可带 tab）。
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<{ page: string; tab: string | null } | null>("navigate", (event) => {
       const target = event.payload?.page ?? "overview";
       const tab = event.payload?.tab ?? null;
-      if (target === "launcher" && (tab === "items" || tab === "staging")) {
-        setLauncherTab(tab);
+      if (target === "launcher" && (tab === "items" || tab === "folders")) {
+        setLauncherTab(tab as "items" | "folders");
       }
       setPage(target as Page);
     }).then((fn) => {
@@ -214,7 +214,6 @@ export default function App() {
       guard: { ...current.guard, ...patch.guard },
       hotkeys: { ...current.hotkeys, ...patch.hotkeys },
       phrases: { ...current.phrases, ...patch.phrases },
-      staging: { ...current.staging, ...patch.staging },
       launcher: { ...current.launcher, ...patch.launcher },
       updates: { ...current.updates, ...patch.updates },
       ui: { ...current.ui, ...patch.ui },

@@ -14,11 +14,14 @@ type LauncherItem = {
   icon: string | null;
 };
 
-type Category = { name: string; path: string; count: number };
+type Category = { name: string; path: string; count: number; hidden: boolean };
 type LauncherRoot = {
   root: string;
+  /** 「全部」要不要出现在侧边栏 */
+  allVisible: boolean;
   categories: Category[];
-  staging: string;
+  /** 常用文件夹，顺序就是侧边栏顺序 */
+  folders: string[];
   view: string;
   sortKey: string;
   sortDir: number;
@@ -28,7 +31,6 @@ type LauncherRoot = {
   lastLabel: string;
   lastPath: string;
 };
-type LauncherListing = { folder: string; exists: boolean; items: LauncherItem[] };
 
 type SortKey = "name" | "modified" | "size" | "type";
 
@@ -46,8 +48,20 @@ const SORT_LABELS: Record<SortKey, string> = {
 /** 面板现在浏览的是哪一片区域。 */
 type Scope =
   | { kind: "all" }
-  /** 一棵真实的目录树：某个分类，或者中转站。 */
+  /** 一棵真实的目录树：某个分类，或者一个常用文件夹。 */
   | { kind: "folder"; base: string; label: string };
+
+/** 快捷方式不显示后缀，和资源管理器的观感一致。 */
+function displayName(name: string): string {
+  return name.replace(/\.(lnk|url)$/i, "");
+}
+
+/** 路径的最后一段，用来当常用文件夹的名字。 */
+function folderLabel(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const index = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+}
 
 type Snapshot = { scope: Scope; path: string };
 
@@ -109,8 +123,9 @@ function Launcher() {
   // 数据
   const [root, setRoot] = useState<LauncherRoot>({
     root: "",
+    allVisible: false,
     categories: [],
-    staging: "",
+    folders: [],
     view: "grid",
     sortKey: "name",
     sortDir: 1,
@@ -120,7 +135,6 @@ function Launcher() {
     lastLabel: "",
     lastPath: "",
   });
-  const [staging, setStaging] = useState<LauncherListing | null>(null);
   const [allCache, setAllCache] = useState<Record<string, LauncherItem[]>>({});
   const [items, setItems] = useState<LauncherItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -159,6 +173,20 @@ function Launcher() {
   const [picked, setPicked] = useState<Set<string>>(() => new Set());
   // 拖拽悬停在哪一行/格子上（只对文件夹有意义）
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  // 侧边栏右键菜单 + 内联输入（新建 / 重命名分类）
+  const [sideMenu, setSideMenu] = useState<{
+    x: number;
+    y: number;
+    path: string;
+    label: string;
+  } | null>(null);
+  const [sideInput, setSideInput] = useState<{
+    kind: "new" | "rename";
+    path: string;
+    value: string;
+  } | null>(null);
+  // 拖拽结束后逼加载器重跑一次（拖拽期间可能停在没缓存的目录上）。
+  const [loadTick, setLoadTick] = useState(0);
   // 顶部飘一句提示：改名/移动失败时得让人看见原因。
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
@@ -183,19 +211,22 @@ function Launcher() {
   const skipCommit = useRef(false);
   const renameInputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const stagingRoot = staging?.folder ?? "";
   // 拖放回调是在挂载时注册的，读不到最新状态，用 ref 兜住。
   const shownRef = useRef<LauncherItem[]>([]);
   const currentDirRef = useRef("");
   const refreshRef = useRef<() => void>(() => {});
   const showToastRef = useRef<(message: string) => void>(() => {});
+  // 拖拽时回调闭包里读不到最新状态：把「当前分类」和「点某个分类要做什么」放进来。
+  const activeIdRef = useRef("__all__");
+  // 拖拽进行中：主线程被 DoDragDrop 占着，取目录的命令发不出去。
+  const dragActiveRef = useRef(false);
+  const sidesRef = useRef<Record<string, () => void>>({});
   const base = scope.kind === "folder" ? scope.base : "";
   const currentDir = scope.kind === "folder" ? path || scope.base : root.root;
 
   const reload = useCallback(async (): Promise<LauncherRoot | null> => {
     const listing = await invoke<LauncherRoot>("launcher_categories");
     setRoot(listing);
-    setStaging(await invoke<LauncherListing>("launcher_listing"));
     const loaded: Record<string, LauncherItem[]> = {};
     if (listing.categories.length <= 12) {
       for (const category of listing.categories) {
@@ -213,12 +244,12 @@ function Launcher() {
   const restore = useCallback(
     (listing: LauncherRoot | null) => {
       // 上次的位置还得存在：分类换过 / 目录删了，就退回「全部」。
-      // 这里必须用接口刚返回的 staging，而不是组件状态——调用这一刻状态还是旧的。
+      // 这里必须用接口刚返回的数据，而不是组件状态——调用这一刻状态还是旧的。
       const base = listing?.lastBase ?? "";
       const known =
         !!base &&
         (listing?.categories.some((category) => category.path === base) ||
-          base === listing?.staging);
+          (listing?.folders ?? []).includes(base));
       if (listing) {
         if (listing.view === "list" || listing.view === "grid") setView(listing.view);
         const keys: SortKey[] = ["name", "modified", "size", "type"];
@@ -264,27 +295,49 @@ function Launcher() {
       const item = shownRef.current[Number(row.dataset.index)];
       return item && item.isDir ? item : null;
     };
+    /** 光标下面是侧边栏的哪一项（返回 data-side 的值）。 */
+    const sideAtClient = (x: number, y: number): string | null => {
+      const node = document.elementFromPoint(x, y);
+      const side = node?.closest<HTMLElement>("[data-side]");
+      return side?.dataset.side ?? null;
+    };
     void listen<{ x: number; y: number }>("launcher-drag-pos", (event) => {
+      dragActiveRef.current = true;
       const point = toClient(event.payload.x, event.payload.y);
       setDropTarget(folderAtClient(point.x, point.y)?.path ?? null);
+      // 拖着东西悬到分类上：切过去，这样才落得进去。
+      // 拖拽期间浏览器不发 mouseenter，只能靠后端轮询来的坐标自己判断。
+      const side = sideAtClient(point.x, point.y);
+      if (side && side !== activeIdRef.current) {
+        const switchTo = sidesRef.current[side];
+        if (switchTo) switchTo();
+      }
     }).then((fn) => disposers.push(fn));
     void listen<{ x: number; y: number; paths: string[] }>("launcher-drag-drop", (event) => {
+      dragActiveRef.current = false;
+      setLoadTick((tick) => tick + 1);
       setDropTarget(null);
       const point = toClient(event.payload.x, event.payload.y);
       const folder = folderAtClient(point.x, point.y);
-      const dest = folder?.path ?? currentDirRef.current;
+      const side = sideAtClient(point.x, point.y);
+      const dest = (side && side !== "__all__" ? side : null) ?? folder?.path ?? currentDirRef.current;
       if (!dest) return;
       void invoke("launcher_move_into", { dest, paths: event.payload.paths })
         .then(() => refreshRef.current())
         .catch((error) => showToastRef.current(String(error)));
     }).then((fn) => disposers.push(fn));
-    void listen("launcher-drag-leave", () => setDropTarget(null)).then((fn) =>
-      disposers.push(fn),
-    );
+    void listen("launcher-drag-leave", () => {
+      dragActiveRef.current = false;
+      setLoadTick((tick) => tick + 1);
+      setDropTarget(null);
+    }).then((fn) => disposers.push(fn));
     void listen<{ x: number; y: number; paths: string[] }>("launcher-dropped", (event) => {
+      dragActiveRef.current = false;
+      setLoadTick((tick) => tick + 1);
       setDropTarget(null);
       const item = folderAt(event.payload.x, event.payload.y);
-      const dest = item?.path ?? currentDirRef.current;
+      const side = sideAtClient(event.payload.x, event.payload.y);
+      const dest = (side && side !== "__all__" ? side : null) ?? item?.path ?? currentDirRef.current;
       if (!dest) return;
       void invoke("launcher_move_into", { dest, paths: event.payload.paths })
         .then(() => refreshRef.current())
@@ -333,12 +386,27 @@ function Launcher() {
         return;
       }
       const target = path || (scope.kind === "folder" ? scope.base : "");
-      // 先清空：否则切目录时上一个目录的内容会留在屏幕上，搜索就会「搜到别处」。
-      setItems([]);
       if (!target) {
+        setItems([]);
         setLoading(false);
         return;
       }
+      // 预读过的分类直接用缓存：拖拽期间主线程被 DoDragDrop 占着，
+      // 这时候发命令只会一直卡在「正在读取」。
+      const cached = allCache[target];
+      if (cached) {
+        setItems(cached);
+        setLoading(false);
+        void fillIcons(cached.map((item) => item.path));
+        return;
+      }
+      // 没缓存又正在拖：保持原样，别转圈，松手后再补。
+      if (dragActiveRef.current) {
+        setLoading(false);
+        return;
+      }
+      // 先清空：否则切目录时上一个目录的内容会留在屏幕上，搜索就会「搜到别处」。
+      setItems([]);
       setLoading(true);
       const list = await invoke<LauncherItem[]>("launcher_items", {
         path: target,
@@ -353,7 +421,7 @@ function Launcher() {
     return () => {
       alive = false;
     };
-  }, [scope, path, root.categories, allCache, fillIcons]);
+  }, [scope, path, root.categories, allCache, fillIcons, loadTick]);
 
   // 拖到面板上的文件放进当前浏览的目录。
   useEffect(() => {
@@ -497,10 +565,52 @@ function Launcher() {
 
   const openAll = useCallback(() => go({ scope: { kind: "all" }, path: "" }), [go]);
 
-  const openStaging = useCallback(() => {
-    if (!stagingRoot) return;
-    go({ scope: { kind: "folder", base: stagingRoot, label: "中转站" }, path: stagingRoot });
-  }, [go, stagingRoot]);
+
+  const openPinned = useCallback(
+    (folder: string) => {
+      go({
+        scope: { kind: "folder", base: folder, label: folderLabel(folder) },
+        path: folder,
+      });
+    },
+    [go],
+  );
+
+  /** 侧边栏的「新建分类 / 重命名」都走这里。 */
+  const commitSideInput = useCallback(async () => {
+    const input = sideInput;
+    if (!input) return;
+    const value = input.value.trim();
+    setSideInput(null);
+    if (!value) return;
+    try {
+      if (input.kind === "new") {
+        await invoke("launcher_create_dir", { parent: input.path, name: value });
+      } else {
+        await invoke("launcher_rename", { path: input.path, name: value });
+      }
+      refreshRef.current();
+    } catch (error) {
+      showToastRef.current(String(error));
+    }
+  }, [sideInput]);
+
+  // 拖拽用的两份最新状态：当前在哪一项、某一项点下去做什么。
+  useEffect(() => {
+    activeIdRef.current = scope.kind === "all" ? "__all__" : scope.base;
+  }, [scope]);
+
+  useEffect(() => {
+    const map: Record<string, () => void> = { __all__: openAll };
+
+    for (const category of root.categories) {
+      map[category.path] = () => openCategory(category);
+    }
+    for (const folder of root.folders) {
+      map[folder] = () => openPinned(folder);
+    }
+    sidesRef.current = map;
+  }, [root, openAll, openCategory, openPinned]);
 
   // ---------- 派生数据 ----------
 
@@ -612,7 +722,7 @@ function Launcher() {
     setEditing({ path: created, name: "新建文件夹" });
   }, [currentDir, refreshAll]);
 
-  const openSettings = useCallback(async (tab: "items" | "staging") => {
+  const openSettings = useCallback(async (tab: "items" | "folders") => {
     await invoke("open_settings", { page: "launcher", tab });
     await invoke("dismiss_launcher");
   }, []);
@@ -752,86 +862,176 @@ function Launcher() {
   };
 
   const hasRoot = root.root.trim().length > 0;
-  const totalCount = root.categories.reduce((sum, category) => sum + category.count, 0);
-  const stagingCount = staging?.items.length ?? 0;
   const activeId = scope.kind === "all" ? "__all__" : scope.base;
   const baseLabel = scope.kind === "all" ? "全部" : scope.label;
 
   return (
-    <div className="palette" onKeyDown={onRootKeyDown}>
-      <aside className="sidebar">
-        <button
-          type="button"
-          className={`side-item${activeId === "__all__" ? " active" : ""}`}
-          onClick={openAll}
-          onMouseEnter={() => {
-            if (activeId !== "__all__") openAll();
-          }}
-        >
-          <span>全部</span>
-          <span className="count">{totalCount}</span>
-        </button>
-        {root.categories.map((category) => (
+    <div
+      className="palette"
+      onKeyDown={onRootKeyDown}
+      onMouseDown={() => {
+        if (sideMenu) setSideMenu(null);
+      }}
+    >
+      <aside
+        className="sidebar"
+        onContextMenu={(event) => {
+          if ((event.target as HTMLElement).closest("[data-side]")) return;
+          event.preventDefault();
+          setSideMenu({ x: event.clientX, y: event.clientY, path: "", label: "" });
+        }}
+      >
+        {sideInput && (
+          <div className="side-input-row">
+            <input
+              className="side-input"
+              autoFocus
+              value={sideInput.value}
+              placeholder={sideInput.kind === "new" ? "分类名" : "新名字"}
+              onChange={(event) => setSideInput({ ...sideInput, value: event.target.value })}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter" || event.keyCode === 13) void commitSideInput();
+                if (event.key === "Escape") setSideInput(null);
+              }}
+            />
+            <button
+              type="button"
+              className="side-ok"
+              title="确定"
+              onClick={() => void commitSideInput()}
+            >
+              ✓
+            </button>
+          </div>
+        )}
+        {root.allVisible && (
+          <button
+            type="button"
+            className={`side-item${activeId === "__all__" ? " active" : ""}`}
+            data-side="__all__"
+            onClick={openAll}
+            onMouseEnter={() => {
+              if (activeId !== "__all__") openAll();
+            }}
+          >
+            <span>全部</span>
+          </button>
+        )}
+
+        {root.categories.filter((category) => !category.hidden).map((category) => (
           <button
             type="button"
             key={category.path}
             className={`side-item${activeId === category.path ? " active" : ""}`}
+            data-side={category.path}
             onClick={() => openCategory(category)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setSideMenu({
+                x: event.clientX,
+                y: event.clientY,
+                path: category.path,
+                label: category.name,
+              });
+            }}
             onMouseEnter={() => {
               if (activeId !== category.path) openCategory(category);
             }}
             title={category.path}
           >
             <span>{category.name}</span>
-            <span className="count">{category.count}</span>
           </button>
         ))}
         {!hasRoot && (
           <div className="side-hint">在设置里选一个文件夹，它的子文件夹就是分类</div>
         )}
-        <div className="side-sep" />
-        <button
-          type="button"
-          className={`side-item${stagingRoot && activeId === stagingRoot ? " active" : ""}`}
-          onClick={openStaging}
-          onMouseEnter={() => {
-            if (stagingRoot && activeId !== stagingRoot) openStaging();
-          }}
-        >
-          <span>中转站</span>
-          <span className="count">{stagingCount}</span>
-        </button>
+        {root.folders.length > 0 && <div className="side-sep" />}
+        {root.folders.map((folder) => (
+          <button
+            type="button"
+            key={folder}
+            className={`side-item${activeId === folder ? " active" : ""}`}
+            data-side={folder}
+            onClick={() => openPinned(folder)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setSideMenu({ x: event.clientX, y: event.clientY, path: folder, label: folderLabel(folder) });
+            }}
+            onMouseEnter={() => {
+              if (activeId !== folder) openPinned(folder);
+            }}
+            title={folder}
+          >
+            <span>{folderLabel(folder)}</span>
+          </button>
+        ))}
+        {sideMenu && (
+          <div
+            className="ctx-menu"
+            style={{ left: sideMenu.x, top: sideMenu.y }}
+            onMouseDown={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            {root.root.trim().length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  const menu = sideMenu;
+                  setSideMenu(null);
+                  setSideInput({ kind: "new", path: root.root, value: "" });
+                  void menu;
+                }}
+              >
+                新建分类
+              </button>
+            )}
+            {sideMenu.path.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  const menu = sideMenu;
+                  setSideMenu(null);
+                  setSideInput({ kind: "rename", path: menu.path, value: menu.label });
+                }}
+              >
+                重命名
+              </button>
+            )}
+          </div>
+        )}
       </aside>
 
       <section className="content">
         <div className="toolbar">
-          <button
-            type="button"
-            className="tool-btn"
-            disabled={backStack.length === 0}
-            onClick={goBack}
-            title="后退"
-          >
-            ←
-          </button>
-          <button
-            type="button"
-            className="tool-btn"
-            disabled={forwardStack.length === 0}
-            onClick={goForward}
-            title="前进"
-          >
-            →
-          </button>
-          <button
-            type="button"
-            className="tool-btn"
-            disabled={!canUp}
-            onClick={goUp}
-            title="上一级"
-          >
-            ↑
-          </button>
+          {/* 只有进了子文件夹才给前进/后退/上一级；停在顶层时这排是空的 */}
+          {canUp && (
+            <>
+              <button
+                type="button"
+                className="tool-btn"
+                disabled={backStack.length === 0}
+                onClick={goBack}
+                title="后退"
+              >
+                ←
+              </button>
+              <button
+                type="button"
+                className="tool-btn"
+                disabled={forwardStack.length === 0}
+                onClick={goForward}
+                title="前进"
+              >
+                →
+              </button>
+              <button type="button" className="tool-btn" onClick={goUp} title="上一级">
+                ↑
+              </button>
+            </>
+          )}
 
           {/* 停在根目录时不显示面包屑，进了子文件夹才出现 */}
           <div className="crumbs">
@@ -1131,7 +1331,7 @@ function Launcher() {
                   onDoubleClick={(event) => event.stopPropagation()}
                 />
               ) : (
-                <span className="tile-name">{item.name}</span>
+                <span className="tile-name">{displayName(item.name)}</span>
               )}
               {view === "list" && (
                 <>

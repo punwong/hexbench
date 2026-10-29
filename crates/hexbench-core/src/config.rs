@@ -60,7 +60,6 @@ pub struct Config {
     pub guard: GuardSettings,
     pub hotkeys: HotkeySettings,
     pub phrases: PhraseSettings,
-    pub staging: StagingSettings,
     pub launcher: LauncherSettings,
     pub sync: SyncSettings,
     pub updates: UpdateSettings,
@@ -76,7 +75,6 @@ impl Default for Config {
             guard: GuardSettings::default(),
             hotkeys: HotkeySettings::default(),
             phrases: PhraseSettings::default(),
-            staging: StagingSettings::default(),
             launcher: LauncherSettings::default(),
             sync: SyncSettings::default(),
             updates: UpdateSettings::default(),
@@ -144,12 +142,6 @@ pub struct UpdateSettings {
     pub dismissed_version: String,
 }
 
-///「中转站」：一个临时文件夹 + 主界面在所有虚拟桌面上可见。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct StagingSettings {
-    pub enabled: bool,
-}
 
 /// 呼出面板的文件区：一个被映射的文件夹，显示在面板里。
 /// 面板上次停留的位置。只在 `remember_location` 打开时使用。
@@ -158,7 +150,7 @@ pub struct StagingSettings {
 pub struct LauncherLocation {
     /// `all` 或 `folder`
     pub kind: String,
-    /// folder 时的根目录（分类目录或中转站目录）
+    /// folder 时的根目录（分类目录或常用文件夹）
     pub base: String,
     pub label: String,
     pub path: String,
@@ -168,10 +160,18 @@ pub struct LauncherLocation {
 pub struct LauncherSettings {
     /// 呼出面板的开关。
     pub enabled: bool,
-    /// 文件区映射的文件夹；空字符串表示还没选。
-    pub folder: String,
+    /// 常用文件夹：面板左侧可以直接跳过去，顺序就是这里的顺序。
+    pub folders: Vec<String>,
     /// 启动器的根目录：它的每个子文件夹就是一个分类。
     pub root: String,
+    /// 分类的显示顺序（按子文件夹名）；不在这里的分类排在后面。
+    pub category_order: Vec<String>,
+    /// 在面板里隐藏的项：分类名，或 `__all__` 表示「全部」那一项。
+    /// 默认只列分类，不要「全部」——启动器里它太干扰。
+    pub hidden_categories: Vec<String>,
+    /// 旧版本只有一个「中转站」文件夹，读旧配置时搬进 `folders`。
+    #[serde(default, skip_serializing, rename = "folder")]
+    pub legacy_folder: String,
     /// 呼出时贴着鼠标位置，而不是固定在屏幕中央。
     pub follow_cursor: bool,
     /// 面板宽度，占屏幕工作区的百分比。
@@ -194,11 +194,15 @@ impl Default for LauncherSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            folder: String::new(),
+            folders: Vec::new(),
             root: String::new(),
-            follow_cursor: false,
-            width_percent: 70,
-            height_percent: 70,
+            category_order: Vec::new(),
+            hidden_categories: vec!["__all__".to_string()],
+            legacy_folder: String::new(),
+            // 默认就是「贴着鼠标 + 面板占一半」，和产品设定一致。
+            follow_cursor: true,
+            width_percent: 50,
+            height_percent: 50,
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,
@@ -442,7 +446,7 @@ pub enum LoadSource {
 ///
 /// 加字段**不用**改它：每个结构体都是 `#[serde(default)]`，老配置缺的字段会
 /// 自动落到默认值。需要 +1 的只有三种情况：字段改名、删字段、改枚举的取值。
-pub const CURRENT_SCHEMA: u32 = 1;
+pub const CURRENT_SCHEMA: u32 = 2;
 
 fn parse(path: &Path) -> Option<Config> {
     let bytes = fs::read(path).ok()?;
@@ -468,9 +472,16 @@ fn migrate(config: &mut Config) {
         return;
     }
     while config.meta.schema < CURRENT_SCHEMA {
-        // 目前还没有需要搬运的历史版本。
         config.meta.schema += 1;
     }
+    // schema 1 → 2：中转站的单个文件夹变成「常用文件夹」列表。
+    if config.launcher.folders.is_empty() && !config.launcher.legacy_folder.trim().is_empty() {
+        config
+            .launcher
+            .folders
+            .push(config.launcher.legacy_folder.clone());
+    }
+    config.launcher.legacy_folder.clear();
 }
 
 /// 解析不了的文件不删也不覆盖，改名留档，免得用户以为配置丢了。

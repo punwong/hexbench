@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Config, HitDto, RunningApp, Snapshot, StagedFile } from "./types";
+import type { Config, HitDto, RunningApp, Snapshot } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -33,14 +33,15 @@ const demoConfig: Config = {
     lastPush: 0,
     lastPull: 0,
   },
-  staging: { enabled: false },
   launcher: {
       enabled: true,
-      folder: "",
+      folders: [],
       root: "",
-      followCursor: false,
-      widthPercent: 70,
-      heightPercent: 70,
+      categoryOrder: [],
+      hiddenCategories: ["__root__"],
+      followCursor: true,
+      widthPercent: 50,
+      heightPercent: 50,
       rememberLocation: true,
       lastLocation: { kind: "", base: "", label: "", path: "" },
     },
@@ -146,26 +147,6 @@ export async function getHitState(): Promise<{
 
 // ---------- 中转站 ----------
 
-export async function stagingFiles(): Promise<StagedFile[]> {
-  if (!isTauri) return [];
-  return invoke<StagedFile[]>("staging_list");
-}
-
-export async function stagingRemove(names: string[]): Promise<StagedFile[]> {
-  if (!isTauri) return [];
-  return invoke<StagedFile[]>("staging_remove", { names });
-}
-
-export async function stagingClear(): Promise<StagedFile[]> {
-  if (!isTauri) return [];
-  return invoke<StagedFile[]>("staging_clear");
-}
-
-export async function stagingReveal(name?: string): Promise<void> {
-  if (!isTauri) return;
-  await invoke("staging_reveal", { name: name ?? null });
-}
-
 /** 用系统默认程序打开一个路径。 */
 export async function openPath(path: string): Promise<void> {
   if (!isTauri) return;
@@ -181,27 +162,8 @@ export async function pickFolder(): Promise<string | null> {
 }
 
 /** Puts staged files on the clipboard as real files (Ctrl+V pastes them). */
-export async function stagingCopy(names: string[]): Promise<number> {
-  if (!isTauri) return 0;
-  return invoke<number>("staging_copy", { names });
-}
-
 /** Hands a staged file to the OS so the user can drag it out of the window. */
-export async function beginStagingDrag(name: string): Promise<number> {
-  if (!isTauri) return 0;
-  return invoke<number>("begin_staging_drag", { name });
-}
-
-export async function setStagingEnabled(enabled: boolean): Promise<void> {
-  if (!isTauri) return;
-  await invoke("staging_set_enabled", { enabled });
-}
-
 /** Fires when files are dropped onto the window. */
-export function onStagingChanged(handler: () => void): Promise<() => void> {
-  return listen("staging-changed", handler);
-}
-
 export async function closePanel(): Promise<void> {
   if (!isTauri) return;
   await invoke("panel_close");
@@ -402,4 +364,30 @@ export async function cacheStats(): Promise<CacheInfo[]> {
 export async function cacheClear(): Promise<number> {
   if (!isTauri) return 0;
   return invoke<number>("cache_clear");
+}
+/// 保存「常用文件夹」的完整列表（增删、排序都走这里）。
+export async function saveLauncherFolders(folders: string[]): Promise<void> {
+  if (!isTauri) return;
+  await invoke("launcher_save_folders", { folders });
+}
+
+/// 保存分类的显示顺序。
+export async function saveCategoryOrder(order: string[]): Promise<void> {
+  if (!isTauri) return;
+  await invoke("launcher_save_category_order", { order });
+}
+export interface LauncherCategoryInfo {
+  name: string;
+  path: string;
+  count: number;
+  /** 面板里是否隐藏 */
+  hidden: boolean;
+}
+
+/// 某个目录下的分类（顺序已经按用户排好的来）。
+///
+/// 直接传路径：设置页要的是「这个文件夹里有什么」，不是「当前配置的根目录」。
+export async function launcherCategoryList(path: string): Promise<LauncherCategoryInfo[]> {
+  if (!isTauri || !path) return [];
+  return invoke<LauncherCategoryInfo[]>("launcher_categories_at", { path });
 }

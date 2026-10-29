@@ -40,7 +40,6 @@ export interface Config {
   guard: GuardSettings;
   hotkeys: HotkeySettings;
   phrases: PhraseSettings;
-  staging: StagingSettings;
   launcher: LauncherSettings;
   sync: SyncSettings;
   updates: UpdateSettings;
@@ -74,20 +73,16 @@ export interface Phrase {
   text: string;
 }
 
-export interface StagedFile {
-  name: string;
-  path: string;
-  size: number;
-  modified: number;
-  dir: boolean;
-}
-
 export interface LauncherSettings {
   enabled: boolean;
-  /** 中转站映射的文件夹 */
-  folder: string;
+  /** 常用文件夹：面板左侧直接列出来，数组顺序就是显示顺序 */
+  folders: string[];
   /** 启动器根目录：每个子文件夹是一个分类 */
   root: string;
+  /** 分类的显示顺序（按子文件夹名） */
+  categoryOrder: string[];
+  /** 面板里隐藏的项：分类名，或 __root__ 表示根目录 */
+  hiddenCategories: string[];
   /** 呼出时贴着鼠标，而不是屏幕居中 */
   followCursor: boolean;
   /** 面板宽度占工作区百分比 */
@@ -98,10 +93,6 @@ export interface LauncherSettings {
   rememberLocation: boolean;
   /** 上次停留的位置 */
   lastLocation: { kind: string; base: string; label: string; path: string };
-}
-
-export interface StagingSettings {
-  enabled: boolean;
 }
 
 export interface PhraseSettings {

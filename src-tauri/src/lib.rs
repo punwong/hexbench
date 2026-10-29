@@ -467,61 +467,6 @@ fn overlay_zones(state: State<'_, AppState>) -> OverlayPayload {
         .unwrap_or(OverlayPayload { bands: Vec::new(), zones: Vec::new() })
 }
 
-/// Paint the current trigger zones on top of the real screens for a few seconds.
-///
-/// The overlay is click-through and unfocused, so it is a pure visual hint: the
-/// user can keep working while it fades away on its own.
-// ---------------------------------------------------------------------------
-// 中转站：一个临时的暂存文件夹，主界面跟着虚拟桌面走
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StagedDto {
-    name: String,
-    path: String,
-    size: u64,
-    modified: i64,
-    dir: bool,
-}
-
-fn staging_dir(app: &AppHandle) -> std::path::PathBuf {
-    let state = app.state::<AppState>();
-    state
-        .config_path
-        .parent()
-        .map(|dir| dir.join("staging"))
-        .unwrap_or_else(|| std::path::PathBuf::from("staging"))
-}
-
-fn staged_files(app: &AppHandle) -> Vec<StagedDto> {
-    let dir = staging_dir(app);
-    let mut items: Vec<StagedDto> = std::fs::read_dir(&dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let meta = entry.metadata().ok()?;
-                    let modified = meta
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|value| value.as_secs() as i64)
-                        .unwrap_or(0);
-                    Some(StagedDto {
-                        name: entry.file_name().to_string_lossy().to_string(),
-                        path: entry.path().to_string_lossy().to_string(),
-                        size: meta.len(),
-                        modified,
-                        dir: meta.is_dir(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    items.sort_by_key(|item| std::cmp::Reverse(item.modified));
-    items
-}
 
 /// `报告.txt` 已存在时变成 `报告 (1).txt`，和资源管理器一致。
 fn unique_target(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -548,8 +493,6 @@ fn unique_target(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     candidate
 }
 
-/// Move dropped paths into the staging folder, the way dragging into a folder
-/// behaves. Returns how many entries made it.
 /// 把一批文件移动进某个目录：同盘是 rename（瞬间），跨盘退化成复制后删除。
 /// 重名自动变成 `文件 (1).txt`，和资源管理器一致。
 fn move_paths_into(dir: &std::path::Path, paths: &[std::path::PathBuf]) -> usize {
@@ -598,195 +541,7 @@ fn move_paths_into(dir: &std::path::Path, paths: &[std::path::PathBuf]) -> usize
     moved
 }
 
-fn stage_paths(app: &AppHandle, paths: &[std::path::PathBuf]) -> usize {
-    move_paths_into(&staging_dir(app), paths)
-}
 
-#[tauri::command]
-fn staging_list(app: AppHandle) -> Vec<StagedDto> {
-    staged_files(&app)
-}
-
-#[tauri::command]
-fn staging_add(paths: Vec<String>, app: AppHandle) -> Vec<StagedDto> {
-    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
-    let moved = stage_paths(&app, &paths);
-    log::info!("staging: took {moved} item(s)");
-    staged_files(&app)
-}
-
-#[tauri::command]
-fn staging_remove(names: Vec<String>, app: AppHandle) -> Vec<StagedDto> {
-    let dir = staging_dir(&app);
-    for name in names {
-        let target = dir.join(&name);
-        // Never let a crafted name escape the folder.
-        if !target.starts_with(&dir) {
-            continue;
-        }
-        let removed = if target.is_dir() {
-            std::fs::remove_dir_all(&target).is_ok()
-        } else {
-            std::fs::remove_file(&target).is_ok()
-        };
-        log::info!("staging: delete {name} -> {removed}");
-    }
-    staged_files(&app)
-}
-
-#[tauri::command]
-fn staging_clear(app: AppHandle) -> Vec<StagedDto> {
-    let dir = staging_dir(&app);
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let _ = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-        }
-    }
-    staged_files(&app)
-}
-
-/// Drag a staged file out of the window. `DoDragDrop` blocks its thread until
-/// the user drops it, so this hands the work to a worker and returns at once.
-/// 把选中的文件放进剪贴板：拖不动的时候，Ctrl+V 也能把文件搬过去。
-#[tauri::command]
-fn staging_copy(names: Vec<String>, app: AppHandle) -> Result<usize, String> {
-    let dir = staging_dir(&app);
-    let paths: Vec<std::path::PathBuf> = names
-        .iter()
-        .map(|name| dir.join(name))
-        .filter(|path| path.exists())
-        .collect();
-    if paths.is_empty() {
-        return Err("中转站里没有这些文件了".to_string());
-    }
-    hexbench_core::sys::copy_files_to_clipboard(&paths)?;
-    log::info!("staging: copied {} item(s) to the clipboard", paths.len());
-    Ok(paths.len())
-}
-#[tauri::command]
-fn begin_staging_drag(name: String, app: AppHandle) -> Result<u32, String> {
-    let path = staging_dir(&app).join(&name);
-    if !path.exists() {
-        return Err("文件已经不在中转站里了".to_string());
-    }
-    // OLE 的拖拽循环要在有窗口的线程上跑，命令正好跑在 UI 线程：DoDragDrop
-    // 会占住它直到用户松手，这期间界面不响应是正常的（原生拖拽都这样）。
-    match hexbench_core::sys::start_file_drag(std::slice::from_ref(&path)) {
-        Ok(effect) => {
-            // DROPEFFECT_MOVE = 2：目标要求「移动」，那就把暂存的这一份删掉。
-            let moved = effect & 2 != 0;
-            if moved && path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
-            log::info!("staging: dragged out effect={effect} moved={moved}");
-            let _ = app.emit("staging-changed", ());
-            Ok(effect)
-        }
-        Err(error) => {
-            log::warn!("staging: drag out failed: {error}");
-            Err(error)
-        }
-    }
-}
-#[tauri::command]
-fn staging_reveal(name: Option<String>, app: AppHandle) {
-    let dir = staging_dir(&app);
-    let _ = std::fs::create_dir_all(&dir);
-    let mut command = std::process::Command::new("explorer.exe");
-    match name {
-        Some(name) => {
-            let target = dir.join(name);
-            if target.exists() {
-                command.arg(format!("/select,{}", target.display()));
-            } else {
-                command.arg(dir.display().to_string());
-            }
-        }
-        None => {
-            command.arg(dir.display().to_string());
-        }
-    }
-    let _ = command.spawn();
-}
-
-/// Move the main window onto the desktop the user is on, so it travels with
-/// them while the staging tool is on.
-fn follow_desktop(app: &AppHandle) {
-    let enabled = app
-        .state::<AppState>()
-        .shared
-        .lock()
-        .unwrap()
-        .config
-        .staging
-        .enabled;
-    if !enabled {
-        return;
-    }
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    if !window.is_visible().unwrap_or(false) {
-        return;
-    }
-    let Ok(hwnd) = window.hwnd() else {
-        return;
-    };
-    let Some(id) = hexbench_core::sys::current_desktop_id() else {
-        return;
-    };
-    if id.len() != 16 {
-        return;
-    }
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&id[..16]);
-    match hexbench_core::sys::move_window_to_desktop(hwnd.0 as isize, &bytes) {
-        Ok(()) => log::info!("staging: moved window to the current desktop"),
-        Err(error) => log::warn!("staging: move failed: {error}"),
-    }
-}
-
-/// Follow every desktop switch while the staging tool is on.
-/// Follow every desktop switch while the staging tool is on.
-///
-/// Windows 11 24H2 no longer raises the shell's desktop-switch event, so the
-/// desktop id is read from the registry instead — the one signal that works on
-/// every build we care about.
-fn spawn_staging_watcher(app: AppHandle) {
-    thread::spawn(move || {
-        let mut last = hexbench_core::sys::current_desktop_id();
-        loop {
-            thread::sleep(Duration::from_millis(120));
-            let current = hexbench_core::sys::current_desktop_id();
-            if current == last {
-                continue;
-            }
-            last = current;
-            // Let the switch settle before dragging the window across.
-            thread::sleep(Duration::from_millis(150));
-            follow_desktop(&app);
-        }
-    });
-}
-
-#[tauri::command]
-fn staging_set_enabled(enabled: bool, app: AppHandle) -> Result<(), String> {
-    let config = {
-        let state = app.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
-        shared.config.staging.enabled = enabled;
-        shared.config.clone()
-    };
-    let state = app.state::<AppState>();
-    config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
-    follow_desktop(&app);
-    Ok(())
-}
 fn open_overlay(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (monitors, regions, trigger) = {
@@ -1853,8 +1608,7 @@ fn open_main_now(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        follow_desktop(app);
-        return;
+            return;
     }
 
     let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
@@ -2164,19 +1918,6 @@ struct LauncherItem {
     icon: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LauncherListing {
-    folder: String,
-    exists: bool,
-    items: Vec<LauncherItem>,
-}
-
-/// 一个文件夹里的条目，按「先文件夹、再名字」排序。
-///
-/// 图标走 Shell 的缓存并且按扩展名复用，所以几百个文件也只做几次转换。
-/// 上限 300：面板是给人翻的，不是资源管理器。
-/// 读一个文件夹，生成面板用的条目（带上 Shell 图标）。
 fn list_folder(path: &std::path::Path, with_icons: bool) -> Vec<LauncherItem> {
     let Ok(entries) = std::fs::read_dir(path) else {
         return Vec::new();
@@ -2223,48 +1964,6 @@ fn list_folder(path: &std::path::Path, with_icons: bool) -> Vec<LauncherItem> {
     items
 }
 
-#[tauri::command]
-async fn launcher_listing(app: AppHandle) -> LauncherListing {
-    let folder = app
-        .state::<AppState>()
-        .shared
-        .lock()
-        .unwrap()
-        .config
-        .launcher
-        .folder
-        .clone();
-    if folder.trim().is_empty() {
-        return LauncherListing {
-            folder,
-            exists: false,
-            items: Vec::new(),
-        };
-    }
-    // 必须离开主线程：这里以前是同步命令，每次呼出都给整个中转站目录取图标，
-    // 加上缩略图之后直接把界面堵死十秒。
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = PathBuf::from(&folder);
-        let exists = path.is_dir();
-        let items = if exists {
-            list_folder(&path, false)
-        } else {
-            Vec::new()
-        };
-        LauncherListing {
-            folder,
-            exists,
-            items,
-        }
-    })
-    .await
-    .unwrap_or_else(|_| LauncherListing {
-        folder: String::new(),
-        exists: false,
-        items: Vec::new(),
-    })
-}
-
 /// 启动器：根目录下的每个子文件夹就是一个分类。
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2272,6 +1971,8 @@ struct LauncherCategory {
     name: String,
     path: String,
     count: usize,
+    /// 面板里是否隐藏这一项。
+    hidden: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -2279,8 +1980,10 @@ struct LauncherCategory {
 struct LauncherRoot {
     root: String,
     categories: Vec<LauncherCategory>,
-    /// 中转站目录：恢复上次位置时要用它判断这个位置还存不存在。
-    staging: String,
+    /// 「全部」那一项在面板里是否显示。
+    all_visible: bool,
+    /// 常用文件夹（按用户排好的顺序），面板左侧直接列出来。
+    folders: Vec<String>,
     /// 上次用的视图和排序。
     view: String,
     sort_key: String,
@@ -2292,7 +1995,70 @@ struct LauncherRoot {
     last_label: String,
     last_path: String,
 }
+/// 扫一个目录，把子文件夹当成分类；排序按配置里的顺序，其余按名字。
+fn scan_categories(root: &str, order: &[String], hidden: &[String]) -> Vec<LauncherCategory> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut list: Vec<LauncherCategory> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let count = std::fs::read_dir(&path)
+            .map(|reader| reader.flatten().count())
+            .unwrap_or(0);
+        let is_hidden = hidden.iter().any(|entry| entry == &name);
+        list.push(LauncherCategory {
+            name,
+            path: path.to_string_lossy().to_string(),
+            count,
+            hidden: is_hidden,
+        });
+    }
+    let rank = |name: &str| -> usize {
+        order
+            .iter()
+            .position(|entry| entry == name)
+            .unwrap_or(usize::MAX)
+    };
+    list.sort_by(|a, b| {
+        rank(&a.name)
+            .cmp(&rank(&b.name))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    list
+}
 
+/// 设置页用：直接扫这个路径，不读「当前根目录」。
+///
+/// 之前是让设置页复用 `launcher_categories`，可它读的是已保存的配置：
+/// 刚在对话框里选完文件夹时配置还没落盘，扫到的是旧的空路径，于是显示
+/// 「这个目录下还没有子文件夹」。传路径进来就没有这个竞态了。
+#[tauri::command]
+async fn launcher_categories_at(path: String, app: AppHandle) -> Vec<LauncherCategory> {
+    let (order, hidden) = {
+        let state = app.state::<AppState>();
+        let shared = state.shared.lock().unwrap();
+        (
+            shared.config.launcher.category_order.clone(),
+            shared.config.launcher.hidden_categories.clone(),
+        )
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        if path.trim().is_empty() {
+            return Vec::new();
+        }
+        scan_categories(&path, &order, &hidden)
+    })
+    .await
+    .unwrap_or_default()
+}
 #[tauri::command]
 async fn launcher_categories(app: AppHandle) -> LauncherRoot {
     // 同样要离开主线程：这里会逐个子文件夹 read_dir 数条目。
@@ -2301,7 +2067,8 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
         .unwrap_or_else(|_| LauncherRoot {
             root: String::new(),
             categories: Vec::new(),
-            staging: String::new(),
+            all_visible: false,
+            folders: Vec::new(),
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,
@@ -2319,15 +2086,19 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
     let root = shared.config.launcher.root.clone();
     let location = shared.config.launcher.last_location.clone();
     let remember_location = shared.config.launcher.remember_location;
-    let staging = shared.config.launcher.folder.clone();
+    let folders = shared.config.launcher.folders.clone();
+    let category_order = shared.config.launcher.category_order.clone();
+    let hidden = shared.config.launcher.hidden_categories.clone();
     let view = shared.config.launcher.view.clone();
     let sort_key = shared.config.launcher.sort_key.clone();
     let sort_dir = shared.config.launcher.sort_dir;
     drop(shared);
+    let all_visible = !hidden.iter().any(|entry| entry == "__all__");
     let empty = |root: String| LauncherRoot {
         root,
         categories: Vec::new(),
-        staging: staging.clone(),
+        all_visible,
+        folders: folders.clone(),
         view: view.clone(),
         sort_key: sort_key.clone(),
         sort_dir,
@@ -2340,33 +2111,15 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
     if root.trim().is_empty() {
         return empty(root);
     }
-    let Ok(entries) = std::fs::read_dir(&root) else {
+    if !std::path::Path::new(&root).is_dir() {
         return empty(root);
-    };
-    let mut list: Vec<LauncherCategory> = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        let count = std::fs::read_dir(&path)
-            .map(|reader| reader.flatten().count())
-            .unwrap_or(0);
-        list.push(LauncherCategory {
-            name,
-            path: path.to_string_lossy().to_string(),
-            count,
-        });
     }
-    list.sort_by_key(|category| category.name.to_lowercase());
+    let list = scan_categories(&root, &category_order, &hidden);
     LauncherRoot {
         root,
         categories: list,
-        staging,
+        all_visible,
+        folders,
         view,
         sort_key,
         sort_dir,
@@ -2469,6 +2222,21 @@ fn launcher_set_drop_target(path: Option<String>) {
 }
 
 /// 在中转站的当前目录里新建文件夹（重名自动加序号）。
+/// 在某个目录下新建一个子文件夹（面板右键「新建分类」用）。
+#[tauri::command]
+fn launcher_create_dir(parent: String, name: String) -> Result<String, String> {
+    let name = name.trim().trim_end_matches(['.', ' ']);
+    if name.is_empty() {
+        return Err("名字不能为空".to_string());
+    }
+    if name.chars().any(|c| "\\/:*?\"<>|".contains(c)) {
+        return Err("名字里不能有 \\ / : * ? \" < > |".to_string());
+    }
+    let dir = PathBuf::from(&parent).join(name);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("建不了这个文件夹：{error}"))?;
+    log::info!("launcher: created category {}", dir.display());
+    Ok(dir.to_string_lossy().to_string())
+}
 #[tauri::command]
 fn launcher_new_folder(parent: String) -> Result<String, String> {
     let target = hexbench_core::sys::create_folder(std::path::Path::new(&parent), "新建文件夹")?;
@@ -2697,8 +2465,8 @@ fn launcher_pick_folder(target: String, app: AppHandle) {
             let mut shared = state.shared.lock().unwrap();
             if is_root {
                 shared.config.launcher.root = folder.clone();
-            } else {
-                shared.config.launcher.folder = folder.clone();
+            } else if !shared.config.launcher.folders.contains(&folder) {
+                shared.config.launcher.folders.push(folder.clone());
             }
             shared.config.clone()
         };
@@ -2719,10 +2487,51 @@ fn launcher_pick_folder(target: String, app: AppHandle) {
 fn launcher_clear_folder(app: AppHandle, state: State<'_, AppState>) {
     let config = {
         let mut shared = state.shared.lock().unwrap();
-        shared.config.launcher.folder.clear();
+        shared.config.launcher.folders.clear();
         shared.config.clone()
     };
     let _ = config::save(&state.config_path, &config);
+    let _ = app.emit("launcher-changed", ());
+}
+
+/// 保存「常用文件夹」的完整列表（增删和拖动排序都走这里）。
+#[tauri::command]
+fn launcher_save_folders(folders: Vec<String>, app: AppHandle, state: State<'_, AppState>) {
+    let config = {
+        let mut shared = state.shared.lock().unwrap();
+        let cleaned: Vec<String> = folders
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        if shared.config.launcher.folders == cleaned {
+            return;
+        }
+        shared.config.launcher.folders = cleaned;
+        shared.config.clone()
+    };
+    if let Err(error) = config::save(&state.config_path, &config) {
+        log::warn!("launcher: save folders failed: {error}");
+        return;
+    }
+    let _ = app.emit("launcher-changed", ());
+}
+
+/// 保存分类的显示顺序（设置页拖动排序）。
+#[tauri::command]
+fn launcher_save_category_order(order: Vec<String>, app: AppHandle, state: State<'_, AppState>) {
+    let config = {
+        let mut shared = state.shared.lock().unwrap();
+        if shared.config.launcher.category_order == order {
+            return;
+        }
+        shared.config.launcher.category_order = order;
+        shared.config.clone()
+    };
+    if let Err(error) = config::save(&state.config_path, &config) {
+        log::warn!("launcher: save category order failed: {error}");
+        return;
+    }
     let _ = app.emit("launcher-changed", ());
 }
 
@@ -2736,7 +2545,8 @@ fn spawn_launcher_watcher(app: AppHandle) {
             notify::RecommendedWatcher,
             std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
         );
-        let mut current: Option<PathBuf> = None;
+        // 监听「根目录 + 所有常用文件夹」：任意一处变化都让面板刷新。
+        let mut current: Vec<PathBuf> = Vec::new();
         // 监听器和它的接收端必须一起活着：丢了监听器就等于丢了监听。
         let mut session: Option<Session> = None;
 
@@ -2744,27 +2554,36 @@ fn spawn_launcher_watcher(app: AppHandle) {
             let wanted = {
                 let state = app.state::<AppState>();
                 let shared = state.shared.lock().unwrap();
-                let raw = shared.config.launcher.folder.clone();
-                if raw.trim().is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(raw))
+                let mut list: Vec<PathBuf> = Vec::new();
+                let root = shared.config.launcher.root.clone();
+                if !root.trim().is_empty() {
+                    list.push(PathBuf::from(root));
                 }
+                for folder in &shared.config.launcher.folders {
+                    if !folder.trim().is_empty() {
+                        list.push(PathBuf::from(folder));
+                    }
+                }
+                list
             };
 
             if wanted != current {
                 session = None;
-                if let Some(directory) = wanted.as_ref() {
-                    if directory.is_dir() {
-                        let (sender, rx) = std::sync::mpsc::channel();
-                        if let Ok(mut created) = notify::recommended_watcher(move |event| {
-                            let _ = sender.send(event);
-                        }) {
-                            if created.watch(directory, RecursiveMode::NonRecursive).is_ok() {
-                                session = Some((created, rx));
-                                log::info!("launcher: watching {}", directory.display());
-                            }
+                let (sender, rx) = std::sync::mpsc::channel();
+                if let Ok(mut created) = notify::recommended_watcher(move |event| {
+                    let _ = sender.send(event);
+                }) {
+                    let mut watched = 0usize;
+                    for directory in &wanted {
+                        if directory.is_dir()
+                            && created.watch(directory, RecursiveMode::NonRecursive).is_ok()
+                        {
+                            watched += 1;
                         }
+                    }
+                    if watched > 0 {
+                        log::info!("launcher: watching {watched} directory(ies)");
+                        session = Some((created, rx));
                     }
                 }
                 current = wanted;
@@ -2781,7 +2600,7 @@ fn spawn_launcher_watcher(app: AppHandle) {
                     Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {
                         session = None;
-                        current = None;
+                        current.clear();
                     }
                 },
                 None => thread::sleep(Duration::from_millis(500)),
@@ -3104,15 +2923,9 @@ pub fn run() {
             phrases_ui,
             phrase_submit,
             panel_close,
-            staging_list,
-            staging_add,
-            staging_remove,
-            staging_clear,
-            staging_reveal,
-            begin_staging_drag,
             dismiss_launcher,
-            launcher_listing,
             launcher_categories,
+            launcher_categories_at,
             launcher_items,
             launcher_pick_folder,
             launcher_open,
@@ -3122,6 +2935,7 @@ pub fn run() {
             open_settings,
             launcher_set_drop_target,
             launcher_new_folder,
+    launcher_create_dir,
             launcher_save_location,
             launcher_icons,
             launcher_save_view,
@@ -3129,8 +2943,8 @@ pub fn run() {
             cache_stats,
             cache_clear,
             launcher_clear_folder,
-            staging_copy,
-            staging_set_enabled,
+    launcher_save_folders,
+    launcher_save_category_order,
             phrase_send_mode,
             sync_test,
             sync_save,
@@ -3189,8 +3003,7 @@ pub fn run() {
                 // Setup runs before the event loop, so building here is safe.
                 open_main_now(&handle);
             }
-            spawn_staging_watcher(handle.clone());
-            spawn_launcher_watcher(handle.clone());
+                    spawn_launcher_watcher(handle.clone());
 
             // A tray app can run for days: checking only at launch would mean
             // "restart to find out you have an update". latest.json is a few
@@ -3316,34 +3129,7 @@ pub fn run() {
                     }
                     return;
                 }
-                if window.label() == "main" {
-                    match drop {
-                        tauri::DragDropEvent::Enter { .. } => {
-                            log::info!("staging: drag entered");
-                        }
-                        tauri::DragDropEvent::Drop { paths, .. } => {
-                            log::info!("staging: drop with {} path(s)", paths.len());
-                            let app = window.app_handle();
-                            let enabled = app
-                                .state::<AppState>()
-                                .shared
-                                .lock()
-                                .unwrap()
-                                .config
-                                .staging
-                                .enabled;
-                            if enabled && !paths.is_empty() {
-                                let moved = stage_paths(app, paths);
-                                log::info!("staging: took {moved} item(s)");
-                            }
-                            let _ = app.emit("staging-changed", ());
-                        }
-                        tauri::DragDropEvent::Leave => {
-                            log::info!("staging: drag left");
-                        }
-                        _ => {}
-                    }
-                }
+
                 return;
             }
             // 面板是「呼出即用」的：点到别处就收起来。

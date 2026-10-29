@@ -1,11 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Crosshair, MessageSquare, Rocket } from "lucide-react";
+import { Crosshair, Eye, EyeOff, MessageSquare, Rocket } from "lucide-react";
 
-import type { CacheInfo } from "./api";
+import type { CacheInfo, LauncherCategoryInfo } from "./api";
 import type {
   Config,
-  StagedFile,
   GuardSettings,
   HotkeySettings,
   LauncherSettings,
@@ -13,24 +12,16 @@ import type {
   Phrase,
   PhraseSettings,
   RunningApp,
-  StagingSettings,
   Snapshot,
   TriggerSettings,
   UiSettings,
   UpdateSettings,
 } from "./types";
 import {
-  beginStagingDrag,
   cacheClear,
   cacheStats,
   copyText,
-  onStagingChanged,
-  setStagingEnabled,
-  stagingClear,
-  stagingFiles,
-  stagingCopy,
-  stagingRemove,
-  stagingReveal,
+  launcherCategoryList,
   diagnostics,
   onAppPicked,
   openPath,
@@ -52,7 +43,6 @@ export type Patch = {
   guard?: Partial<GuardSettings>;
   hotkeys?: Partial<HotkeySettings>;
   phrases?: Partial<PhraseSettings>;
-  staging?: Partial<StagingSettings>;
   launcher?: Partial<LauncherSettings>;
   updates?: Partial<UpdateSettings>;
   ui?: Partial<UiSettings>;
@@ -1137,166 +1127,6 @@ function formatBytes(size: number): string {
   return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-export function StagingPage({
-  config,
-  update,
-}: {
-  config: Config;
-  update: UpdateConfig;
-}) {
-  const [items, setItems] = useState<StagedFile[]>([]);
-  const [dragging, setDragging] = useState(false);
-  const [toast, setToast] = useState("");
-
-  const flash = (message: string) => {
-    setToast(message);
-    window.setTimeout(() => setToast(""), 2600);
-  };
-
-  const copyItem = (name: string) => {
-    void stagingCopy([name]).then((count) => {
-      if (count > 0) flash("已复制到剪贴板，去目标窗口按 Ctrl+V");
-    });
-  };
-
-  const refresh = () => {
-    void stagingFiles().then(setItems);
-  };
-
-  useEffect(() => {
-    refresh();
-    let stop: (() => void) | undefined;
-    void onStagingChanged(() => {
-      setDragging(false);
-      refresh();
-    }).then((unlisten) => {
-      stop = unlisten;
-    });
-    return () => stop?.();
-  }, []);
-
-  const enabled = config.staging.enabled;
-
-  // 拖出去：按住某一行往窗外拖，交给系统接管（真正的 OLE 拖拽）。
-  const startDragOut = (item: StagedFile, event: React.PointerEvent) => {
-    if (event.button !== 0) return;
-    const startX = event.clientX;
-    const startY = event.clientY;
-    let started = false;
-
-    const stop = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", stop);
-    };
-    const move = (next: PointerEvent) => {
-      if (started) return;
-      if (Math.abs(next.clientX - startX) + Math.abs(next.clientY - startY) < 5) {
-        return;
-      }
-      started = true;
-      stop();
-      void beginStagingDrag(item.name).then((effect) => {
-        if (effect === 0) {
-          flash("没落到目标上，可以点「复制」再按 Ctrl+V");
-        }
-      });
-    };
-
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", stop);
-  };
-
-  return (
-    <div className="stack">
-      {!enabled && (
-        <div className="callout">
-          中转站没开。到「概览」把它打开，主界面才会跟着虚拟桌面走。
-        </div>
-      )}
-
-      <Card
-        action={
-          <button type="button" className="btn" onClick={() => void stagingReveal()}>
-            打开文件夹
-          </button>
-        }
-        title="中转站"
-      >
-        <div className={`drop-zone ${dragging ? "over" : ""}`}>
-          {items.length === 0 ? (
-            <div className="drop-empty">
-              <b>把文件拖到这里</b>
-              <span>文件会被收进中转站，切到别的桌面再拖出去就行</span>
-            </div>
-          ) : (
-            <div className="staged-list">
-              {items.map((item) => (
-                <div
-                  className="staged-row"
-                  key={item.name}
-                  onPointerDown={(event) => startDragOut(item, event)}
-                >
-                  <span className="staged-icon">{item.dir ? "📁" : "📄"}</span>
-                  <span className="staged-text">
-                    <span className="staged-name">{item.name}</span>
-                    <span className="staged-meta">
-                      {item.dir ? "文件夹" : formatBytes(item.size)}
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => void stagingReveal(item.name)}
-                  >
-                    定位
-                  </button>
-                  <button type="button" className="btn" onClick={() => copyItem(item.name)}>
-                    复制
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => void stagingRemove([item.name]).then(setItems)}
-                  >
-                    删除
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {toast && <div className="staging-toast">{toast}</div>}
-
-        <div className="staging-actions">
-          <span className="sub">
-            {items.length === 0 ? "还没有文件" : `共 ${items.length} 项`}
-          </span>
-          <button
-            type="button"
-            className="btn"
-            disabled={items.length === 0}
-            onClick={() => void stagingClear().then(setItems)}
-          >
-            清空
-          </button>
-        </div>
-      </Card>
-
-      <Card title="一起切桌面">
-        <Row label="主界面跟随虚拟桌面" hint="开着时，这个窗口在每个桌面上都在，方便来回搬文件">
-          <Toggle
-            checked={enabled}
-            onChange={(next) => {
-              update({ staging: { enabled: next } });
-              void setStagingEnabled(next);
-            }}
-          />
-        </Row>
-      </Card>
-    </div>
-  );
-}
 export function HotkeysPage({
   config,
   update,
@@ -1361,6 +1191,117 @@ export function HotkeysPage({
  *   启动项 —— 根目录下的每个子文件夹就是一个分类；
  *   中转站 —— 一个普通文件夹，用来临时搬文件。
  */
+/// 可拖动排序的行。自己处理鼠标事件，不用 HTML5 拖放：
+/// 无边框窗口里更稳，也不依赖系统拖放循环。
+function SortableRows({
+  items,
+  onReorder,
+  trailing,
+}: {
+  items: Array<{ key: string; label: string; hint?: string }>;
+  onReorder: (from: number, to: number) => void;
+  trailing?: (index: number) => ReactNode;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState<number | null>(null);
+  const [over, setOver] = useState<number | null>(null);
+  // 监听器里读不到最新状态，用 ref 兜住。
+  const stateRef = useRef<{ from: number | null; to: number | null }>({ from: null, to: null });
+
+  /** 指针纵向落在第几行；落在最后一行下方就算最后一行。 */
+  const rowAt = (y: number): number | null => {
+    const rows = listRef.current?.querySelectorAll<HTMLElement>(".sortable-row");
+    if (!rows || rows.length === 0) return null;
+    for (let index = 0; index < rows.length; index += 1) {
+      const rect = rows[index].getBoundingClientRect();
+      if (y >= rect.top && y <= rect.bottom) return index;
+    }
+    const last = rows[rows.length - 1].getBoundingClientRect();
+    return y > last.bottom ? rows.length - 1 : 0;
+  };
+
+  useEffect(() => {
+    if (dragging === null) return;
+
+    const onMove = (event: MouseEvent) => {
+      const next = rowAt(event.clientY);
+      if (next !== null && next !== stateRef.current.to) {
+        stateRef.current.to = next;
+        setOver(next);
+      }
+    };
+    const onUp = () => {
+      const { from, to } = stateRef.current;
+      if (from !== null && to !== null && from !== to) onReorder(from, to);
+      stateRef.current = { from: null, to: null };
+      setDragging(null);
+      setOver(null);
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    return () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+  }, [dragging, onReorder]);
+
+  return (
+    <div className="sortable" ref={listRef}>
+      {items.map((item, index) => (
+        <div
+          key={item.key}
+          className={`sortable-row${dragging === index ? " dragging" : ""}${
+            over === index && dragging !== null && dragging !== index ? " over" : ""
+          }`}
+          onMouseDown={(event) => {
+            if (event.button !== 0) return;
+            // 行尾的按钮要能正常点，别被拖拽抢走。
+            if ((event.target as HTMLElement).closest("button")) return;
+            event.preventDefault();
+            stateRef.current = { from: index, to: index };
+            setDragging(index);
+            setOver(index);
+          }}
+        >
+          <span className="grip" aria-hidden="true">
+            ⠿
+          </span>
+          <span className="sortable-label">{item.label}</span>
+          {item.hint && <span className="sub">{item.hint}</span>}
+          <span className="sortable-actions">{trailing?.(index)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+/** 眼睛按钮：亮 = 显示，灰 = 隐藏。 */
+function EyeButton({ hidden, onClick }: { hidden: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className={`icon-btn${hidden ? " off" : ""}`}
+      title={hidden ? "在面板里隐藏：点一下显示" : "在面板里显示：点一下隐藏"}
+      onClick={onClick}
+    >
+      {hidden ? <EyeOff size={15} /> : <Eye size={15} />}
+    </button>
+  );
+}
+
+function moveItem<T>(list: T[], from: number, to: number): T[] {
+  const next = [...list];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  return next;
+}
+
+function folderLabel(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const index = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+}
+
 export function LauncherPage({
   config,
   update,
@@ -1369,53 +1310,127 @@ export function LauncherPage({
 }: {
   config: Config;
   update: UpdateConfig;
-  tab: "items" | "staging";
-  onTabChange: (tab: "items" | "staging") => void;
+  tab: "items" | "folders";
+  onTabChange: (tab: "items" | "folders") => void;
 }) {
+  const root = config.launcher.root;
+  const folders = config.launcher.folders ?? [];
+  const hidden = config.launcher.hiddenCategories ?? [];
+  const [categories, setCategories] = useState<LauncherCategoryInfo[]>([]);
 
-  const choose = async (target: "root" | "file") => {
-    const folder = await pickFolder();
-    if (!folder) return;
-    update({
-      launcher: target === "root" ? { root: folder } : { folder },
-    });
+  // 根目录变了就重新读一遍分类（后端已经按配置顺序排好）。
+  useEffect(() => {
+    let alive = true;
+    void launcherCategoryList(root)
+      .then((list) => alive && setCategories(list))
+      .catch(() => alive && setCategories([]));
+    return () => {
+      alive = false;
+    };
+  }, [root]);
+
+  const chooseRoot = async () => {
+    const picked = await pickFolder();
+    if (picked) update({ launcher: { root: picked } });
   };
 
-  const root = config.launcher.root;
-  const folder = config.launcher.folder;
+  /** 显示 / 隐藏某一项（分类名，或 __root__）。 */
+  const toggleHidden = (name: string) => {
+    const next = hidden.includes(name)
+      ? hidden.filter((entry) => entry !== name)
+      : [...hidden, name];
+    update({ launcher: { hiddenCategories: next } });
+  };
+
+  const addFolder = async () => {
+    const picked = await pickFolder();
+    if (!picked || folders.includes(picked)) return;
+    update({ launcher: { folders: [...folders, picked] } });
+  };
 
   return (
     <div className="stack">
       <Tabs
         value={tab}
-        onChange={(value) => onTabChange(value as "items" | "staging")}
+        onChange={(value) => onTabChange(value as "items" | "folders")}
         options={[
           { value: "items", label: "启动项" },
-          { value: "staging", label: "中转站" },
+          { value: "folders", label: "常用文件夹" },
         ]}
       />
 
       {tab === "items" ? (
         <Card title="启动项">
           <p className="sub" style={{ marginTop: 0 }}>
-            选一个根目录，它下面的每个子文件夹就是一个分类（比如 常用 / 软件 / 设计），
-            面板左侧按这些分类生成导航，右边显示分类里的程序。
+            选一个根目录，它下面的每个子文件夹就是一个分类（比如 常用 / 软件 / 设计）。
+            面板左侧按下面的顺序生成导航，拖动可以调整。
           </p>
           <Row label="根目录" hint="例如 D:\启动器，里面放几个子文件夹当分类">
             <div className="hotkey-cell">
               <code>{root || "未选择"}</code>
-              <button type="button" className="btn" onClick={() => void choose("root")}>
+              <button type="button" className="btn" onClick={() => void chooseRoot()}>
                 选择
               </button>
               <button
                 type="button"
                 className="btn"
-                onClick={() => update({ launcher: { root: "" } })}
+                onClick={() => update({ launcher: { root: "", categoryOrder: [] } })}
               >
                 清空
               </button>
             </div>
           </Row>
+
+          {root && (
+            <div style={{ marginTop: 12 }}>
+              <div className="row-hint" style={{ marginBottom: 8 }}>
+                面板里的顺序（拖动调整）；眼睛控制它在面板上显不显示
+              </div>
+
+              {/* 「全部」：固定在第一条，只能显示 / 隐藏 */}
+              <div className="sortable-row" style={{ cursor: "default" }}>
+                <span className="grip" style={{ opacity: 0.25, cursor: "default" }}>
+                  ⠿
+                </span>
+                <span className="sortable-label">全部</span>
+                <span className="sub">所有分类合在一起</span>
+                <span className="sortable-actions">
+                  <EyeButton
+                    hidden={hidden.includes("__all__")}
+                    onClick={() => toggleHidden("__all__")}
+                  />
+                </span>
+              </div>
+
+              <div style={{ height: 6 }} />
+
+              {categories.length === 0 ? (
+                <div className="row-hint">这个目录下还没有子文件夹。</div>
+              ) : (
+                <SortableRows
+                  items={categories.map((category) => ({
+                    key: category.path,
+                    label: category.name,
+                    hint: `${category.count} 项`,
+                  }))}
+                  onReorder={(from, to) => {
+                    const next = moveItem(categories, from, to);
+                    setCategories(next);
+                    update({
+                      launcher: { categoryOrder: next.map((category) => category.name) },
+                    });
+                  }}
+                  trailing={(index) => (
+                    <EyeButton
+                      hidden={categories[index].hidden}
+                      onClick={() => toggleHidden(categories[index].name)}
+                    />
+                  )}
+                />
+              )}
+            </div>
+          )}
+
           <Row
             label="呼出位置"
             hint="打开后贴着鼠标出现；关掉则固定在该屏幕的中间偏上"
@@ -1459,44 +1474,61 @@ export function LauncherPage({
               onChange={(value) => update({ launcher: { rememberLocation: value } })}
             />
           </Row>
-
         </Card>
       ) : (
-        <Card title="中转站">
+        <Card title="常用文件夹">
           <p className="sub" style={{ marginTop: 0 }}>
-            面板左侧最后的「中转站」显示这个文件夹。往里拖文件就是移动进这个目录，
-            往外拖就是复制或移动出去——用来在网页、聊天窗口之间快速搬文件。
+            这里的文件夹会出现在面板左侧，点一下直接跳过去；拖动可以调整顺序。
+            往里拖文件就是移动进那个目录，往外拖就是复制或移动出去。
           </p>
-          <Row label="文件夹" hint="建议用一个固定的目录，比如 D:\中转">
-            <div className="hotkey-cell">
-              <code>{folder || "未选择"}</code>
-              <button type="button" className="btn" onClick={() => void choose("file")}>
-                选择
-              </button>
+
+          {folders.length === 0 ? (
+            <div className="row-hint" style={{ marginBottom: 10 }}>
+              还没有添加任何文件夹。
+            </div>
+          ) : (
+            <SortableRows
+              items={folders.map((folder) => ({
+                key: folder,
+                label: folderLabel(folder),
+                hint: folder,
+              }))}
+              onReorder={(from, to) =>
+                update({ launcher: { folders: moveItem(folders, from, to) } })
+              }
+              trailing={(index) => (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() =>
+                    update({ launcher: { folders: folders.filter((_, i) => i !== index) } })
+                  }
+                >
+                  移除
+                </button>
+              )}
+            />
+          )}
+
+          <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+            <button type="button" className="btn" onClick={() => void addFolder()}>
+              添加文件夹
+            </button>
+            {folders.length > 0 && (
               <button
                 type="button"
                 className="btn"
-                onClick={() => update({ launcher: { folder: "" } })}
+                onClick={() => update({ launcher: { folders: [] } })}
               >
-                清空
+                全部清空
               </button>
-            </div>
-          </Row>
-          <Row label="打开文件夹" hint="在资源管理器里查看这个目录">
-            <button
-              type="button"
-              className="btn"
-              onClick={() => folder && void openPath(folder)}
-            >
-              打开
-            </button>
-          </Row>
+            )}
+          </div>
         </Card>
       )}
     </div>
   );
 }
-
 /// 设置页里的「缓存」：目前只有缩略图，以后别的工具也能挂在这里。
 export function CachePage() {
   const [items, setItems] = useState<CacheInfo[]>([]);

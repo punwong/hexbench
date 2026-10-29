@@ -624,7 +624,62 @@
         background: var(--surface-2);
         color: var(--text);
       }
-    </style>
+      /* 侧边栏右键菜单 */
+  .ctx-menu {
+    position: absolute;
+    z-index: 40;
+    min-width: 132px;
+    padding: 5px;
+    border: 1px solid var(--line, #e3e3e3);
+    border-radius: 9px;
+    background: var(--surface, #fff);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+  }
+
+  .ctx-menu button {
+    display: block;
+    width: 100%;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .ctx-menu button:hover {
+    background: var(--hover, rgba(0, 0, 0, 0.06));
+  }
+
+  .side-input-row {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 6px;
+  }
+
+  .side-ok {
+    flex: 0 0 auto;
+    width: 28px;
+    border: 1px solid var(--accent, #2f6fed);
+    border-radius: 7px;
+    background: var(--accent, #2f6fed);
+    color: #fff;
+    cursor: pointer;
+  }
+
+  .side-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    border: 1px solid var(--accent, #2f6fed);
+    border-radius: 7px;
+    background: var(--surface, #fff);
+    color: inherit;
+    font-size: 12.5px;
+  }
+</style>
   </head>
   <body>
     <div id="root"></div>

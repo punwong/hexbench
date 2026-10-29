@@ -1416,3 +1416,70 @@ code,
   font-size: 12.5px;
   animation: fade-in 160ms var(--ease) both;
 }
+/* ---------- 可拖动排序的行 ---------- */
+.sortable {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sortable-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface, transparent);
+  cursor: grab;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.sortable-row.dragging {
+  opacity: 0.45;
+}
+
+.sortable-row.over {
+  border-color: var(--accent, #2f6fed);
+  background: color-mix(in srgb, var(--accent-bg, #eef3ff) 70%, transparent);
+}
+
+.sortable .grip {
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: -1px;
+  cursor: grab;
+  user-select: none;
+}
+
+.sortable-label {
+  font-size: 13px;
+}
+
+.sortable-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+/* 图标按钮（眼睛这类） */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg, inherit);
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  border-color: var(--accent, #2f6fed);
+}
+
+.icon-btn.off {
+  color: var(--muted);
+  opacity: 0.55;
+}
