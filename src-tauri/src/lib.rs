@@ -2201,6 +2201,11 @@ fn store_web_geometry(app: &AppHandle, x: i32, y: i32, w: u32, h: u32) {
 
 /// 用户拖动网页窗口（移动或拖边角改大小）后：重排子网页 + 记住几何。
 fn remember_web_geometry(window: &tauri::WebviewWindow) {
+    // 隐藏/显示过程中系统会上报一个临时位置（比如 130,130），
+    // 那不是用户拖动，存下来会让下次呼出跑到奇怪的地方。
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
     let scale = window.scale_factor().unwrap_or(1.0);
     let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
         return;
