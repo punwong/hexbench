@@ -906,6 +906,18 @@ function Launcher() {
       );
       return true;
     }
+    // Ctrl+Z：撤销上一步（删进回收站 / 重命名 / 移动 / 新建文件夹）
+    if (ctrl && key === "z" && !renaming) {
+      event.preventDefault();
+      void invoke<string>("launcher_undo")
+        .then((message) => {
+          void reload();
+          showToastRef.current(message);
+        })
+        .catch((error) => showToastRef.current(String(error)));
+      return true;
+    }
+
     if (ctrl && key === "v" && !renaming) {
       const dir = currentDir || root.root;
       if (!dir) return false;
@@ -917,6 +929,22 @@ function Launcher() {
     }
     return false;
   };
+
+  // Ctrl+Z 用 document 级监听兜底：焦点在搜索框/改名框时 React 处理器不一定收到。
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z") return;
+      event.preventDefault();
+      void invoke<string>("launcher_undo")
+        .then((message) => {
+          void reload();
+          showToastRef.current(message);
+        })
+        .catch((error) => showToastRef.current(String(error)));
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [reload]);
 
   const onRootKeyDown = (event: React.KeyboardEvent) => {
     if (fileShortcuts(event)) return;

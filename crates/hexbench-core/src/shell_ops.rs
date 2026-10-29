@@ -332,6 +332,79 @@ pub fn paste_into(dest: &Path) -> Result<usize, String> {
     }
 }
 
+/// 把之前删除（进回收站）的文件还原到原位置。
+///
+/// Windows 的回收站是「每卷一个」：`<卷>:\$Recycle.Bin\<SID>\` 下成对放
+/// `$I<id>`（元数据，里面有原始完整路径）和 `$R<id>`（实际内容）。
+/// 这里按原始路径找到对应的一对，把 `$R` 搬回去、删掉 `$I`，
+/// 效果就等于在回收站里点「还原」。
+pub fn restore_trashed(original: &std::path::Path) -> Result<(), String> {
+    use std::path::Component;
+
+    let prefix = match original.components().next() {
+        Some(Component::Prefix(prefix)) => prefix.as_os_str().to_string_lossy().to_string(),
+        _ => return Err("只能还原本机磁盘上的文件".to_string()),
+    };
+    let bin = std::path::PathBuf::from(format!("{prefix}\\$Recycle.Bin"));
+    if original.exists() {
+        return Err(format!("{} 已经存在了", original.display()));
+    }
+
+    let want = original.to_string_lossy().to_lowercase();
+    let Ok(sids) = std::fs::read_dir(&bin) else {
+        return Err("读不到回收站".to_string());
+    };
+    for sid in sids.flatten() {
+        let Ok(entries) = std::fs::read_dir(sid.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("$I") || name.len() < 3 {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            if bytes.len() < 28 {
+                continue;
+            }
+            let version = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            if version != 2 {
+                continue;
+            }
+            let length = u32::from_le_bytes(bytes[24..28].try_into().unwrap_or([0; 4])) as usize;
+            if length == 0 || bytes.len() < 28 + length * 2 {
+                continue;
+            }
+            let utf16: Vec<u16> = bytes[28..28 + length * 2]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .take_while(|code| *code != 0)
+                .collect();
+            let recorded = String::from_utf16_lossy(&utf16);
+            if recorded.to_lowercase() != want {
+                continue;
+            }
+            let payload = entry.path().with_file_name(format!("$R{}", &name[2..]));
+            if !payload.exists() {
+                continue;
+            }
+            if let Some(parent) = original.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::rename(&payload, original)
+                .map_err(|error| format!("还原 {}: {error}", original.display()))?;
+            let _ = std::fs::remove_file(entry.path());
+            log::info!("restore: {} 已还原", original.display());
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "回收站里找不到 {}（可能已经被清空）",
+        original.display()
+    ))
+}
 /// 取缩略图（RGBA）。拿不到缩略图时 Shell 会退化成图标，两者都失败才返回 None。
 pub fn thumbnail_rgba(path: &Path, size: u32) -> Option<(Vec<u8>, u32, u32)> {
     ensure_com();

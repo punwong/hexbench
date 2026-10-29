@@ -2854,6 +2854,17 @@ fn launcher_move_into(dest: String, paths: Vec<String>, app: AppHandle) -> Resul
         return Err("文件已经不在了".to_string());
     }
     let moved = move_paths_into(&dir, &sources);
+    // 记下「新位置 ← 旧位置」，撤销时搬回去
+    let pairs: Vec<(PathBuf, PathBuf)> = sources
+        .iter()
+        .filter_map(|source| {
+            let name = source.file_name()?;
+            Some((dir.join(name), source.clone()))
+        })
+        .collect();
+    if !pairs.is_empty() {
+        push_undo(UndoOp::Move(pairs));
+    }
     log::info!("launcher: moved {moved} item(s) into {}", dir.display());
     let _ = app.emit("launcher-changed", ());
     Ok(moved)
@@ -2886,6 +2897,7 @@ fn launcher_create_dir(parent: String, name: String) -> Result<String, String> {
 #[tauri::command]
 fn launcher_new_folder(parent: String) -> Result<String, String> {
     let target = hexbench_core::sys::create_folder(std::path::Path::new(&parent), "新建文件夹")?;
+    push_undo(UndoOp::NewFolder(target.clone()));
     Ok(target.to_string_lossy().to_string())
 }
 /// 某个分类（也就是某个子文件夹）里的条目。
@@ -2998,12 +3010,91 @@ fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String
         }
     }
 }
+/// 撤销栈：记录最近能反悔的操作。
+enum UndoOp {
+    /// 删进回收站的文件（撤销 = 从回收站还原）
+    Trash(Vec<PathBuf>),
+    /// 重命名：（新路径, 旧路径）
+    Rename { path: PathBuf, previous: PathBuf },
+    /// 移动：（新路径, 旧路径）成对
+    Move(Vec<(PathBuf, PathBuf)>),
+    /// 新建文件夹
+    NewFolder(PathBuf),
+}
+
+static UNDO_STACK: Mutex<Vec<UndoOp>> = Mutex::new(Vec::new());
+
+fn push_undo(op: UndoOp) {
+    if let Ok(mut stack) = UNDO_STACK.lock() {
+        stack.push(op);
+        // 只留最近 30 步，够用又不占内存
+        while stack.len() > 30 {
+            stack.remove(0);
+        }
+    }
+}
+
+/// Ctrl+Z：撤销上一步。
+#[tauri::command]
+fn launcher_undo(app: AppHandle) -> Result<String, String> {
+    let op = UNDO_STACK.lock().ok().and_then(|mut stack| stack.pop());
+    let Some(op) = op else {
+        return Err("没有可撤销的操作".to_string());
+    };
+    let message = match op {
+        UndoOp::Trash(paths) => {
+            let mut restored = 0usize;
+            let mut last_error = String::new();
+            for path in &paths {
+                match hexbench_core::shell_ops::restore_trashed(path) {
+                    Ok(()) => restored += 1,
+                    Err(error) => last_error = error,
+                }
+            }
+            if restored == 0 {
+                return Err(last_error);
+            }
+            format!("已从回收站还原 {restored} 个文件")
+        }
+        UndoOp::Rename { path, previous } => {
+            std::fs::rename(&path, &previous).map_err(|error| error.to_string())?;
+            format!("已还原名称：{}", previous.display())
+        }
+        UndoOp::Move(entries) => {
+            let mut moved = 0usize;
+            for (from, to) in &entries {
+                if from.exists() && !to.exists() {
+                    if let Err(error) = std::fs::rename(from, to) {
+                        log::warn!("undo move: {error}");
+                        continue;
+                    }
+                    moved += 1;
+                }
+            }
+            if moved == 0 {
+                return Err("这些文件已经不在原来的位置了".to_string());
+            }
+            format!("已移回 {moved} 个文件")
+        }
+        UndoOp::NewFolder(path) => {
+            hexbench_core::shell_ops::trash(&[path]).map_err(|error| error.to_string())?;
+            "已删除刚新建的文件夹".to_string()
+        }
+    };
+    let _ = app.emit("launcher-changed", ());
+    log::info!("undo: {message}");
+    Ok(message)
+}
 /// 删除到回收站（系统会弹确认框）。
 #[tauri::command]
 fn launcher_trash(paths: Vec<String>) -> Result<usize, String> {
     log::info!("trash: {} items", paths.len());
     let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    hexbench_core::shell_ops::trash(&targets)
+    let removed = hexbench_core::shell_ops::trash(&targets)?;
+    if removed > 0 {
+        push_undo(UndoOp::Trash(targets));
+    }
+    Ok(removed)
 }
 
 /// 把选中项放上剪贴板（cut=true 表示剪切）。
@@ -3129,6 +3220,10 @@ fn launcher_rename(path: String, name: String, app: AppHandle) -> Result<String,
             return Err(error);
         }
     };
+    push_undo(UndoOp::Rename {
+        path: renamed.clone(),
+        previous: target.clone(),
+    });
     let _ = app.emit("launcher-changed", ());
     Ok(renamed.to_string_lossy().to_string())
 }
@@ -3704,6 +3799,7 @@ pub fn run() {
             launcher_context_menu,
     launcher_background_menu,
     launcher_trash,
+    launcher_undo,
     launcher_clipboard_copy,
     launcher_paste,
             launcher_rename,
