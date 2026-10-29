@@ -864,6 +864,7 @@ function Launcher() {
   };
 
   const onInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (fileShortcuts(event)) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setSelected((current) =>
@@ -885,7 +886,40 @@ function Launcher() {
   };
 
   /** Esc 的唯一处理点：改名输入框会 stopPropagation，走到这里的一定不是改名。 */
+  // 删除 / 复制 / 剪切 / 粘贴：根节点和搜索框都要能用。
+  const fileShortcuts = (event: React.KeyboardEvent): boolean => {
+    const target = event.target as HTMLElement;
+    const renaming = target.tagName === "TEXTAREA";
+    const ctrl = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+    if (event.key === "Delete" && picked.size > 0) {
+      event.preventDefault();
+      void invoke<number>("launcher_trash", { paths: [...picked] })
+        .then(() => void reload())
+        .catch((error) => showToastRef.current(String(error)));
+      return true;
+    }
+    if (ctrl && (key === "c" || key === "x") && picked.size > 0 && !renaming) {
+      event.preventDefault();
+      void invoke("launcher_clipboard_copy", { paths: [...picked], cut: key === "x" }).catch(
+        (error) => showToastRef.current(String(error)),
+      );
+      return true;
+    }
+    if (ctrl && key === "v" && !renaming) {
+      const dir = currentDir || root.root;
+      if (!dir) return false;
+      event.preventDefault();
+      void invoke<number>("launcher_paste", { dest: dir })
+        .then(() => void reload())
+        .catch((error) => showToastRef.current(String(error)));
+      return true;
+    }
+    return false;
+  };
+
   const onRootKeyDown = (event: React.KeyboardEvent) => {
+    if (fileShortcuts(event)) return;
     const target = event.target as HTMLElement;
     // 改名时 Ctrl+A 应该选中名字本身，而不是全选文件。
     const renaming = target.tagName === "TEXTAREA";
@@ -894,6 +928,36 @@ function Launcher() {
       setPicked(new Set(shown.map((item) => item.path)));
       return;
     }
+    // 删除到回收站（系统会弹确认框）
+    if (event.key === "Delete" && picked.size > 0) {
+      event.preventDefault();
+      void invoke<number>("launcher_trash", { paths: [...picked] })
+        .then(() => void reload())
+        .catch((error) => showToastRef.current(String(error)));
+      return;
+    }
+
+    const ctrl = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+    // 复制 / 剪切：写进系统剪贴板，资源管理器也能粘
+    if (ctrl && (key === "c" || key === "x") && picked.size > 0 && !renaming) {
+      event.preventDefault();
+      void invoke("launcher_clipboard_copy", { paths: [...picked], cut: key === "x" }).catch(
+        (error) => showToastRef.current(String(error)),
+      );
+      return;
+    }
+    // 粘贴到当前目录
+    if (ctrl && key === "v" && !renaming) {
+      const dir = currentDir || root.root;
+      if (!dir) return;
+      event.preventDefault();
+      void invoke<number>("launcher_paste", { dest: dir })
+        .then(() => void reload())
+        .catch((error) => showToastRef.current(String(error)));
+      return;
+    }
+
     if (event.key !== "Escape") return;
     event.preventDefault();
     // 先取消多选，再退层，最后才关面板。

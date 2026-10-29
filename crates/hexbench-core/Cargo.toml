@@ -20,6 +20,8 @@ ureq = "2"
 # 手写 vtable 太容易出错，直接用生成好的。
 windows = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
   "Win32_System_Com",
   "Win32_System_Ole",
   "Win32_UI_Shell",

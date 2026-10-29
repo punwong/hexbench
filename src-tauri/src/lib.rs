@@ -2891,6 +2891,28 @@ fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String
         }
     }
 }
+/// 删除到回收站（系统会弹确认框）。
+#[tauri::command]
+fn launcher_trash(paths: Vec<String>) -> Result<usize, String> {
+    log::info!("trash: {} items", paths.len());
+    let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    hexbench_core::shell_ops::trash(&targets)
+}
+
+/// 把选中项放上剪贴板（cut=true 表示剪切）。
+#[tauri::command]
+fn launcher_clipboard_copy(paths: Vec<String>, cut: bool) -> Result<(), String> {
+    log::info!("clipboard: copy {} items cut={cut}", paths.len());
+    let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    hexbench_core::shell_ops::clipboard_set_files(&targets, cut)
+}
+
+/// 粘贴剪贴板里的文件到目标目录。
+#[tauri::command]
+fn launcher_paste(dest: String) -> Result<usize, String> {
+    log::info!("clipboard: paste into {dest}");
+    hexbench_core::shell_ops::paste_into(&PathBuf::from(dest))
+}
 /// 文件夹空白处的原生右键菜单（新建 / 粘贴 / 属性 / 刷新）。
 #[tauri::command]
 fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> {
@@ -3567,6 +3589,9 @@ pub fn run() {
             launcher_begin_drag,
             launcher_context_menu,
     launcher_background_menu,
+    launcher_trash,
+    launcher_clipboard_copy,
+    launcher_paste,
             launcher_rename,
             open_settings,
             launcher_set_drop_target,
