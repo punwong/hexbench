@@ -44,6 +44,7 @@ const demoConfig: Config = {
       siteKeepAliveSecs: 90,
     siteWidthPercent: 24,
     siteHeightPercent: 85,
+    siteRememberPosition: true,
     siteFollowPanel: false,
     siteSide: "right",
       followCursor: true,

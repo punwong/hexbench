@@ -93,6 +93,8 @@ export interface LauncherSettings {
   siteWidthPercent: number;
   /** 网页窗口高度占工作区百分比 */
   siteHeightPercent: number;
+  /** 是否记住网页窗口拖动后的位置和大小 */
+  siteRememberPosition: boolean;
   /** 网页窗口是否跟随呼出面板（默认固定贴一侧） */
   siteFollowPanel: boolean;
   /** 固定位置时贴哪一侧："left" | "right" */

@@ -2096,9 +2096,9 @@ fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
         let launcher = &shared.config.launcher;
         let pct_w = launcher.site_width_percent.clamp(10, 90);
         let pct_h = launcher.site_height_percent.clamp(20, 100);
-        // 拖动保存的几何只在百分比没被改过时才算数；
-        // 用户在设置里改了百分比，就重新按百分比摆。
-        let saved = (launcher.site_w > 0
+        // 拖动保存的几何：关掉「记住位置」或改了百分比都不算数
+        let saved = (launcher.site_remember_position
+            && launcher.site_w > 0
             && launcher.site_pct_w == pct_w
             && launcher.site_pct_h == pct_h)
             .then_some((
@@ -2118,36 +2118,42 @@ fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
     let (area_x, area_y, area_w, area_h) =
         hexbench_core::sys::work_area_at(cursor_x, cursor_y).unwrap_or((0, 0, 1920, 1080));
+    let pct_width = (area_w as f64 * width_percent as f64 / 100.0).max(240.0);
+    let pct_height = (area_h as f64 * height_percent as f64 / 100.0).max(240.0);
 
-    let (width, height, left, top) = if let Some((saved_x, saved_y, saved_w, saved_h)) = saved {
+    // 优先级：跟随面板 > 记住的拖动结果 > 固定贴一侧
+    let (width, height, left, top) = if follow {
+        let (left, top) = match app.get_webview_window("launcher") {
+            Some(panel) => {
+                let scale = panel.scale_factor().unwrap_or(1.0);
+                match (panel.outer_position(), panel.inner_size()) {
+                    (Ok(position), Ok(size)) => (
+                        (position.x as f64 / scale + size.width as f64 / scale + 8.0).round(),
+                        (position.y as f64 / scale).round(),
+                    ),
+                    _ => (area_x as f64, area_y as f64),
+                }
+            }
+            None => (area_x as f64, area_y as f64),
+        };
+        (pct_width, pct_height, left, top)
+    } else if let Some((saved_x, saved_y, saved_w, saved_h)) = saved {
         // 用户拖过：位置和大小都按他拖出来的来
         (saved_w, saved_h, saved_x as f64, saved_y as f64)
+    } else if side == "left" {
+        (
+            pct_width,
+            pct_height,
+            area_x as f64,
+            area_y as f64 + (area_h as f64 - pct_height) / 2.0,
+        )
     } else {
-        let width = (area_w as f64 * width_percent as f64 / 100.0).max(240.0);
-        let height = (area_h as f64 * height_percent as f64 / 100.0).max(240.0);
-        let (left, top) = if follow {
-            match app.get_webview_window("launcher") {
-                Some(panel) => {
-                    let scale = panel.scale_factor().unwrap_or(1.0);
-                    match (panel.outer_position(), panel.inner_size()) {
-                        (Ok(position), Ok(size)) => (
-                            (position.x as f64 / scale + size.width as f64 / scale + 8.0).round(),
-                            (position.y as f64 / scale).round(),
-                        ),
-                        _ => (area_x as f64, area_y as f64),
-                    }
-                }
-                None => (area_x as f64, area_y as f64),
-            }
-        } else if side == "left" {
-            (area_x as f64, area_y as f64 + (area_h as f64 - height) / 2.0)
-        } else {
-            (
-                area_x as f64 + area_w as f64 - width,
-                area_y as f64 + (area_h as f64 - height) / 2.0,
-            )
-        };
-        (width, height, left, top)
+        (
+            pct_width,
+            pct_height,
+            area_x as f64 + area_w as f64 - pct_width,
+            area_y as f64 + (area_h as f64 - pct_height) / 2.0,
+        )
     };
 
     let _ = web.set_size(tauri::LogicalSize::new(width, height));

@@ -1530,6 +1530,13 @@ export function LauncherPage({
             </div>
           </Row>
 
+          <Row label="记住网页窗口的位置和大小">
+            <Toggle
+              checked={config.launcher.siteRememberPosition ?? true}
+              onChange={(next) => update({ launcher: { siteRememberPosition: next } })}
+            />
+          </Row>
+
           <Row label="跟随呼出面板">
             <Toggle
               checked={config.launcher.siteFollowPanel ?? false}

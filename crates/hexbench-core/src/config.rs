@@ -188,6 +188,8 @@ pub struct LauncherSettings {
     pub site_follow_panel: bool,
     /// 固定位置时贴哪一侧："left" 或 "right"。
     pub site_side: String,
+    /// 是否记住拖动出来的位置和大小。
+    pub site_remember_position: bool,
     /// 用户拖动出来的位置和大小（逻辑像素）。0 表示没拖过。
     pub site_x: i32,
     pub site_y: i32,
@@ -236,6 +238,7 @@ impl Default for LauncherSettings {
             site_height_percent: 85,
             site_follow_panel: false,
             site_side: "right".to_string(),
+            site_remember_position: true,
             site_x: 0,
             site_y: 0,
             site_w: 0,
