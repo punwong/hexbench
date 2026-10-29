@@ -62,15 +62,15 @@ const TITLES: Record<Page, { title: string; subtitle: string }> = {
 
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
-  const [launcherTab, setLauncherTab] = useState<"items" | "folders">("items");
+  const [launcherTab, setLauncherTab] = useState<"items" | "folders" | "sites">("items");
   // 面板里点「去设置」：切到指定页面（可带 tab）。
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<{ page: string; tab: string | null } | null>("navigate", (event) => {
       const target = event.payload?.page ?? "overview";
       const tab = event.payload?.tab ?? null;
-      if (target === "launcher" && (tab === "items" || tab === "folders")) {
-        setLauncherTab(tab as "items" | "folders");
+      if (target === "launcher" && (tab === "items" || tab === "folders" || tab === "sites")) {
+        setLauncherTab(tab as "items" | "folders" | "sites");
       }
       setPage(target as Page);
     }).then((fn) => {

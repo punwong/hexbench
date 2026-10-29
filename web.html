@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>网页</title>
+    <style>
+      /* 和面板（launcher.html）同一套颜色变量，视觉上连成一片 */
+      :root {
+        --bg: #ffffff;
+        --sidebar: #f7f7f8;
+        --surface: #f7f7f8;
+        --surface-2: #efeff1;
+        --text: #0d0d0d;
+        --muted: #6b6b6b;
+        --line: rgba(0, 0, 0, 0.08);
+        --pick: rgba(0, 0, 0, 0.1);
+        --accent: #2f6fed;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d0d0d;
+          --sidebar: #131313;
+          --surface: #191919;
+          --surface-2: #232323;
+          --text: #ececec;
+          --muted: #9b9b9b;
+          --line: rgba(255, 255, 255, 0.1);
+          --pick: rgba(255, 255, 255, 0.14);
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      /* 和面板一样：窗口透明，body 自己画 1px 发丝边框 + 8px 圆角 */
+      html {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+      }
+
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        font-size: 12.5px;
+        /* 这里不画边框：两个独立窗口各画一条会在接缝处叠色，
+        而且窗口自身还会多出一圈系统描边（实测边缘是 200，比面板的 235 更深）。
+        统一由左侧面板的边框和那条竖线来表达边界。 */
+        /* 左半边的圆角交给左侧面板，自己只圆右侧，拼起来像一张卡片 */
+        border-radius: 0 8px 8px 0;
+        overflow: hidden;
+      }
+
+      /* 与面板 .toolbar 完全一致：40px 高、左右 12 留白、发丝下边框 */
+      #bar {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 40px;
+        padding: 0 12px;
+        border-bottom: 1px solid var(--line);
+        -webkit-app-region: drag;
+      }
+
+      #bar button { -webkit-app-region: no-drag; }
+
+      #tabs {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        flex: 1;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      #tabs::-webkit-scrollbar { display: none; }
+
+      /* 站点标签：和面板里的图标按钮同样的尺寸与圆角 */
+      .tab {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      .tab img {
+        width: 16px;
+        height: 16px;
+        object-fit: contain;
+      }
+
+      .tab span {
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .tab:hover { background: var(--pick); }
+
+      .tab.active {
+        border-color: var(--accent);
+        background: rgba(47, 111, 237, 0.1);
+      }
+
+      .btn {
+        flex: 0 0 auto;
+        min-width: 26px;
+        height: 24px;
+        padding: 0 6px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text);
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      .btn:hover { background: var(--pick); }
+
+      .hint {
+        flex: 1;
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <div id="tabs"><span class="hint">加载中…</span></div>
+      <button class="btn" id="reload" title="刷新网页">⟳</button>
+    </div>
+    <script>
+      // 这个窗口只需要一条顶栏：不经过 React / Vite 模块图，
+      // 直接连 Tauri 的 IPC，避免任何引导层出问题导致白屏。
+      (function () {
+        var tabs = document.getElementById("tabs");
+        var icons = {};
+        var sites = [];
+        var activeUrl = "";
+
+        function invoke(cmd, args) {
+          var internals = window.__TAURI_INTERNALS__;
+          if (!internals || typeof internals.invoke !== "function") {
+            return Promise.reject(new Error("没有 Tauri IPC"));
+          }
+          return internals.invoke(cmd, args);
+        }
+
+        function showHint(text) {
+          var hint = document.createElement("span");
+          hint.className = "hint";
+          hint.textContent = text;
+          tabs.replaceChildren(hint);
+        }
+
+        function render() {
+          if (!sites.length) {
+            showHint("还没有添加网址（去设置里加）");
+            return;
+          }
+          tabs.replaceChildren();
+          sites.forEach(function (site) {
+            var button = document.createElement("button");
+            button.className = "tab" + (site.url === activeUrl ? " active" : "");
+            button.title = site.name || site.url;
+            if (icons[site.url]) {
+              var img = document.createElement("img");
+              img.src = icons[site.url];
+              img.alt = "";
+              button.appendChild(img);
+            } else {
+              var span = document.createElement("span");
+              span.textContent = (site.name || site.url).slice(0, 1);
+              button.appendChild(span);
+            }
+            button.addEventListener("click", function () {
+              select(site);
+            });
+            tabs.appendChild(button);
+          });
+        }
+
+        function select(site) {
+          activeUrl = site.url;
+          try {
+            localStorage.setItem("web-active", site.url);
+          } catch (error) {
+            /* 忽略 */
+          }
+          render();
+          invoke("web_page_open", { url: site.url }).catch(function (error) {
+            showHint("打开失败：" + String(error));
+          });
+          loadIcon(site.url);
+        }
+
+        function loadIcon(url) {
+          if (!url || icons[url]) return;
+          invoke("site_icon", { url: url })
+            .then(function (icon) {
+              if (!icon) return;
+              icons[url] = icon;
+              render();
+            })
+            .catch(function () {});
+        }
+
+        document.getElementById("reload").addEventListener("click", function () {
+          invoke("web_page_nav", { action: "reload" }).catch(function () {});
+        });
+
+
+        invoke("launcher_web_sites")
+          .then(function (list) {
+            sites = list || [];
+            var remembered = "";
+            try {
+              remembered = localStorage.getItem("web-active") || "";
+            } catch (error) {
+              remembered = "";
+            }
+            var first = null;
+            for (var i = 0; i < sites.length; i += 1) {
+              if (sites[i].url === remembered) first = sites[i];
+            }
+            if (!first && sites.length) first = sites[0];
+            if (first) {
+              select(first);
+            } else {
+              render();
+            }
+          })
+          .catch(function (error) {
+            showHint("读不到网址：" + String(error));
+          });
+      })();
+    </script>
+  </body>
+</html>

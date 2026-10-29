@@ -143,6 +143,14 @@ pub struct UpdateSettings {
 }
 
 
+/// 面板里的一个网址。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LauncherSite {
+    pub name: String,
+    pub url: String,
+}
+
 /// 呼出面板的文件区：一个被映射的文件夹，显示在面板里。
 /// 面板上次停留的位置。只在 `remember_location` 打开时使用。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -166,6 +174,20 @@ pub struct LauncherSettings {
     pub root: String,
     /// 分类的显示顺序（按子文件夹名）；不在这里的分类排在后面。
     pub category_order: Vec<String>,
+    /// 面板里的「网址」分组：可以在面板里直接打开这些站点。
+    pub sites: Vec<LauncherSite>,
+    /// 内置网页总开关（关掉就只有文件夹，不创建任何 WebView）。
+    pub web_enabled: bool,
+    /// 面板收起后网页保留多少秒（0 = 立即关闭）。
+    pub site_keep_alive_secs: u32,
+    /// 网页窗口宽度，占工作区百分比。
+    pub site_width_percent: u32,
+    /// 网页窗口高度，占工作区百分比。
+    pub site_height_percent: u32,
+    /// 网页窗口是否跟着呼出面板走（默认 false：固定贴在屏幕一侧）。
+    pub site_follow_panel: bool,
+    /// 固定位置时贴哪一侧："left" 或 "right"。
+    pub site_side: String,
     /// 在面板里隐藏的项：分类名，或 `__all__` 表示「全部」那一项。
     /// 默认只列分类，不要「全部」——启动器里它太干扰。
     pub hidden_categories: Vec<String>,
@@ -198,6 +220,14 @@ impl Default for LauncherSettings {
             root: String::new(),
             category_order: Vec::new(),
             hidden_categories: vec!["__all__".to_string()],
+            sites: Vec::new(),
+            web_enabled: true,
+            // 默认留 90 秒：够把一段 AI 回答说完，又不至于一直占着内存。
+            site_keep_alive_secs: 90,
+            site_width_percent: 24,
+            site_height_percent: 85,
+            site_follow_panel: false,
+            site_side: "right".to_string(),
             legacy_folder: String::new(),
             // 默认就是「贴着鼠标 + 面板占一半」，和产品设定一致。
             follow_cursor: true,

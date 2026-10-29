@@ -22,6 +22,7 @@ import {
   cacheStats,
   copyText,
   launcherCategoryList,
+  siteTitle,
   diagnostics,
   onAppPicked,
   openPath,
@@ -1310,8 +1311,8 @@ export function LauncherPage({
 }: {
   config: Config;
   update: UpdateConfig;
-  tab: "items" | "folders";
-  onTabChange: (tab: "items" | "folders") => void;
+  tab: "items" | "folders" | "sites";
+  onTabChange: (tab: "items" | "folders" | "sites") => void;
 }) {
   const root = config.launcher.root;
   const folders = config.launcher.folders ?? [];
@@ -1352,10 +1353,11 @@ export function LauncherPage({
     <div className="stack">
       <Tabs
         value={tab}
-        onChange={(value) => onTabChange(value as "items" | "folders")}
+        onChange={(value) => onTabChange(value as "items" | "folders" | "sites")}
         options={[
           { value: "items", label: "启动项" },
           { value: "folders", label: "常用文件夹" },
+          { value: "sites", label: "网址" },
         ]}
       />
 
@@ -1474,6 +1476,202 @@ export function LauncherPage({
               onChange={(value) => update({ launcher: { rememberLocation: value } })}
             />
           </Row>
+        </Card>
+      ) : tab === "sites" ? (
+        <Card title="网址">
+          <p className="sub" style={{ marginTop: 0 }}>
+            这里加的站点会出现在面板左侧，点一下直接在面板里打开（真 WebView，不是 iframe，
+            所以 Google、ChatGPT 这类也能开）。面板收起时网页会一起关掉，不占内存。
+          </p>
+          <Row label="内置网页" hint="关掉之后面板只显示文件夹，不会创建任何 WebView">
+            <Toggle
+              checked={config.launcher.webEnabled !== false}
+              onChange={(value) => update({ launcher: { webEnabled: value } })}
+            />
+          </Row>
+
+          <Row label="收起后保留" hint="面板收起后网页继续运行多少秒（0 = 立刻关闭）。问 AI 时建议留几十秒">
+            <div className="hotkey-cell">
+              <input
+                className="side-input"
+                style={{ width: 84 }}
+                value={config.launcher.siteKeepAliveSecs ?? 90}
+                onChange={(event) => {
+                  const digits = event.target.value.replace(/\D/g, "");
+                  update({ launcher: { siteKeepAliveSecs: digits ? Number(digits) : 0 } });
+                }}
+              />
+              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>秒</span>
+            </div>
+          </Row>
+
+          <Row label="网页窗口宽度 / 高度（占工作区百分比）">
+            <div className="hotkey-cell">
+              <input
+                className="side-input"
+                style={{ width: 64 }}
+                value={config.launcher.siteWidthPercent ?? 24}
+                onChange={(event) => {
+                  const digits = event.target.value.replace(/\D/g, "");
+                  update({ launcher: { siteWidthPercent: digits ? Number(digits) : 10 } });
+                }}
+              />
+              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>%</span>
+              <input
+                className="side-input"
+                style={{ width: 64 }}
+                value={config.launcher.siteHeightPercent ?? 85}
+                onChange={(event) => {
+                  const digits = event.target.value.replace(/\D/g, "");
+                  update({ launcher: { siteHeightPercent: digits ? Number(digits) : 20 } });
+                }}
+              />
+              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>%</span>
+            </div>
+          </Row>
+
+          <Row label="跟随呼出面板">
+            <Toggle
+              checked={config.launcher.siteFollowPanel ?? false}
+              onChange={(next) => update({ launcher: { siteFollowPanel: next } })}
+            />
+          </Row>
+
+          {(config.launcher.siteFollowPanel ?? false) ? null : (
+            <Row label="固定在屏幕哪一侧">
+              <div className="hotkey-cell">
+                {(["left", "right"] as const).map((side) => (
+                  <button
+                    key={side}
+                    type="button"
+                    className={(config.launcher.siteSide ?? "right") === side ? "chip active" : "chip"}
+                    onClick={() => update({ launcher: { siteSide: side } })}
+                    style={{ marginRight: 6 }}
+                  >
+                    {side === "left" ? "左侧" : "右侧"}
+                  </button>
+                ))}
+              </div>
+            </Row>
+          )}
+
+          {(config.launcher.sites ?? []).length === 0 && (
+            <div className="row-hint" style={{ marginBottom: 10 }}>
+              还没有添加网址。
+            </div>
+          )}
+
+          {(config.launcher.sites ?? []).map((entry, index) => (
+            <div key={index} className="sortable-row" style={{ cursor: "default" }}>
+              <input
+                className="side-input"
+                style={{ width: 110 }}
+                value={entry.name}
+                placeholder="名称"
+                onChange={(event) =>
+                  update({
+                    launcher: {
+                      sites: (config.launcher.sites ?? []).map((item, i) =>
+                        i === index ? { ...item, name: event.target.value } : item,
+                      ),
+                    },
+                  })
+                }
+              />
+              <input
+                className="side-input"
+                style={{ flex: 1 }}
+                value={entry.url}
+                placeholder="https://chatgpt.com"
+                onChange={(event) =>
+                  update({
+                    launcher: {
+                      sites: (config.launcher.sites ?? []).map((item, i) =>
+                        i === index ? { ...item, url: event.target.value } : item,
+                      ),
+                    },
+                  })
+                }
+                onBlur={() => {
+                  const raw = entry.url.trim();
+                  if (!raw) return;
+                  // 只打 `bing.com` 也认：补上协议再存，省得后面报「网址不对」。
+                  const normalized = raw.includes("://") ? raw : `https://${raw}`;
+                  const patched = (config.launcher.sites ?? []).map((item, i) =>
+                    i === index ? { ...item, url: normalized } : item,
+                  );
+                  if (normalized !== raw) update({ launcher: { sites: patched } });
+                  // 名字空着就顺手抓一下标题；抓到之后照样能改。
+                  if (entry.name.trim()) return;
+                  void siteTitle(normalized).then((title) => {
+                    if (!title) return;
+                    update({
+                      launcher: {
+                        sites: patched.map((item, i) =>
+                          i === index && !item.name.trim() ? { ...item, name: title } : item,
+                        ),
+                      },
+                    });
+                  });
+                }}
+              />
+              <span className="sortable-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={index === 0}
+                  title="上移"
+                  onClick={() =>
+                    update({
+                      launcher: { sites: moveItem(config.launcher.sites ?? [], index, index - 1) },
+                    })
+                  }
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={index === (config.launcher.sites ?? []).length - 1}
+                  title="下移"
+                  onClick={() =>
+                    update({
+                      launcher: { sites: moveItem(config.launcher.sites ?? [], index, index + 1) },
+                    })
+                  }
+                >
+                  ↓
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() =>
+                    update({
+                      launcher: {
+                        sites: (config.launcher.sites ?? []).filter((_, i) => i !== index),
+                      },
+                    })
+                  }
+                >
+                  移除
+                </button>
+              </span>
+            </div>
+          ))}
+
+          <div style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              className="btn"
+              onClick={() =>
+                update({
+                  launcher: { sites: [...(config.launcher.sites ?? []), { name: "", url: "" }] },
+                })
+              }
+            >
+              添加网址
+            </button>
+          </div>
         </Card>
       ) : (
         <Card title="常用文件夹">

@@ -1565,6 +1565,22 @@ pub fn rename_path(
 
 
 
+/// 前台窗口是不是属于我们自己的进程。
+///
+/// 面板收起靠「失焦」判断，但内嵌网页是同一进程的子窗口：
+/// 它抢到焦点时前台窗口仍然是我们的，这种情况不应该收起。
+pub fn foreground_is_current_process() -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, &mut pid);
+        pid == std::process::id()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_accent;

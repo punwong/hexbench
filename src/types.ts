@@ -81,8 +81,22 @@ export interface LauncherSettings {
   root: string;
   /** 分类的显示顺序（按子文件夹名） */
   categoryOrder: string[];
-  /** 面板里隐藏的项：分类名，或 __root__ 表示根目录 */
+  /** 面板里隐藏的项：分类名，或 __all__ 表示「全部」 */
   hiddenCategories: string[];
+  /** 面板里的网址分组 */
+  sites: Array<{ name: string; url: string }>;
+  /** 内置网页总开关 */
+  webEnabled: boolean;
+  /** 面板收起后网页保留多少秒（0 = 立即关闭） */
+  siteKeepAliveSecs: number;
+  /** 网页窗口宽度占工作区百分比 */
+  siteWidthPercent: number;
+  /** 网页窗口高度占工作区百分比 */
+  siteHeightPercent: number;
+  /** 网页窗口是否跟随呼出面板（默认固定贴一侧） */
+  siteFollowPanel: boolean;
+  /** 固定位置时贴哪一侧："left" | "right" */
+  siteSide: string;
   /** 呼出时贴着鼠标，而不是屏幕居中 */
   followCursor: boolean;
   /** 面板宽度占工作区百分比 */

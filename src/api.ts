@@ -38,7 +38,14 @@ const demoConfig: Config = {
       folders: [],
       root: "",
       categoryOrder: [],
-      hiddenCategories: ["__root__"],
+      hiddenCategories: ["__all__"],
+      sites: [],
+      webEnabled: true,
+      siteKeepAliveSecs: 90,
+    siteWidthPercent: 24,
+    siteHeightPercent: 85,
+    siteFollowPanel: false,
+    siteSide: "right",
       followCursor: true,
       widthPercent: 50,
       heightPercent: 50,
@@ -390,4 +397,9 @@ export interface LauncherCategoryInfo {
 export async function launcherCategoryList(path: string): Promise<LauncherCategoryInfo[]> {
   if (!isTauri || !path) return [];
   return invoke<LauncherCategoryInfo[]>("launcher_categories_at", { path });
+}
+/// 抓网页标题，用来给网址自动填名字。
+export async function siteTitle(url: string): Promise<string> {
+  if (!isTauri || !url.trim()) return "";
+  return invoke<string>("site_title", { url });
 }

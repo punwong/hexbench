@@ -22,6 +22,10 @@ type LauncherRoot = {
   categories: Category[];
   /** 常用文件夹，顺序就是侧边栏顺序 */
   folders: string[];
+  /** 网址分组 */
+  sites: Array<{ name: string; url: string }>;
+  /** 设置里的「内置网页」开关：开着就默认展开右侧栏 */
+  webEnabled: boolean;
   view: string;
   sortKey: string;
   sortDir: number;
@@ -126,6 +130,8 @@ function Launcher() {
     allVisible: false,
     categories: [],
     folders: [],
+    sites: [],
+    webEnabled: false,
     view: "grid",
     sortKey: "name",
     sortDir: 1,
@@ -173,6 +179,9 @@ function Launcher() {
   const [picked, setPicked] = useState<Set<string>>(() => new Set());
   // 拖拽悬停在哪一行/格子上（只对文件夹有意义）
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  // 正在面板里看的内嵌网页；null = 文件视图
+  // 站点图标：抓一次就缓存，标签页直接用。
+  const [siteIcons, setSiteIcons] = useState<Record<string, string>>({});
   // 侧边栏右键菜单 + 内联输入（新建 / 重命名分类）
   const [sideMenu, setSideMenu] = useState<{
     x: number;
@@ -326,6 +335,7 @@ function Launcher() {
         .then(() => refreshRef.current())
         .catch((error) => showToastRef.current(String(error)));
     }).then((fn) => disposers.push(fn));
+    // 后端收起面板（切到别的应用）时，把网页状态一起清掉。
     void listen("launcher-drag-leave", () => {
       dragActiveRef.current = false;
       setLoadTick((tick) => tick + 1);
@@ -423,6 +433,23 @@ function Launcher() {
     };
   }, [scope, path, root.categories, allCache, fillIcons, loadTick]);
 
+  // 站点图标：每个地址抓一次，抓不到就退化成一个字。
+  useEffect(() => {
+    let alive = true;
+    for (const entry of root.sites) {
+      if (!entry.url || siteIcons[entry.url]) continue;
+      void invoke<string>("site_icon", { url: entry.url })
+        .then((icon) => {
+          if (!alive || !icon) return;
+          setSiteIcons((previous) => ({ ...previous, [entry.url]: icon }));
+        })
+        .catch(() => {});
+    }
+    return () => {
+      alive = false;
+    };
+  }, [root.sites, siteIcons]);
+
   // 拖到面板上的文件放进当前浏览的目录。
   useEffect(() => {
     currentDirRef.current = currentDir;
@@ -434,6 +461,10 @@ function Launcher() {
     const disposers: Array<() => void> = [];
     void listen("launcher-changed", () => void reload()).then((fn) => disposers.push(fn));
     void listen("launcher-shown", () => {
+      // 每次呼出都以后端为准，避免「第一次收了、第二次就变不回来」。
+      void invoke<boolean>("web_side_state")
+        .then((open) => document.body.classList.toggle("web-open", open))
+        .catch(() => {});
       setQuery("");
       setSelected(-1);
       setPicked(new Set());
@@ -505,6 +536,7 @@ function Launcher() {
 
   const go = useCallback(
     (next: Snapshot) => {
+      // 切回文件视图时把内嵌网页关掉。
       setBackStack((previous) => [...previous, { scope, path }]);
       setForwardStack([]);
       setScope(next.scope);
@@ -947,6 +979,7 @@ function Launcher() {
         {!hasRoot && (
           <div className="side-hint">在设置里选一个文件夹，它的子文件夹就是分类</div>
         )}
+
         {root.folders.length > 0 && <div className="side-sep" />}
         {root.folders.map((folder) => (
           <button
@@ -1357,6 +1390,7 @@ function Launcher() {
           </span>
         </div>
       </section>
+
     </div>
   );
 }

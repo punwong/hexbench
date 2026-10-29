@@ -57,7 +57,9 @@
         height: 100%;
         box-sizing: border-box;
         background: var(--bg);
-        border: 1px solid var(--line);
+        /* 外框用一个固定的浅灰（#bcbcbc）：和右侧网页面板接缝处实测的
+        渲染值完全一致，两个面板的边框看起来才是同一根线。 */
+        border: 1px solid #bcbcbc;
         border-radius: 8px;
         overflow: hidden;
         animation: palette-in 130ms var(--ease) both;
@@ -223,7 +225,9 @@
         display: flex;
         align-items: center;
         gap: 4px;
-        padding: 6px 12px;
+        height: 40px;
+        box-sizing: border-box;
+        padding: 0 12px;
         border-bottom: 1px solid var(--line);
       }
 
@@ -593,7 +597,9 @@
         width: fit-content;
         margin: 14px auto 0;
         padding: 7px 16px;
-        border: 1px solid var(--line);
+        /* 外框用一个固定的浅灰（#bcbcbc）：和右侧网页面板接缝处实测的
+        渲染值完全一致，两个面板的边框看起来才是同一根线。 */
+        border: 1px solid #bcbcbc;
         border-radius: 8px;
         background: var(--text);
         color: var(--bg);
@@ -679,6 +685,100 @@
     color: inherit;
     font-size: 12.5px;
   }
+  /* 网站图标标签页 */
+  .site-tabs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 4px;
+  }
+
+  .site-tab {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.04);
+    cursor: pointer;
+    overflow: hidden;
+  }
+
+  .site-tab img {
+    width: 18px;
+    height: 18px;
+    object-fit: contain;
+  }
+
+  .site-tab span {
+    font-size: 12px;
+    color: var(--muted, #888);
+  }
+
+  .site-tab:hover {
+    border-color: var(--line, #e3e3e3);
+  }
+
+  .site-tab.active {
+    border-color: var(--accent, #2f6fed);
+    box-shadow: 0 0 0 2px rgba(47, 111, 237, 0.15);
+  }
+      /* 右侧网页区：和文件区并排，多出来的一栏 */
+      .web-col {
+        display: none;
+        flex: 0 0 420px;
+        width: 420px;
+        display: flex;
+        flex-direction: column;
+        border-left: 1px solid var(--line);
+        background: var(--bg);
+      }
+
+      body.web-open .web-col { display: flex; }
+
+      .web-bar {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 40px;
+        padding: 0 8px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .web-tab {
+        flex: 0 0 auto;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: transparent;
+        cursor: pointer;
+      }
+
+      .web-tab img {
+        width: 16px;
+        height: 16px;
+        object-fit: contain;
+      }
+
+      .web-tab span {
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .web-tab:hover { background: var(--pick); }
+
+      .web-tab.active {
+        border-color: #2f6fed;
+        background: rgba(47, 111, 237, 0.1);
+      }
 </style>
   </head>
   <body>

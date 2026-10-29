@@ -10,6 +10,7 @@ pub mod shell_ops;
 pub mod dpapi;
 pub mod geometry;
 pub mod icons;
+pub mod net;
 pub mod model;
 pub mod sync;
 pub mod trigger;

@@ -1689,19 +1689,28 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     // 这个窗口可能是在别的线程上创建的，拖放目标注册要求那线程也初始化过 OLE，
     // 否则外部拖进来的文件会被系统交给主窗口，而不是这里。
     hexbench_core::sys::init_ole();
+    // 新窗口就是全新的前端状态（网页没了、视图回到文件），
+    // 竖版标志必须跟着清掉，否则会出现「竖版空壳」。
+    LAUNCHER_WEB_MODE.store(false, Ordering::Relaxed);
     let built = WebviewWindowBuilder::new(app, "launcher", WebviewUrl::App("launcher.html".into()))
         .title("快速呼出")
         .inner_size(780.0, 500.0)
         .min_inner_size(520.0, 320.0)
         .decorations(false)
         .zoom_hotkeys_enabled(false)
-        .transparent(true)
+        // 透明窗口 + 改尺寸是已知坏组合（issue #13906、PR #16192）：
+        // 页面会错位/溢出，窗口尺寸也可能不生效。圆角改用 DWM 设置。
+        .transparent(false)
         .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
         .visible(false)
         .build()
+        .map_err(|error| {
+            log::warn!("launcher: build failed: {error}");
+            error
+        })
         .ok();
     if let Some(window) = &built {
         // Tauri 只在先建的那个 webview 上登记拖放目标，面板是后建的，得自己挂一个，
@@ -1841,10 +1850,36 @@ fn launcher_appearance(app: &AppHandle) -> (bool, (u32, u32)) {
     )
 }
 fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))) {
-    LAUNCHER_SHOWN_AT.store(now_millis(), Ordering::Relaxed);
     place_launcher(window, appearance.0, appearance.1);
+    LAUNCHER_SHOWN_AT.store(now_millis(), Ordering::Relaxed);
+    // 网页模式下窗口是竖版的：这时候再按配置的 50%×50% 摆一次，
+    // 网页仍按竖版矩形挂着，两边尺寸对不上就是「排版错位」。
     let _ = window.show();
+    // 设置里开了内置网页：把预建好的网页窗口摆到右侧并显示
+    // （只 show，不在这里创建窗口——运行中建窗口会卡住面板）。
+    {
+        let app = window.app_handle();
+        let enabled = {
+            let state = app.state::<AppState>();
+            let shared = state.shared.lock().unwrap();
+            shared.config.launcher.web_enabled
+                && !shared.config.launcher.sites.is_empty()
+        };
+        if enabled {
+            if let Some(web) = web_window_handle() {
+                place_web_window(app, &web);
+                let _ = web.show();
+                WEB_PANEL_OPEN.store(true, Ordering::Relaxed);
+            }
+        }
+    }
     let _ = window.set_focus();
+    // 之前开着网页面板的话，跟着一起回来（页面没重新加载）。
+    // 之前开着网页区的话，跟着一起恢复（子 WebView 留在窗口里，不重新加载）。
+    if WEB_PANEL_OPEN.load(Ordering::Relaxed) {
+        let handle = window.app_handle().clone();
+        let _ = sync_web_side(&handle, true);
+    }
     // Windows 的前台锁会吞掉单纯的 show+focus，必须走 force_foreground，
     // 否则按完快捷键打不了字。
     // show() 只是排进事件循环，此刻窗口可能还没真正绘制出来；延迟一点再抢
@@ -1856,6 +1891,11 @@ fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))
             hexbench_core::sys::force_foreground(hwnd.0 as isize);
         }
     });
+    // 网页窗口跟着面板一起回来：页面还在里面，不会重新加载。
+    if let Some(site) = window.app_handle().get_webview_window(SITE_WEBVIEW) {
+        place_site_window(window, &site);
+        let _ = site.show();
+    }
     let _ = window.app_handle().emit("launcher-shown", ());
     log::info!("launcher: shown");
 }
@@ -1865,12 +1905,25 @@ fn open_launcher(app: &AppHandle) {
         reveal_launcher(&window, launcher_appearance(app));
         return;
     }
+    // 关掉内嵌网页时面板窗口可能被一起带走，但 `launcher` 这个 label 还挂在
+    // 旧 WebView 上：不先清掉，重建就会报「label already exists」，
+    // 用户看到的就是「按热键没反应」。
+    if let Some(stale) = app.get_webview("launcher") {
+        log::warn!("launcher: clearing stale webview before rebuild");
+        let _ = stale.close();
+    }
+    if let Some(leftover) = app.get_window("launcher") {
+        log::warn!("launcher: destroying leftover window before rebuild");
+        let _ = leftover.destroy();
+    }
     // Creating a WebView2 window re-enters the event loop: doing it on the UI
     // thread froze the whole app for five seconds. Build it on a worker, then
     // reveal it from there.
     let handle = app.clone();
     let appearance = launcher_appearance(app);
     thread::spawn(move || {
+        // 销毁是异步的：等它落地再建，否则还会撞 label。
+        thread::sleep(Duration::from_millis(120));
         if let Some(window) = build_launcher(&handle) {
             reveal_launcher(&window, appearance);
         }
@@ -1882,11 +1935,485 @@ fn show_launcher(app: &AppHandle) {
     open_launcher(app);
 }
 
+
+
 fn hide_launcher(app: &AppHandle) {
+    log::info!(
+        "launcher: hide (site_open={})",
+        app.get_webview_window(SITE_WEBVIEW).is_some()
+    );
     if let Some(window) = app.get_webview_window("launcher") {
         let _ = window.hide();
+    // 网页窗口是独立窗口：面板收起时一起隐藏
+    if let Some(web) = web_window_handle() {
+        let _ = web.hide();
+    }
+    }
+    // 网页面板跟着面板一起收起：页面继续跑，但不再挡在前台。
+    // 用句柄隐藏：这个窗口会从注册表消失，查不到。
+    // 网页是面板窗口里的子 WebView，跟着窗口一起隐藏，不用单独处理。
+    let keep = app
+        .state::<AppState>()
+        .shared
+        .lock()
+        .unwrap()
+        .config
+        .launcher
+        .site_keep_alive_secs;
+    if keep == 0 {
+        close_site_window(app);
+        return;
+    }
+    let handle = app.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(keep as u64));
+        let visible = handle
+            .get_webview_window("launcher")
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        if visible {
+            return;
+        }
+        log::info!("launcher: page idle for too long, closing the site window");
+        close_site_window(&handle);
+    });
+}
+
+
+
+/// 独立网页窗口的标签。
+const SITE_WEBVIEW: &str = "site";
+
+/// 网页窗口和面板之间的间距（逻辑像素）。
+const SITE_GAP: f64 = 0.0;
+
+/// Windows 给窗口留的不可见外框宽度（实测 8px）。
+/// 网页面板要「贴住」面板而不是留缝，就得把这圈隐形边抵掉。
+const WEB_FRAME_INSET: f64 = 8.0;
+
+/// 窗口尺寸变化后，把网页子 WebView 重新铺到右栏。
+///
+/// 不能靠 auto_resize：issue #9611 明确说它会破坏固定横向位置；
+/// issue #13318 给的官方临时解法就是自己监听 resize 再 set_size。
+fn reflow_web_page(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("launcher") else {
+        return;
+    };
+    let Ok(size) = window.inner_size() else {
+        return;
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let width = size.width as f64 / scale;
+    let height = size.height as f64 / scale;
+    if let Some(page) = app.get_webview(SITE_WEBVIEW) {
+        let _ = page.set_position(tauri::LogicalPosition::new(
+            (width - WEB_COLUMN_WIDTH).max(0.0),
+            WEB_TOOLBAR,
+        ));
+        let _ = page.set_size(tauri::LogicalSize::new(
+            WEB_COLUMN_WIDTH,
+            (height - WEB_TOOLBAR).max(80.0),
+        ));
     }
 }
+
+fn sync_web_side(app: &AppHandle, open: bool) -> Result<(), String> {
+    log::info!("web: sync_web_side open={open}");
+    if open {
+        ensure_web_window(app)?;
+    }
+    if let Some(web) = web_window_handle() {
+        if open {
+            place_web_window(app, &web);
+            let _ = web.show();
+        } else {
+            let _ = web.hide();
+        }
+    }
+    WEB_PANEL_OPEN.store(open, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn web_panel_show(app: AppHandle) -> Result<bool, String> {
+    sync_web_side(&app, true)?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn web_panel_hide(app: AppHandle) -> Result<bool, String> {
+    sync_web_side(&app, false)?;
+    Ok(false)
+}
+
+/// 建独立网页窗口（我们的 web.html：顶栏图标标签 + 下面挂子 WebView）。
+fn ensure_web_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    if let Some(existing) = app.get_webview_window(WEB_PANEL) {
+        return Ok(existing);
+    }
+    let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
+    let (_x, _y, _w, area_h) =
+        hexbench_core::sys::work_area_at(cursor_x, cursor_y).unwrap_or((0, 0, 1920, 1080));
+    let height = (area_h as f64 * 0.85).max(320.0);
+    let built = tauri::WebviewWindowBuilder::new(
+        app,
+        WEB_PANEL,
+        tauri::WebviewUrl::App("web.html".into()),
+    )
+    .title("网页")
+    .inner_size(WEB_COLUMN_WIDTH, height)
+    .decorations(false)
+    .resizable(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .build()
+    .map_err(|error| format!("开不了网页窗口：{error}"))?;
+    // 存下句柄：这个窗口实体不会出现在 get_webview_window 的查找结果里
+    if let Ok(mut held) = WEB_WINDOW.lock() {
+        *held = Some(built.clone());
+    }
+    Ok(built)
+}
+
+/// 摆网页窗口：默认固定贴屏幕一侧；勾了「跟随面板」才贴到面板右边。
+fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
+    let (width_percent, height_percent, follow, side) = {
+        let state = app.state::<AppState>();
+        let shared = state.shared.lock().unwrap();
+        (
+            shared.config.launcher.site_width_percent.clamp(10, 90),
+            shared.config.launcher.site_height_percent.clamp(20, 100),
+            shared.config.launcher.site_follow_panel,
+            shared.config.launcher.site_side.clone(),
+        )
+    };
+    let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
+    let (area_x, area_y, area_w, area_h) =
+        hexbench_core::sys::work_area_at(cursor_x, cursor_y).unwrap_or((0, 0, 1920, 1080));
+    let width = (area_w as f64 * width_percent as f64 / 100.0).max(240.0);
+    let height = (area_h as f64 * height_percent as f64 / 100.0).max(240.0);
+
+    let (left, top) = if follow {
+        match app.get_webview_window("launcher") {
+            Some(panel) => {
+                let scale = panel.scale_factor().unwrap_or(1.0);
+                match (panel.outer_position(), panel.inner_size()) {
+                    (Ok(position), Ok(size)) => (
+                        (position.x as f64 / scale + size.width as f64 / scale + 8.0).round(),
+                        (position.y as f64 / scale).round(),
+                    ),
+                    _ => (area_x as f64, area_y as f64),
+                }
+            }
+            None => (area_x as f64, area_y as f64),
+        }
+    } else if side == "left" {
+        (area_x as f64, area_y as f64 + (area_h as f64 - height) / 2.0)
+    } else {
+        (
+            area_x as f64 + area_w as f64 - width,
+            area_y as f64 + (area_h as f64 - height) / 2.0,
+        )
+    };
+    let _ = web.set_size(tauri::LogicalSize::new(width, height));
+    let _ = web.set_position(tauri::LogicalPosition::new(left, top));
+    // 子 WebView 是按创建时的窗口尺寸摆的，窗口改过大小必须重排一次，
+    // 否则它会留在旧位置/旧尺寸，看起来就是「网页内容空白」。
+    if let Some(page) = app.get_webview(SITE_WEBVIEW) {
+        let _ = page.set_position(tauri::LogicalPosition::new(1.0, WEB_TOOLBAR));
+        let _ = page.set_size(tauri::LogicalSize::new(
+            (width - 2.0).max(80.0),
+            (height - WEB_TOOLBAR - 1.0).max(80.0),
+        ));
+    }
+    log::info!("web: placed at {left},{top} {width}x{height} follow={follow}");
+}
+
+
+
+
+/// 网页窗口的句柄。
+///
+/// 不能用 `get_webview_window("web")` 去找：实测这个窗口的 webview 注册了、
+/// 窗口实体却没进注册表（自测输出 `web missing` 就是这么来的）。
+static WEB_WINDOW: Mutex<Option<tauri::WebviewWindow>> = Mutex::new(None);
+
+/// 取网页窗口句柄。
+fn web_window_handle() -> Option<tauri::WebviewWindow> {
+    WEB_WINDOW.lock().ok().and_then(|held| held.clone())
+}
+
+/// 网页面板当前是不是「打开着」（用户点了 ✕ 才算关）。
+/// 面板收起时网页跟着藏，但状态保留——下次呼出面板它一起回来。
+static WEB_PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// 网页当前打开的地址：地址没变就不重新导航（保住滚动位置和未完成的回答）。
+static LAST_SITE_URL: Mutex<Option<String>> = Mutex::new(None);
+
+fn close_site_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(SITE_WEBVIEW) {
+        let _ = window.close();
+    }
+}
+
+/// 把网页窗口摆到面板右侧、高度对齐面板。
+fn place_site_window(panel: &tauri::WebviewWindow, site: &tauri::WebviewWindow) {
+    let scale = panel.scale_factor().unwrap_or(1.0);
+    let (Ok(position), Ok(size)) = (panel.outer_position(), panel.inner_size()) else {
+        return;
+    };
+    let left = (position.x as f64 / scale + size.width as f64 / scale + SITE_GAP - WEB_FRAME_INSET).round();
+    let top = (position.y as f64 / scale).round();
+    let height = (size.height as f64 / scale).max(240.0);
+    let _ = site.set_position(tauri::LogicalPosition::new(left, top));
+    let _ = site.set_size(tauri::LogicalSize::new(WEB_COLUMN_WIDTH, height));
+}
+
+/// 建一个独立的网页窗口（不是子 WebView）。
+///
+/// 独立窗口的好处：面板显示/隐藏/改尺寸都不会连累它，
+/// 页面可以真的留在后台（AI 回答不断），也不会出现两边尺寸对不齐的错位。
+fn build_site_window(app: &AppHandle, url: tauri::Url) -> Result<(), String> {
+    let panel = app.get_webview_window("launcher").ok_or("面板还没建好")?;
+    let scale = panel.scale_factor().unwrap_or(1.0);
+    let (Ok(position), Ok(size)) = (panel.outer_position(), panel.inner_size()) else {
+        return Err("拿不到面板位置".to_string());
+    };
+    let left = (position.x as f64 / scale + size.width as f64 / scale + SITE_GAP - WEB_FRAME_INSET).round();
+    let top = (position.y as f64 / scale).round();
+    let height = (size.height as f64 / scale).max(240.0);
+    tauri::WebviewWindowBuilder::new(app, SITE_WEBVIEW, tauri::WebviewUrl::External(url))
+        .title("网页")
+        .inner_size(WEB_COLUMN_WIDTH, height)
+        .position(left, top)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .user_agent(SITE_USER_AGENT)
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                let _ = webview.app_handle().emit("launcher-site-loaded", ());
+            }
+        })
+        .build()
+        .map_err(|error| format!("开不了网页窗口：{error}"))?;
+    Ok(())
+}
+
+
+/// 面板是个小窗口，按 PC 版请求的话很多站点的自适应会挤成一条缝。
+/// 统一用安卓 Chrome 的 UA，让站点直接给移动版布局。
+const SITE_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 14; Pixel 8) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36";
+
+/// 在面板内容区里挂一个真正的 WebView 打开网址。
+///
+/// 用子 WebView 而不是 iframe：Google / ChatGPT 这类站点会发
+/// `X-Frame-Options: DENY`，iframe 直接被拒；子 WebView 是一个独立浏览器，
+/// 不受这条限制。
+/// 面板当前是不是竖版网页模式。
+///
+/// 窗口可能被销毁重建（收起久了、或系统回收），前端状态会一起没；
+/// 把这个记在这里，重建后仍然知道该用竖版尺寸。
+static LAUNCHER_WEB_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 网页模式下内容区的矩形（逻辑像素，相对窗口客户区）。
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// 网页列宽：接近手机竖屏的 390–430，移动版布局才会按设计稿呈现。
+const WEB_COLUMN_WIDTH: f64 = 420.0;
+/// 侧边栏宽度，和 launcher.html 里的 .sidebar 保持一致。
+/// 工具栏高度，和 launcher.html 里的 .toolbar 保持一致。
+
+
+#[tauri::command]
+fn launcher_set_web_mode(on: bool) -> Result<WebRect, String> {
+    // 网页已经改成独立窗口，面板自己不再改尺寸；命令保留是为了兼容前端旧调用。
+    let _ = on;
+    Ok(WebRect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    })
+}
+#[tauri::command]
+async fn launcher_open_site(app: AppHandle, url: String) -> Result<(), String> {
+    let normalized = hexbench_core::net::normalize_url(&url);
+    let parsed: tauri::Url = normalized
+        .parse()
+        .map_err(|_| format!("网址不对：{url}"))?;
+    if let Some(existing) = app.get_webview_window(SITE_WEBVIEW) {
+        let _ = existing.navigate(parsed);
+        // 不在这里 show()：预建窗口该保持隐藏，否则一开机就自己弹出来。
+        return Ok(());
+    }
+    build_site_window(&app, parsed)?;
+    log::info!("launcher: opened site {url}");
+    Ok(())
+}
+
+/// 独立网页面板的窗口标签。
+const WEB_PANEL: &str = "web";
+/// 网页面板顶栏高度，必须和 web.html 里 `.bar` 的高度一致。
+const WEB_TOOLBAR: f64 = 40.0;
+
+
+
+
+
+/// 开关右侧网页栏：返回操作后的状态（true = 已打开）。
+/// 前端只负责显示，加宽窗口和挂子 WebView 都在这里做完。
+#[tauri::command]
+fn web_side_toggle(app: AppHandle) -> Result<bool, String> {
+    let open = !WEB_PANEL_OPEN.load(Ordering::Relaxed);
+    sync_web_side(&app, open)?;
+    Ok(open)
+}
+
+/// 网页栏当前是否打开（前端每次呼出时问一次，避免前后端状态各走各的）。
+#[tauri::command]
+fn web_side_state() -> bool {
+    WEB_PANEL_OPEN.load(Ordering::Relaxed)
+}
+
+
+
+#[tauri::command]
+async fn web_page_open(app: AppHandle, url: String) -> Result<(), String> {
+    let normalized = hexbench_core::net::normalize_url(&url);
+    let parsed: tauri::Url = normalized
+        .parse()
+        .map_err(|_| format!("网址不对：{url}"))?;
+    // add_child 定义在 Window 上：用持有句柄换出底层 Window，
+    // get_window(WEB_PANEL) 查不到（这个窗口实体不在注册表里）。
+    let web_panel = web_window_handle().ok_or_else(|| "网页面板还没建好".to_string())?;
+    let window = web_panel.as_ref().window();
+    if let Some(existing) = app.get_webview(SITE_WEBVIEW) {
+        let same = LAST_SITE_URL
+            .lock()
+            .map(|last| last.as_deref() == Some(normalized.as_str()))
+            .unwrap_or(false);
+        if !same {
+            let _ = existing.navigate(parsed);
+            if let Ok(mut last) = LAST_SITE_URL.lock() {
+                *last = Some(normalized);
+            }
+            log::info!("web: navigated to {url}");
+        }
+        // 不 show()：预建窗口要保持隐藏，否则一开机就自己弹出来。
+        return Ok(());
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let size = window.inner_size().map_err(|error| error.to_string())?;
+    let width = size.width as f64 / scale;
+    let height = (size.height as f64 / scale - WEB_TOOLBAR).max(120.0);
+    window
+        .add_child(
+            tauri::WebviewBuilder::new(SITE_WEBVIEW, tauri::WebviewUrl::External(parsed))
+                .user_agent(SITE_USER_AGENT)
+                .on_page_load(|webview, payload| {
+                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                        let _ = webview.app_handle().emit("launcher-site-loaded", ());
+                    }
+                }),
+            // 左右各让 1px、底部让 1px：留给 CSS 画的发丝边框。
+            tauri::LogicalPosition::new(1.0, WEB_TOOLBAR),
+            tauri::LogicalSize::new((width - 2.0).max(80.0), (height - 1.0).max(80.0)),
+        )
+        .map_err(|error| format!("开不了网页：{error}"))?;
+    if let Ok(mut last) = LAST_SITE_URL.lock() {
+        *last = Some(normalized);
+    }
+    log::info!("web: opened {url}");
+    Ok(())
+}
+
+#[tauri::command]
+fn web_page_nav(app: AppHandle, action: String) {
+    let Some(webview) = app.get_webview(SITE_WEBVIEW) else {
+        return;
+    };
+    let script = match action.as_str() {
+        "back" => "history.back()",
+        "forward" => "history.forward()",
+        "reload" => "location.reload()",
+        _ => return,
+    };
+    let _ = webview.eval(script);
+}
+
+/// 网页面板标签页用的数据。
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSiteDto {
+    name: String,
+    url: String,
+}
+
+#[tauri::command]
+fn launcher_web_sites(app: AppHandle) -> Vec<WebSiteDto> {
+    log::info!("web: launcher_web_sites called");
+    let state = app.state::<AppState>();
+    let shared = state.shared.lock().unwrap();
+    shared
+        .config
+        .launcher
+        .sites
+        .iter()
+        .map(|site| WebSiteDto {
+            name: site.name.clone(),
+            url: site.url.clone(),
+        })
+        .collect()
+}
+/// 抓站点标题，给设置页自动填名字用。
+#[tauri::command]
+async fn site_title(url: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || hexbench_core::net::site_title(&url))
+        .await
+        .unwrap_or_default()
+}
+
+/// 站点图标，给顶部标签页用。
+#[tauri::command]
+async fn site_icon(url: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || hexbench_core::net::favicon_data_uri(&url))
+        .await
+        .unwrap_or_default()
+}
+
+/// 关掉网页窗口。
+#[tauri::command]
+fn launcher_close_site(app: AppHandle) {
+    close_site_window(&app);
+}
+
+#[tauri::command]
+fn launcher_site_nav(app: AppHandle, action: String) {
+    let Some(window) = app.get_webview_window(SITE_WEBVIEW) else {
+        return;
+    };
+    let script = match action.as_str() {
+        "back" => "history.back()",
+        "forward" => "history.forward()",
+        "reload" => "location.reload()",
+        _ => return,
+    };
+    let _ = window.eval(script);
+}
+
+#[tauri::command]
+fn launcher_site_bounds(_app: AppHandle, _x: f64, _y: f64, _width: f64, _height: f64) {}
 
 fn toggle_launcher(app: &AppHandle) {
     let enabled = app
@@ -1984,6 +2511,10 @@ struct LauncherRoot {
     all_visible: bool,
     /// 常用文件夹（按用户排好的顺序），面板左侧直接列出来。
     folders: Vec<String>,
+    /// 面板里的网址分组。
+    sites: Vec<hexbench_core::config::LauncherSite>,
+    /// 设置里的「内置网页」开关：开着就默认展开右侧网页栏。
+    web_enabled: bool,
     /// 上次用的视图和排序。
     view: String,
     sort_key: String,
@@ -2069,6 +2600,8 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             categories: Vec::new(),
             all_visible: false,
             folders: Vec::new(),
+            sites: Vec::new(),
+            web_enabled: false,
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,
@@ -2087,11 +2620,13 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
     let location = shared.config.launcher.last_location.clone();
     let remember_location = shared.config.launcher.remember_location;
     let folders = shared.config.launcher.folders.clone();
+    let sites = shared.config.launcher.sites.clone();
     let category_order = shared.config.launcher.category_order.clone();
     let hidden = shared.config.launcher.hidden_categories.clone();
     let view = shared.config.launcher.view.clone();
     let sort_key = shared.config.launcher.sort_key.clone();
     let sort_dir = shared.config.launcher.sort_dir;
+    let web_enabled = shared.config.launcher.web_enabled;
     drop(shared);
     let all_visible = !hidden.iter().any(|entry| entry == "__all__");
     let empty = |root: String| LauncherRoot {
@@ -2099,6 +2634,8 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         categories: Vec::new(),
         all_visible,
         folders: folders.clone(),
+        sites: sites.clone(),
+        web_enabled,
         view: view.clone(),
         sort_key: sort_key.clone(),
         sort_dir,
@@ -2120,6 +2657,8 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         categories: list,
         all_visible,
         folders,
+        sites,
+        web_enabled,
         view,
         sort_key,
         sort_dir,
@@ -2792,6 +3331,48 @@ fn region_dto(region: &Region) -> RegionDto {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 调试自测通道（仅 debug 构建）：文件触发、结果写文件，不依赖屏幕坐标。
+#[cfg(debug_assertions)]
+fn spawn_selftest(app: AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(6));
+        if !std::env::temp_dir().join("hexbench-selftest.txt").exists() {
+            return;
+        }
+        let mut out = String::new();
+        if let Some(window) = app.get_webview_window("launcher") {
+            let _ = window.show();
+            thread::sleep(Duration::from_millis(900));
+            out += &format!(
+                "panel size={:?} visible={:?}\n",
+                window.inner_size(),
+                window.is_visible()
+            );
+        } else {
+            out += "panel missing\n";
+        }
+        match sync_web_side(&app, true) {
+            Ok(()) => {
+                thread::sleep(Duration::from_millis(1500));
+                match app.get_webview_window(WEB_PANEL) {
+                    Some(web) => out += &format!(
+                        "web size={:?} visible={:?}\n",
+                        web.inner_size(),
+                        web.is_visible()
+                    ),
+                    None => out += "web missing\n",
+                }
+                out += &format!("site webview={}\n", app.get_webview(SITE_WEBVIEW).is_some());
+            }
+            Err(error) => out += &format!("web err={error}\n"),
+        }
+        let _ = sync_web_side(&app, false);
+        thread::sleep(Duration::from_millis(500));
+        out += &format!("after close web_open={}\n", WEB_PANEL_OPEN.load(Ordering::Relaxed));
+        let _ = std::fs::write(std::env::temp_dir().join("hexbench-selftest-out.txt"), out);
+    });
+}
+
 pub fn run() {
     // 必须在任何窗口创建之前：OLE 拖放目标要在这个线程上注册。
     hexbench_core::sys::init_ole();
@@ -2936,6 +3517,27 @@ pub fn run() {
             launcher_set_drop_target,
             launcher_new_folder,
     launcher_create_dir,
+    launcher_set_web_mode,
+    launcher_open_site,
+    launcher_close_site,
+    launcher_site_nav,
+    site_title,
+    site_icon,
+    web_panel_show,
+    web_side_state,
+    web_side_toggle,
+    web_panel_hide,
+    web_page_open,
+    web_page_nav,
+    launcher_web_sites,
+    site_icon,
+    web_panel_show,
+    web_side_state,
+    web_panel_hide,
+    web_page_open,
+    web_page_nav,
+    launcher_web_sites,
+    launcher_site_bounds,
             launcher_save_location,
             launcher_icons,
             launcher_save_view,
@@ -3004,6 +3606,7 @@ pub fn run() {
                 open_main_now(&handle);
             }
                     spawn_launcher_watcher(handle.clone());
+            spawn_selftest(handle.clone());
 
             // A tray app can run for days: checking only at launch would mean
             // "restart to find out you have an update". latest.json is a few
@@ -3029,7 +3632,16 @@ pub fn run() {
                 .launcher
                 .enabled
             {
-                if let Some(window) = build_launcher(app.handle()) {
+        // 网页窗口也在启动时预建（隐藏）：创建窗口必须在启动阶段的主线程，
+        // 运行中创建会得到「有外壳、没注册」的窗口（自测已验证）。
+        if let Err(error) = ensure_web_window(app.handle()) {
+            log::warn!("web: pre-build failed: {error}");
+        }
+        // visible(false) 在透明/无边框窗口上不一定生效，补一次隐藏
+        if let Some(web) = web_window_handle() {
+            let _ = web.hide();
+        }
+        if let Some(window) = build_launcher(app.handle()) {
                     let _ = window.hide();
                 }
             }
@@ -3132,14 +3744,22 @@ pub fn run() {
 
                 return;
             }
-            // 面板是「呼出即用」的：点到别处就收起来。
-            if window.label() == "launcher" {
+            if let WindowEvent::Resized(_) = event {
+                if window.label() == "launcher" {
+                    reflow_web_page(window.app_handle());
+                }
+            }            // 面板是「呼出即用」的：点到别处就收起来。
+            // 网页面板算它的附属窗口，两者任何一个失焦都一起收。
+            if matches!(window.label(), "launcher" | "web") {
                 if let WindowEvent::Focused(false) = event {
                     // 刚显示的那 500ms、以及右键菜单开着的时候，都别收起。
                     let since = LAUNCHER_SHOWN_AT.load(Ordering::Relaxed);
                     let menu_open = LAUNCHER_MENU_OPEN.load(Ordering::Relaxed);
-                    if !menu_open && now_millis().saturating_sub(since) > 500 {
-                        let _ = window.hide();
+                    // 内嵌网页是同一进程的子窗口，抢焦点时不能当成「点到别处」。
+                    let left = !hexbench_core::sys::foreground_is_current_process();
+                    if left && !menu_open && now_millis().saturating_sub(since) > 500 {
+                        // 走统一的收起逻辑：面板和网页面板一起收。
+                        hide_launcher(window.app_handle());
                     }
                 }
                 return;
