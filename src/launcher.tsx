@@ -960,6 +960,24 @@ function Launcher() {
     return () => document.removeEventListener("keydown", onKey);
   }, [reload]);
 
+  // 侧边栏是「悬停即切换」，但鼠标划过整列时会一路触发，
+  // 列表跟着重排，看起来就是分类和常用文件夹来回亮、来回跳。
+  // 改成停留一小会儿才切。
+  const hoverTimer = useRef<number | null>(null);
+  const hoverOpen = (action: () => void) => {
+    if (hoverTimer.current !== null) window.clearTimeout(hoverTimer.current);
+    hoverTimer.current = window.setTimeout(() => {
+      hoverTimer.current = null;
+      action();
+    }, 160);
+  };
+  const hoverCancel = () => {
+    if (hoverTimer.current !== null) {
+      window.clearTimeout(hoverTimer.current);
+      hoverTimer.current = null;
+    }
+  };
+
   const onRootKeyDown = (event: React.KeyboardEvent) => {
     if (fileShortcuts(event)) return;
     const target = event.target as HTMLElement;
@@ -1095,8 +1113,9 @@ function Launcher() {
             data-side="__all__"
             onClick={openAll}
             onMouseEnter={() => {
-              if (activeId !== "__all__") openAll();
+              if (activeId !== "__all__") hoverOpen(openAll);
             }}
+            onMouseLeave={hoverCancel}
           >
             <span>全部</span>
           </button>
@@ -1120,8 +1139,9 @@ function Launcher() {
               });
             }}
             onMouseEnter={() => {
-              if (activeId !== category.path) openCategory(category);
+              if (activeId !== category.path) hoverOpen(() => openCategory(category));
             }}
+            onMouseLeave={hoverCancel}
             title={category.path}
           >
             <span>{category.name}</span>
@@ -1145,8 +1165,9 @@ function Launcher() {
               setSideMenu({ x: event.clientX, y: event.clientY, path: folder, label: folderLabel(folder) });
             }}
             onMouseEnter={() => {
-              if (activeId !== folder) openPinned(folder);
+              if (activeId !== folder) hoverOpen(() => openPinned(folder));
             }}
+            onMouseLeave={hoverCancel}
             title={folder}
           >
             <span>{folderLabel(folder)}</span>
