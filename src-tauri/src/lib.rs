@@ -1773,6 +1773,34 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
             Err(error) => log::warn!("launcher: no hwnd: {error}"),
         }
     }
+    // 面板缩放时，网页窗口里的子 WebView 会错位（表现为半边空白）。
+    // 缩放结束后按网页窗口当前尺寸重排一次。
+    if let Some(window) = &built {
+        let probe = window.clone();
+        window.on_window_event(move |event| {
+            if !matches!(event, tauri::WindowEvent::Resized(_)) {
+                return;
+            }
+            let handle = probe.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(220));
+                let app = handle.app_handle();
+                if let Some(web) = web_window_handle() {
+                    if web.is_visible().unwrap_or(false) {
+                        let scale = web.scale_factor().unwrap_or(1.0);
+                        if let Ok(size) = web.inner_size() {
+                            reflow_site_page(
+                                app,
+                                size.width as f64 / scale,
+                                size.height as f64 / scale,
+                            );
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     match built {
         Some(_) => log::info!("launcher: built in {} ms", started.elapsed().as_millis()),
         None => log::warn!("launcher: build failed"),
