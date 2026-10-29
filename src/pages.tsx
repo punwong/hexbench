@@ -1498,74 +1498,47 @@ export function LauncherPage({
           </Row>
 
           <Row label="收起后保留" hint="面板收起后网页继续运行多少秒（0 = 立刻关闭）。问 AI 时建议留几十秒">
-            <div className="hotkey-cell">
-              <input
-                className="side-input"
-                style={{ width: 84 }}
-                value={config.launcher.siteKeepAliveSecs ?? 90}
-                onChange={(event) => {
-                  const digits = event.target.value.replace(/\D/g, "");
-                  update({ launcher: { siteKeepAliveSecs: digits ? Number(digits) : 0 } });
-                }}
-              />
-              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>秒</span>
-            </div>
-          </Row>
-
-          <Row label="网页窗口宽度 / 高度（占工作区百分比）">
-            <div className="hotkey-cell">
-              <input
-                className="side-input"
-                style={{ width: 64 }}
-                value={config.launcher.siteWidthPercent ?? 24}
-                onChange={(event) => {
-                  const digits = event.target.value.replace(/\D/g, "");
-                  update({ launcher: { siteWidthPercent: digits ? Number(digits) : 10 } });
-                }}
-              />
-              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>%</span>
-              <input
-                className="side-input"
-                style={{ width: 64 }}
-                value={config.launcher.siteHeightPercent ?? 85}
-                onChange={(event) => {
-                  const digits = event.target.value.replace(/\D/g, "");
-                  update({ launcher: { siteHeightPercent: digits ? Number(digits) : 20 } });
-                }}
-              />
-              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>%</span>
-            </div>
-          </Row>
-
-          <Row label="记住网页窗口的位置和大小">
-            <Toggle
-              checked={config.launcher.siteRememberPosition ?? true}
-              onChange={(next) => update({ launcher: { siteRememberPosition: next } })}
+            <Slider
+              value={config.launcher.siteKeepAliveSecs ?? 90}
+              min={0}
+              max={300}
+              step={10}
+              onChange={(value) => update({ launcher: { siteKeepAliveSecs: value } })}
+              format={(value) => (value === 0 ? "立刻关闭" : `${value} 秒`)}
             />
           </Row>
 
-          <Row label="跟随呼出面板">
-            <Toggle
-              checked={config.launcher.siteFollowPanel ?? false}
-              onChange={(next) => update({ launcher: { siteFollowPanel: next } })}
+          <Row label="网页窗口宽度" hint="占所在屏幕工作区宽度的百分比">
+            <Slider
+              value={config.launcher.siteWidthPercent ?? 24}
+              min={10}
+              max={90}
+              step={1}
+              onChange={(value) => update({ launcher: { siteWidthPercent: value } })}
+              format={(value) => `${value}%`}
+            />
+          </Row>
+          <Row label="网页窗口高度" hint="占所在屏幕工作区高度的百分比，可以比呼出面板高很多">
+            <Slider
+              value={config.launcher.siteHeightPercent ?? 85}
+              min={20}
+              max={100}
+              step={1}
+              onChange={(value) => update({ launcher: { siteHeightPercent: value } })}
+              format={(value) => `${value}%`}
             />
           </Row>
 
           {(config.launcher.siteFollowPanel ?? false) ? null : (
             <Row label="固定在屏幕哪一侧">
-              <div className="hotkey-cell">
-                {(["left", "right"] as const).map((side) => (
-                  <button
-                    key={side}
-                    type="button"
-                    className={(config.launcher.siteSide ?? "right") === side ? "chip active" : "chip"}
-                    onClick={() => update({ launcher: { siteSide: side } })}
-                    style={{ marginRight: 6 }}
-                  >
-                    {side === "left" ? "左侧" : "右侧"}
-                  </button>
-                ))}
-              </div>
+              <Segmented
+                value={config.launcher.siteSide ?? "right"}
+                onChange={(value) => update({ launcher: { siteSide: value } })}
+                options={[
+                  { value: "left", label: "左侧" },
+                  { value: "right", label: "右侧" },
+                ]}
+              />
             </Row>
           )}
 
