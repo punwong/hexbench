@@ -467,7 +467,7 @@ function Launcher() {
   const base = scope.kind === "folder" ? scope.base : "";
   const currentDir = scope.kind === "folder" ? path || scope.base : root.root;
 
-  const reload = useCallback(async (): Promise<LauncherRoot | null> => {
+  const reload = useCallback(async (dropStale = false): Promise<LauncherRoot | null> => {
     const listing = await invoke<LauncherRoot>("launcher_categories");
     setRoot(listing);
     const loaded: Record<string, LauncherItem[]> = {};
@@ -479,7 +479,11 @@ function Launcher() {
         });
       }
     }
-    setAllCache((previous) => ({ ...previous, ...loaded }));
+    // 分类的列表在这里重读了一遍；钉住的文件夹（以及预读过的其它目录）不在
+    // 分类里，上面没碰它们。文件被移动 / 粘贴 / 新建之后，缓存里的旧列表
+    // 不能再拿去画界面了——目标目录里明明已经有文件，面板却显示「这里是空的」。
+    // 丢掉这些条目，让读取重新来一遍；纯呼出时保留，首屏才不用等。
+    setAllCache(dropStale ? () => loaded : (previous) => ({ ...previous, ...loaded }));
     return listing;
   }, []);
 
@@ -802,7 +806,8 @@ function Launcher() {
   // 文件夹变化 / 面板重新呼出：刷新。
   useEffect(() => {
     const disposers: Array<() => void> = [];
-    void listen("launcher-changed", () => void reload()).then((fn) => disposers.push(fn));
+    // 目录内容变了：缓存里钉住的文件夹也要作废（见 reload 的注释）。
+    void listen("launcher-changed", () => void reload(true)).then((fn) => disposers.push(fn));
     void listen("launcher-shown", () => {
       // 每次呼出都以后端为准，避免「第一次收了、第二次就变不回来」。
       void invoke<boolean>("web_side_state")
@@ -1136,7 +1141,7 @@ function Launcher() {
   // ---------- 操作 ----------
 
   const refreshAll = useCallback(async () => {
-    await reload();
+    await reload(true);
     if (scope.kind === "folder") {
       const target = path || scope.base;
       if (target) {
