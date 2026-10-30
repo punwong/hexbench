@@ -53,7 +53,7 @@ const TITLES: Record<Page, { title: string; subtitle: string }> = {
   overview: { title: "概览", subtitle: "按需打开，各占一个设置页" },
   edge: { title: "边缘桌面", subtitle: "触发位置、时序与防误触" },
   phrases: { title: "常用语", subtitle: "吸附在聊天窗口旁，点一下就发出去" },
-  launcher: { title: "快捷启动", subtitle: "一个键呼出：启动程序、搬运文件" },
+  launcher: { title: "快捷面板", subtitle: "一个键呼出：按分类找文件、搬运文件" },
   hotkeys: { title: "热键", subtitle: "所有全局快捷键，集中在一处" },
   general: { title: "通用", subtitle: "外观、启动与配置文件" },
   cache: { title: "缓存", subtitle: "缩略图等缓存的占用与清理" },
@@ -297,7 +297,7 @@ export default function App() {
           <div className="nav-group">
             <div className="nav-label">工具</div>
             {config.launcher.enabled && (
-              <NavItem page="launcher" current={page} onClick={setPage} icon={<Rocket size={16} />} label="快捷启动" />
+              <NavItem page="launcher" current={page} onClick={setPage} icon={<Rocket size={16} />} label="快捷面板" />
             )}
             {config.enabled && (
               <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘桌面" />

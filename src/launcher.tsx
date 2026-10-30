@@ -2,7 +2,7 @@ import "./shell";
 
 import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -28,6 +28,23 @@ type LauncherItem = {
   icon: string | null;
 };
 
+/// 流式列目录的一页（对应后端的 `LauncherPage`）。
+type LauncherPage = { items: LauncherItem[]; done: boolean };
+
+/// 虚拟滚动的尺寸参数，必须和 `launcher.html` 里的网格/列表样式一致。
+const GRID_CELL_W = 108;
+const GRID_GAP = 22;
+// 48(图标) + 6(间距) + 两行名字(约 32.4) + 上下内边距(18)，留一点余量。
+const GRID_TILE_H = 106;
+const GRID_PAD = 22;
+const LIST_ROW_H = 36;
+const LIST_GAP = 10;
+const LIST_PAD = 10;
+/// 图标走 Tauri 自定义协议：Windows 上地址是 `http://<scheme>.localhost`。
+const ICON_BASE = "http://hbicon.localhost/";
+/// 一次向 Shell 要多少张图标。面板只会要屏幕上可见的那些。
+const ICON_BATCH = 64;
+
 type Category = { name: string; path: string; count: number; hidden: boolean };
 type LauncherRoot = {
   root: string;
@@ -48,6 +65,8 @@ type LauncherRoot = {
   lastBase: string;
   lastLabel: string;
   lastPath: string;
+  /** 上次停在「快速访问」那一行 */
+  lastPinned: boolean;
 };
 
 type SortKey = "name" | "modified" | "size" | "type";
@@ -154,6 +173,7 @@ function Launcher() {
     lastBase: "",
     lastLabel: "",
     lastPath: "",
+    lastPinned: false,
   });
   const [allCache, setAllCache] = useState<Record<string, LauncherItem[]>>({});
   const [items, setItems] = useState<LauncherItem[]>([]);
@@ -162,21 +182,29 @@ function Launcher() {
   const [iconByPath, setIconByPath] = useState<Record<string, string | null>>({});
   const iconRef = useRef<Record<string, string | null>>({});
   const viewToken = useRef(0);
+  // 虚拟滚动：只渲染视口里的几行，几千项的目录也不会把 DOM 撑爆。
+  const [viewport, setViewport] = useState({ width: 0, height: 0, scrollTop: 0 });
 
+  // 图标现在只回一个缓存键，真正的 PNG 由 `hbicon://` 协议直接给 WebView。
   const fillIcons = useCallback(async (paths: string[]) => {
     const token = viewToken.current;
     const missing = paths.filter((path) => !(path in iconRef.current));
-    for (let index = 0; index < missing.length; index += 24) {
+    for (let index = 0; index < missing.length; index += ICON_BATCH) {
       if (token !== viewToken.current) return; // 已经切到别的目录了
-      const chunk = missing.slice(index, index + 24);
+      const chunk = missing.slice(index, index + ICON_BATCH);
       const filled = await invoke<Array<[string, string | null]>>("launcher_icons", {
         paths: chunk,
       });
       if (token !== viewToken.current) return;
-      const next = { ...iconRef.current };
-      for (const [path, icon] of filled) next[path] = icon;
-      iconRef.current = next;
-      setIconByPath(next);
+      // 只填这一批的键：整表复制会让上千项时变成 O(n²)。
+      let changed = false;
+      for (const [path, key] of filled) {
+        if (iconRef.current[path] !== key || !(path in iconRef.current)) {
+          iconRef.current[path] = key;
+          changed = true;
+        }
+      }
+      if (changed) setIconByPath({ ...iconRef.current });
     }
   }, []);
 
@@ -229,6 +257,30 @@ function Launcher() {
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "name", dir: 1 });
   const [view, setView] = useState<"grid" | "list">("grid");
   const [sortMenu, setSortMenu] = useState(false);
+
+  // 视口尺寸变化（切网格/列表、窗口拉大、滚动条出现）都要重新算可视范围。
+  useEffect(() => {
+    const element = gridRef.current;
+    if (!element) return;
+    const measure = () =>
+      setViewport((previous) => {
+        const next = {
+          width: element.clientWidth,
+          height: element.clientHeight,
+          scrollTop: element.scrollTop,
+        };
+        return previous.width === next.width &&
+          previous.height === next.height &&
+          previous.scrollTop === next.scrollTop
+          ? previous
+          : next;
+      });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [view]);
+
   const hoverArmed = useRef(false);
   const [editing, setEditing] = useState<{ path: string; name: string } | null>(null);
   const skipCommit = useRef(false);
@@ -243,6 +295,9 @@ function Launcher() {
   const activeIdRef = useRef("__all__");
   // 拖拽进行中：主线程被 DoDragDrop 占着，取目录的命令发不出去。
   const dragActiveRef = useRef(false);
+  // 最后一次收到拖拽坐标的时间：拖拽结束的通知偶尔会丢（拖到窗口外松手、
+  // 拖拽被系统取消），只看布尔值会让面板一直不刷新，所以要能自己过期。
+  const dragSeenAt = useRef(0);
   const sidesRef = useRef<Record<string, () => void>>({});
   const base = scope.kind === "folder" ? scope.base : "";
   const currentDir = scope.kind === "folder" ? path || scope.base : root.root;
@@ -280,7 +335,15 @@ function Launcher() {
         if (key) setSort({ key, dir: listing.sortDir === -1 ? -1 : 1 });
       }
       if (listing?.rememberLocation && listing.lastKind === "folder" && known) {
-        setScope({ kind: "folder", base, label: listing.lastLabel || "文件夹" });
+        // 同一个文件夹可能既是分类又是快速访问：按上次停在哪一行还原，
+        // 否则高亮会落到另一边。
+        const pinned = !!listing.lastPinned && (listing.folders ?? []).includes(base);
+        setScope({
+          kind: "folder",
+          base,
+          label: listing.lastLabel || "文件夹",
+          pinned: pinned || undefined,
+        });
         setPath(listing.lastPath || base);
         return;
       }
@@ -318,21 +381,23 @@ function Launcher() {
       const item = shownRef.current[Number(row.dataset.index)];
       return item && item.isDir ? item : null;
     };
-    /** 光标下面是侧边栏的哪一项（返回 data-side 的值）。 */
-    const sideAtClient = (x: number, y: number): string | null => {
+    /** 光标下面是侧边栏的哪一项（id 用来比高亮，path 用来当落点）。 */
+    const sideAtClient = (x: number, y: number): { id: string; path: string } | null => {
       const node = document.elementFromPoint(x, y);
       const side = node?.closest<HTMLElement>("[data-side]");
-      return side?.dataset.side ?? null;
+      if (!side?.dataset.side) return null;
+      return { id: side.dataset.side, path: side.dataset.path ?? "" };
     };
     void listen<{ x: number; y: number }>("launcher-drag-pos", (event) => {
       dragActiveRef.current = true;
+      dragSeenAt.current = Date.now();
       const point = toClient(event.payload.x, event.payload.y);
       setDropTarget(folderAtClient(point.x, point.y)?.path ?? null);
       // 拖着东西悬到分类上：切过去，这样才落得进去。
       // 拖拽期间浏览器不发 mouseenter，只能靠后端轮询来的坐标自己判断。
       const side = sideAtClient(point.x, point.y);
-      if (side && side !== activeIdRef.current) {
-        const switchTo = sidesRef.current[side];
+      if (side && side.id !== activeIdRef.current) {
+        const switchTo = sidesRef.current[side.id];
         if (switchTo) switchTo();
       }
     }).then((fn) => disposers.push(fn));
@@ -343,7 +408,7 @@ function Launcher() {
       const point = toClient(event.payload.x, event.payload.y);
       const folder = folderAtClient(point.x, point.y);
       const side = sideAtClient(point.x, point.y);
-      const dest = (side && side !== "__all__" ? side : null) ?? folder?.path ?? currentDirRef.current;
+      const dest = side?.path || folder?.path || currentDirRef.current;
       if (!dest) return;
       void invoke("launcher_move_into", { dest, paths: event.payload.paths })
         .then(() => refreshRef.current())
@@ -361,7 +426,7 @@ function Launcher() {
       setDropTarget(null);
       const item = folderAt(event.payload.x, event.payload.y);
       const side = sideAtClient(event.payload.x, event.payload.y);
-      const dest = (side && side !== "__all__" ? side : null) ?? item?.path ?? currentDirRef.current;
+      const dest = side?.path || item?.path || currentDirRef.current;
       if (!dest) return;
       void invoke("launcher_move_into", { dest, paths: event.payload.paths })
         .then(() => refreshRef.current())
@@ -391,22 +456,23 @@ function Launcher() {
         base: scope.kind === "folder" ? scope.base : "",
         label: scope.kind === "folder" ? scope.label : "",
         path: scope.kind === "folder" ? path : "",
+        pinned: scope.kind === "folder" ? !!scope.pinned : false,
       });
     }, 400);
     return () => window.clearTimeout(timer);
   }, [scope, path, root.rememberLocation]);
 
-  // 读当前这一层：先出名字，图标后台补。
+  // 读当前这一层：名字流式推过来，图标按可见范围再补。
   useEffect(() => {
     let alive = true;
     viewToken.current += 1;
+    const token = viewToken.current;
     const run = async () => {
       if (scope.kind === "all" && !path) {
         const all = root.categories.flatMap((category) => allCache[category.path] ?? []);
         if (!alive) return;
         setItems(all);
         setLoading(false);
-        void fillIcons(all.map((item) => item.path));
         return;
       }
       const target = path || (scope.kind === "folder" ? scope.base : "");
@@ -421,31 +487,67 @@ function Launcher() {
       if (cached) {
         setItems(cached);
         setLoading(false);
-        void fillIcons(cached.map((item) => item.path));
         return;
       }
       // 没缓存又正在拖：保持原样，别转圈，松手后再补。
-      if (dragActiveRef.current) {
+      // 1.5 秒没有新的拖拽坐标就当拖拽已经结束——拖拽结束事件丢了的时候
+      // （拖到窗口外松手、被系统取消）不能一直卡在这里。
+      if (dragActiveRef.current && Date.now() - dragSeenAt.current < 1500) {
         setLoading(false);
         return;
       }
       // 先清空：否则切目录时上一个目录的内容会留在屏幕上，搜索就会「搜到别处」。
       setItems([]);
       setLoading(true);
-      const list = await invoke<LauncherItem[]>("launcher_items", {
-        path: target,
-        withIcons: false,
-      });
-      if (!alive) return;
-      setItems(list);
-      setLoading(false);
-      void fillIcons(list.map((item) => item.path));
+      if (gridRef.current) gridRef.current.scrollTop = 0;
+      const channel = new Channel<LauncherPage>();
+      channel.onmessage = (page) => {
+        if (!alive || token !== viewToken.current) return;
+        if (page.items.length) {
+          setItems((previous) => [...previous, ...page.items]);
+        }
+        if (page.done) setLoading(false);
+      };
+      try {
+        await invoke("launcher_items_stream", { path: target, onPage: channel });
+      } catch (error) {
+        if (alive && token === viewToken.current) showToastRef.current(String(error));
+      } finally {
+        if (alive && token === viewToken.current) setLoading(false);
+      }
     };
     void run();
     return () => {
       alive = false;
     };
-  }, [scope, path, root.categories, allCache, fillIcons, loadTick]);
+  }, [scope, path, root.categories, allCache, loadTick]);
+
+  // 分类多到没预读全时，搜索期间把缺的补上：不能因为没预读就少搜几个分类。
+  useEffect(() => {
+    if (!query.trim()) return;
+    const missing = root.categories
+      .map((category) => category.path)
+      .filter((path) => !(path in allCache));
+    if (missing.length === 0) return;
+    let alive = true;
+    void (async () => {
+      for (const path of missing) {
+        try {
+          const list = await invoke<LauncherItem[]>("launcher_items", {
+            path,
+            withIcons: false,
+          });
+          if (!alive) return;
+          setAllCache((previous) => ({ ...previous, [path]: list }));
+        } catch {
+          // 读不了就跳过：少一个分类，别把搜索卡住。
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [query, root.categories, allCache]);
 
   // 站点图标：每个地址抓一次，抓不到就退化成一个字。
   useEffect(() => {
@@ -605,17 +707,26 @@ function Launcher() {
 
   const enterFolder = useCallback(
     (folderPath: string) => {
-      if (scope.kind === "all") {
-        // 「全部」是多个分类的合集：进某个文件夹等于切到它所属的分类。
+      // 搜索结果是跨分类的：进别的分类里的文件夹要连分类一起切过去，
+      // 否则面包屑和「上一层」都会指错地方。
+      if (scope.kind === "all" || !isInside(folderPath, scope.base)) {
         const owner = root.categories.find((category) => isInside(folderPath, category.path));
         if (owner) {
           go({ scope: { kind: "folder", base: owner.path, label: owner.name }, path: folderPath });
           return;
         }
+        const pin = root.folders.find((folder) => isInside(folderPath, folder));
+        if (pin) {
+          go({
+            scope: { kind: "folder", base: pin, label: folderLabel(pin), pinned: true },
+            path: folderPath,
+          });
+          return;
+        }
       }
       go({ scope, path: folderPath });
     },
-    [go, scope, root.categories],
+    [go, scope, root.categories, root.folders],
   );
 
   const openCategory = useCallback(
@@ -659,17 +770,20 @@ function Launcher() {
 
   // 拖拽用的两份最新状态：当前在哪一项、某一项点下去做什么。
   useEffect(() => {
-    activeIdRef.current = scope.kind === "all" ? "__all__" : scope.base;
+    activeIdRef.current =
+      scope.kind === "all" ? "__all__" : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
   }, [scope]);
 
   useEffect(() => {
     const map: Record<string, () => void> = { __all__: openAll };
 
+    // 同一个文件夹可能既是分类又是快速访问：键得带来源，不然两边互相覆盖，
+    // 拖拽时悬停到其中一个会切到另一个。
     for (const category of root.categories) {
-      map[category.path] = () => openCategory(category);
+      map[`cat:${category.path}`] = () => openCategory(category);
     }
     for (const folder of root.folders) {
-      map[folder] = () => openPinned(folder);
+      map[`pin:${folder}`] = () => openPinned(folder);
     }
     sidesRef.current = map;
   }, [root, openAll, openCategory, openPinned]);
@@ -690,11 +804,20 @@ function Launcher() {
       });
   }, [scope, path, base]);
 
-  const filtered = useMemo(() => {
+  // 一输入关键词就跨所有分类找：搜索框不属于某一个分类，只看眼前这一层太窄。
+  // 当前目录的条目也并进来，在子文件夹 / 快速访问里搜东西时不会突然搜不到眼前这些。
+  const searched = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return items;
-    return items.filter((item) => item.name.toLowerCase().includes(needle));
-  }, [items, query]);
+    if (!needle) return null;
+    const pool = new Map<string, LauncherItem>();
+    for (const category of root.categories) {
+      for (const item of allCache[category.path] ?? []) pool.set(item.path, item);
+    }
+    for (const item of items) pool.set(item.path, item);
+    return [...pool.values()].filter((item) => item.name.toLowerCase().includes(needle));
+  }, [query, root.categories, allCache, items]);
+
+  const filtered = searched ?? items;
 
   const shown = useMemo(() => {
     const list = [...filtered];
@@ -722,16 +845,75 @@ function Launcher() {
     return list;
   }, [filtered, sort]);
 
+  // 虚拟滚动的几何：列数、行高、总高度、当前要渲染的区间。
+  const layout = useMemo(() => {
+    const width = Math.max(0, viewport.width);
+    const height = Math.max(0, viewport.height);
+    if (view === "grid") {
+      const inner = Math.max(width - GRID_PAD * 2, GRID_CELL_W);
+      const cols = Math.max(1, Math.floor((inner + GRID_GAP) / (GRID_CELL_W + GRID_GAP)));
+      const pitch = GRID_TILE_H + GRID_GAP;
+      const rows = Math.ceil(shown.length / cols);
+      const total = GRID_PAD * 2 + Math.max(0, rows * pitch - GRID_GAP);
+      // 上下各多渲染两行，滚动时不会出现空白。
+      const first = Math.max(0, Math.floor((viewport.scrollTop - GRID_PAD) / pitch) - 2);
+      const last = Math.min(rows, Math.ceil((viewport.scrollTop + height - GRID_PAD) / pitch) + 2);
+      return {
+        start: first * cols,
+        end: Math.min(shown.length, Math.max(last, first + 1) * cols),
+        total,
+        topOf: (index: number) => GRID_PAD + Math.floor(index / cols) * pitch,
+        leftOf: (index: number) => GRID_PAD + (index % cols) * (GRID_CELL_W + GRID_GAP),
+        itemHeight: GRID_TILE_H,
+        pad: GRID_PAD,
+      };
+    }
+    const pitch = LIST_ROW_H + LIST_GAP;
+    const rows = shown.length;
+    const total = LIST_PAD * 2 + Math.max(0, rows * pitch - LIST_GAP);
+    const first = Math.max(0, Math.floor((viewport.scrollTop - LIST_PAD) / pitch) - 3);
+    const last = Math.min(rows, Math.ceil((viewport.scrollTop + height - LIST_PAD) / pitch) + 3);
+    return {
+      start: first,
+      end: Math.min(rows, Math.max(last, first + 1)),
+      total,
+      topOf: (index: number) => LIST_PAD + index * pitch,
+      leftOf: () => LIST_PAD,
+      itemHeight: LIST_ROW_H,
+      pad: LIST_PAD,
+    };
+  }, [view, viewport.width, viewport.height, viewport.scrollTop, shown.length]);
+
   useEffect(() => {
     if (selected >= shown.length) setSelected(Math.max(shown.length - 1, -1));
   }, [shown.length, selected]);
 
+  // 键盘移动后把选中项滚进视野。虚拟滚动下目标节点可能还没渲染，
+  // 只能按几何位置算，`scrollIntoView` 靠不住。
+  // 只在「选中项变了」时滚：否则用户自己往下滚，这里会把视图硬拽回选中项。
+  const revealed = useRef(-1);
   useEffect(() => {
-    if (selected < 0) return;
-    const grid = gridRef.current;
-    const active = grid?.querySelector<HTMLElement>("[data-index].active");
-    active?.scrollIntoView({ block: "nearest" });
-  }, [selected, shown]);
+    if (selected < 0 || selected === revealed.current) return;
+    revealed.current = selected;
+    const element = gridRef.current;
+    if (!element) return;
+    const top = layout.topOf(selected);
+    const bottom = top + layout.itemHeight;
+    if (top - layout.pad < element.scrollTop) {
+      element.scrollTop = Math.max(0, top - layout.pad);
+    } else if (bottom + layout.pad > element.scrollTop + element.clientHeight) {
+      element.scrollTop = bottom + layout.pad - element.clientHeight;
+    }
+  }, [selected, layout]);
+
+  // 图标只取屏幕上看得见的那几项，滚到哪儿取到哪儿。
+  useEffect(() => {
+    const slice = shown.slice(layout.start, layout.end);
+    const missing = slice
+      .map((item) => item.path)
+      .filter((path) => !(path in iconRef.current));
+    if (missing.length) void fillIcons(missing);
+  }, [shown, layout.start, layout.end, fillIcons]);
 
   // ---------- 操作 ----------
 
@@ -776,13 +958,6 @@ function Launcher() {
     setEditing(null);
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
-
-  const createFolder = useCallback(async () => {
-    if (!currentDir) return;
-    const created = await invoke<string>("launcher_new_folder", { parent: currentDir });
-    await refreshAll();
-    setEditing({ path: created, name: "新建文件夹" });
-  }, [currentDir, refreshAll]);
 
   const openSettings = useCallback(async (tab: "items" | "folders") => {
     await invoke("open_settings", { page: "launcher", tab });
@@ -1145,7 +1320,8 @@ function Launcher() {
             type="button"
             key={category.path}
             className={`side-item${activeId === `cat:${category.path}` ? " active" : ""}`}
-            data-side={category.path}
+            data-side={`cat:${category.path}`}
+            data-path={category.path}
             onClick={() => openCategory(category)}
             onContextMenu={(event) => {
               event.preventDefault();
@@ -1175,7 +1351,8 @@ function Launcher() {
             type="button"
             key={folder}
             className={`side-item${activeId === `pin:${folder}` ? " active" : ""}`}
-            data-side={folder}
+            data-side={`pin:${folder}`}
+            data-path={folder}
             onClick={() => openPinned(folder)}
             onContextMenu={(event) => {
               event.preventDefault();
@@ -1347,16 +1524,6 @@ function Launcher() {
               </svg>
             )}
           </button>
-          <button
-            type="button"
-            className="tool-btn wide"
-            disabled={!currentDir}
-            onClick={() => void createFolder()}
-            title="在当前目录新建文件夹"
-          >
-            新建文件夹
-          </button>
-
           <div className="search">
             <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
               <circle cx="7.2" cy="7.2" r="5.2" stroke="currentColor" strokeWidth="1.6" />
@@ -1381,6 +1548,14 @@ function Launcher() {
         <div
           className={view === "grid" ? "grid" : "list"}
           ref={gridRef}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            setViewport((previous) =>
+              previous.scrollTop === element.scrollTop
+                ? previous
+                : { ...previous, scrollTop: element.scrollTop },
+            );
+          }}
           onPointerDown={beginMarquee}
           onPointerMove={moveMarquee}
           onPointerUp={endMarquee}
@@ -1408,7 +1583,7 @@ function Launcher() {
             <div className="empty">
               {!hasRoot && scope.kind === "all" ? (
                 <>
-                  <strong>还没有选启动器文件夹</strong>
+                  <strong>还没有选分类的根目录</strong>
                   选一个文件夹，它的每个子文件夹就会变成左边的分类
                   <button
                     type="button"
@@ -1418,9 +1593,9 @@ function Launcher() {
                     去设置里选文件夹
                   </button>
                 </>
-              ) : query ? (
+              ) : searched ? (
                 <>
-                  <strong>没有匹配的条目</strong>
+                  <strong>所有分类里都没有</strong>
                   换个关键词试试
                 </>
               ) : loading ? (
@@ -1433,7 +1608,11 @@ function Launcher() {
               )}
             </div>
           )}
-          {shown.map((item, index) => (
+          {/* 撑出总高度，真正渲染的只有可视范围那几十项。 */}
+          <div className="virt-space" style={{ height: layout.total }} />
+          {shown.slice(layout.start, layout.end).map((item, offset) => {
+            const index = layout.start + offset;
+            return (
             <div
               key={item.path}
               role="button"
@@ -1445,6 +1624,23 @@ function Launcher() {
               }`}
               title={`${item.name}${item.size ? `\n${formatSize(item.size)}` : ""}`}
               data-index={index}
+              style={
+                view === "grid"
+                  ? {
+                      position: "absolute",
+                      left: layout.leftOf(index),
+                      top: layout.topOf(index),
+                      width: GRID_CELL_W,
+                      height: GRID_TILE_H,
+                    }
+                  : {
+                      position: "absolute",
+                      left: LIST_PAD,
+                      right: LIST_PAD,
+                      top: layout.topOf(index),
+                      height: LIST_ROW_H,
+                    }
+              }
               onPointerDown={(event) => {
                 if (event.button !== 0) return;
                 // Alt+拖动是框选，交给网格处理。
@@ -1504,9 +1700,20 @@ function Launcher() {
             >
               <span className="tile-icon">
                 {(() => {
-                  const icon = item.icon ?? iconByPath[item.path] ?? null;
-                  return icon ? (
-                    <img src={`data:image/png;base64,${icon}`} alt="" draggable={false} />
+                  const key = iconByPath[item.path] ?? null;
+                  return key ? (
+                    <img
+                      src={`${ICON_BASE}${key}`}
+                      alt=""
+                      draggable={false}
+                      decoding="async"
+                      loading="lazy"
+                      onError={() => {
+                        // 缓存被清掉了：放回字形，下次可见时重新要。
+                        delete iconRef.current[item.path];
+                        setIconByPath({ ...iconRef.current });
+                      }}
+                    />
                   ) : (
                     <span className="tile-glyph">{item.isDir ? "▢" : "▤"}</span>
                   );
@@ -1562,13 +1769,15 @@ function Launcher() {
                 </>
               )}
             </div>
-          ))}
+            );
+          })}
         </div>
 
         {toast && <div className="toast">{toast}</div>}
 
         <div className="foot">
-          <span>{baseLabel}</span>
+          {/* 一搜索就跨所有分类找，这里跟着说清楚范围。 */}
+          <span>{searched ? "所有分类" : baseLabel}</span>
           <span>·</span>
           <span>{shown.length} 项</span>
           <span>·</span>

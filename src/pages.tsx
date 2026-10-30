@@ -101,8 +101,8 @@ export function Overview({
         <div className="tools">
           <ToolRow
             icon={<Rocket size={18} />}
-            name="快捷启动"
-            hint="一个键呼出：按分类启动程序，顺手中转文件"
+            name="快捷面板"
+            hint="一个键呼出：按分类找文件、搬运文件"
             enabled={config.launcher.enabled}
             onToggle={(value) => update({ launcher: { enabled: value } })}
             onOpen={() => onOpen("launcher")}
@@ -1049,8 +1049,8 @@ const HOTKEY_GROUPS: Array<{
   rows: Array<{ key: "pause" | "phrasesPanel" | "launcher"; label: string; hint: string }>;
 }> = [
   {
-    tool: "快捷启动",
-    hint: "呼出启动器 / 中转站面板",
+    tool: "快捷面板",
+    hint: "一个键呼出：文件分类 / 快速访问 / 内置网页",
     rows: [
       { key: "launcher", label: "呼出面板", hint: "任何时候按一下就能呼出" },
     ],
@@ -1186,11 +1186,10 @@ export function HotkeysPage({
 }
 
 /**
- * 快捷启动：一个键呼出的面板。
- *
- * 面板里有两块内容，对应这里的两个标签：
- *   启动项 —— 根目录下的每个子文件夹就是一个分类；
- *   中转站 —— 一个普通文件夹，用来临时搬文件。
+ * 快捷面板：一个键呼出的面板。设置分成三块，对应三个标签：
+ *   快捷启动 —— 根目录下的每个子文件夹就是一个分类；
+ *   快速访问 —— 另外钉住的几个普通文件夹；
+ *   内置网页 —— 网页窗口顶栏上的那些站点。
  */
 /// 可拖动排序的行。自己处理鼠标事件，不用 HTML5 拖放：
 /// 无边框窗口里更稳，也不依赖系统拖放循环。
@@ -1355,14 +1354,14 @@ export function LauncherPage({
         value={tab}
         onChange={(value) => onTabChange(value as "items" | "folders" | "sites")}
         options={[
-          { value: "items", label: "启动项" },
-          { value: "folders", label: "常用文件夹" },
-          { value: "sites", label: "网址" },
+          { value: "items", label: "快捷启动" },
+          { value: "folders", label: "快速访问" },
+          { value: "sites", label: "内置网页" },
         ]}
       />
 
       {tab === "items" ? (
-        <Card title="启动项">
+        <Card title="快捷启动">
           <p className="sub" style={{ marginTop: 0 }}>
             选一个根目录，它下面的每个子文件夹就是一个分类（比如 常用 / 软件 / 设计）。
             面板左侧按下面的顺序生成导航，拖动可以调整。
@@ -1485,12 +1484,12 @@ export function LauncherPage({
           </Row>
         </Card>
       ) : tab === "sites" ? (
-        <Card title="网址">
+        <Card title="内置网页">
           <p className="sub" style={{ marginTop: 0 }}>
-            这里加的站点会出现在面板左侧，点一下直接在面板里打开（真 WebView，不是 iframe，
+            这里加的站点会出现在网页窗口的顶栏，点一下直接打开（真 WebView，不是 iframe，
             所以 Google、ChatGPT 这类也能开）。面板收起时网页会一起关掉，不占内存。
           </p>
-          <Row label="内置网页" hint="关掉之后面板只显示文件夹，不会创建任何 WebView">
+          <Row label="启用网页窗口" hint="关掉之后面板只显示文件夹，不会创建任何 WebView">
             <Toggle
               checked={config.launcher.webEnabled !== false}
               onChange={(value) => update({ launcher: { webEnabled: value } })}
@@ -1661,7 +1660,7 @@ export function LauncherPage({
           </div>
         </Card>
       ) : (
-        <Card title="常用文件夹">
+        <Card title="快速访问">
           <p className="sub" style={{ marginTop: 0 }}>
             这里的文件夹会出现在面板左侧，点一下直接跳过去；拖动可以调整顺序。
             往里拖文件就是移动进那个目录，往外拖就是复制或移动出去。

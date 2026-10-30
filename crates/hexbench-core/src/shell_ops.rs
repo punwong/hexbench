@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::core::{Interface, HSTRING};
+use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
@@ -20,9 +20,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{
-    FileOperation, IFileOperation, IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName,
-    FOFX_ADDUNDORECORD, FOF_NOCONFIRMMKDIR, FOF_WANTNUKEWARNING, SIIGBF_BIGGERSIZEOK,
-    SIIGBF_THUMBNAILONLY,
+    FileOperation, IFileOperation, ISharedBitmap, IShellItem, IShellItemImageFactory,
+    IThumbnailCache, LocalThumbnailCache, SHCreateItemFromParsingName, FOFX_ADDUNDORECORD,
+    FOF_NOCONFIRMMKDIR, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING, SIIGBF_BIGGERSIZEOK,
+    SIIGBF_THUMBNAILONLY, WTS_INCACHEONLY,
 };
 
 fn wide(path: &Path) -> HSTRING {
@@ -57,7 +58,9 @@ pub fn move_into(sources: &[PathBuf], dest: &Path) -> Result<usize, String> {
     unsafe {
         let operation: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
             .map_err(|error| format!("IFileOperation: {error}"))?;
-        let flags = FOF_NOCONFIRMMKDIR | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING;
+        // 重名自动编号（`文件 (2).txt`），和资源管理器一致，也不弹替换框。
+        let flags = FOF_NOCONFIRMMKDIR | FOF_RENAMEONCOLLISION | FOFX_ADDUNDORECORD
+            | FOF_WANTNUKEWARNING;
         operation
             .SetOperationFlags(flags)
             .map_err(|error| error.to_string())?;
@@ -85,6 +88,38 @@ pub fn move_into(sources: &[PathBuf], dest: &Path) -> Result<usize, String> {
         }
         Ok(queued)
     }
+}
+
+/// 改名：交给 `IFileOperation`，和资源管理器走同一条路（长路径、大小写、
+/// 撤销记录都由系统处理）。名字合法性、重名由调用方先检查。
+pub fn rename(path: &Path, new_name: &str) -> Result<(), String> {
+    ensure_com();
+    let mut new_wide: Vec<u16> = new_name.encode_utf16().collect();
+    new_wide.push(0);
+    // SAFETY: 字符串在调用期间有效；item / operation 都是本次创建的 COM 对象。
+    unsafe {
+        let operation: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
+            .map_err(|error| format!("IFileOperation: {error}"))?;
+        operation
+            .SetOperationFlags(FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING)
+            .map_err(|error| error.to_string())?;
+        let item: IShellItem = SHCreateItemFromParsingName(&wide(path), None)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        operation
+            .RenameItem(&item, PCWSTR(new_wide.as_ptr()), None)
+            .map_err(|error| error.to_string())?;
+        operation
+            .PerformOperations()
+            .map_err(|error| error.to_string())?;
+        if operation
+            .GetAnyOperationsAborted()
+            .map(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Err("改名被取消".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// 删除到回收站（Explorer 会自己弹确认框）。
@@ -136,7 +171,10 @@ pub fn copy_into(sources: &[PathBuf], dest: &Path) -> Result<usize, String> {
         let operation: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
             .map_err(|error| format!("IFileOperation: {error}"))?;
         operation
-            .SetOperationFlags(FOF_NOCONFIRMMKDIR | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING)
+            .SetOperationFlags(
+                FOF_NOCONFIRMMKDIR | FOF_RENAMEONCOLLISION | FOFX_ADDUNDORECORD
+                    | FOF_WANTNUKEWARNING,
+            )
             .map_err(|error| error.to_string())?;
         let target: IShellItem = SHCreateItemFromParsingName(&wide(dest), None)
             .map_err(|error| format!("目标文件夹: {error}"))?;
@@ -164,12 +202,26 @@ pub fn copy_into(sources: &[PathBuf], dest: &Path) -> Result<usize, String> {
     }
 }
 
+/// 剪贴板经常被别的程序短暂占着（输入法、剪贴板历史、浏览器）。资源管理器
+/// 也是重试几次；只试一次的话，`Ctrl+X` 会偶尔静默地什么都没写进去。
+fn open_clipboard_with_retry() -> bool {
+    use windows::Win32::System::DataExchange::OpenClipboard;
+    for _ in 0..8 {
+        // SAFETY: 只是尝试取得剪贴板所有权，拿不到就等一会儿再试。
+        if unsafe { OpenClipboard(None) }.is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    false
+}
+
 /// 把文件列表写进剪贴板（`CF_HDROP`），`cut=true` 时附带「剪切」标记。
 ///
 /// 这样我们自己的粘贴、以及资源管理器的粘贴都能用同一份数据。
 pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+        CloseClipboard, EmptyClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_HDROP;
@@ -221,12 +273,20 @@ pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
             payload.len() * 2,
         );
         let _ = GlobalUnlock(handle);
-        OpenClipboard(None).map_err(|error| error.to_string())?;
+        if !open_clipboard_with_retry() {
+            return Err("剪贴板被其他程序占用，稍后再试".to_string());
+        }
         let _ = EmptyClipboard();
-        SetClipboardData(CF_HDROP.0 as u32, Some(windows::Win32::Foundation::HANDLE(handle.0)))
-            .map_err(|error| error.to_string())?;
-        // 剪切标记：Preferred DropEffect
-        let name: Vec<u16> = "Preferred DropEffect`0".encode_utf16().collect();
+        if let Err(error) =
+            SetClipboardData(CF_HDROP.0 as u32, Some(windows::Win32::Foundation::HANDLE(handle.0)))
+        {
+            // 失败也要把剪贴板交还，否则会把其他程序挡在外面。
+            let _ = CloseClipboard();
+            return Err(error.to_string());
+        }
+        // 剪切标记：Preferred DropEffect。
+        // 名字必须带结尾 NUL：RegisterClipboardFormat 不会替你补。
+        let name: Vec<u16> = "Preferred DropEffect\0".encode_utf16().collect();
         let format = RegisterClipboardFormatW(windows::core::PCWSTR(name.as_ptr()));
         // DROPEFFECT_MOVE = 2，DROPEFFECT_COPY = 1
         let effect: u32 = if cut { 2 } else { 1 };
@@ -235,7 +295,12 @@ pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
             if !cell.is_null() {
                 *cell = effect;
                 let _ = GlobalUnlock(extra);
-                let _ = SetClipboardData(format, Some(windows::Win32::Foundation::HANDLE(extra.0)));
+                let written =
+                    SetClipboardData(format, Some(windows::Win32::Foundation::HANDLE(extra.0)));
+                if let Err(error) = &written {
+                    log::warn!("clipboard: drop effect 写入失败 format={format}: {error}");
+                }
+                log::debug!("clipboard: wrote effect={effect} format={format} ok={}", written.is_ok());
             }
         }
         let _ = CloseClipboard();
@@ -246,16 +311,35 @@ pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
 /// 读剪贴板里的文件列表，以及是不是「剪切」。
 #[allow(clippy::type_complexity)]
 pub fn clipboard_get_files() -> Option<(Vec<PathBuf>, bool)> {
+    // 刚写完剪贴板立刻读，自定义格式偶尔要晚十几毫秒才出现 —— 实测同一进程
+    // 写完后第一次读会读不到 DropEffect，`Ctrl+X` 紧跟 `Ctrl+V` 就退化成复制。
+    for attempt in 0..3 {
+        let (paths, effect) = clipboard_read_files()?;
+        match effect {
+            Some(value) => return Some((paths, value & 2 != 0)),
+            None if attempt < 2 => {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            None => return Some((paths, false)),
+        }
+    }
+    None
+}
+
+/// 读一次剪贴板。`None` 表示没有文件；第二个值 `None` 表示有文件、但剪切
+/// 标记还没读到（调用方决定要不要稍后再读）。
+fn clipboard_read_files() -> Option<(Vec<PathBuf>, Option<u32>)> {
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-        RegisterClipboardFormatW,
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, RegisterClipboardFormatW,
     };
     use windows::Win32::System::Ole::CF_HDROP;
     use windows::Win32::UI::Shell::DragQueryFileW;
 
     // SAFETY: 只在持锁期间读，读到的路径立刻拷贝成 owned 数据。
     unsafe {
-        OpenClipboard(None).ok()?;
+        if !open_clipboard_with_retry() {
+            return None;
+        }
         if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_err() {
             let _ = CloseClipboard();
             return None;
@@ -283,16 +367,16 @@ pub fn clipboard_get_files() -> Option<(Vec<PathBuf>, bool)> {
             buffer.truncate(written as usize);
             paths.push(PathBuf::from(String::from_utf16_lossy(&buffer)));
         }
-        // 剪切标记
-        let name: Vec<u16> = "Preferred DropEffect`0".encode_utf16().collect();
+        // 剪切标记：名字必须带结尾 NUL，否则注册到的是另一段内存。
+        let name: Vec<u16> = "Preferred DropEffect\0".encode_utf16().collect();
         let format = RegisterClipboardFormatW(windows::core::PCWSTR(name.as_ptr()));
-        let mut cut = false;
+        let mut effect_value = None;
         if let Ok(effect_handle) = GetClipboardData(format) {
             let pointer = windows::Win32::System::Memory::GlobalLock(
                 windows::Win32::Foundation::HGLOBAL(effect_handle.0),
             ) as *const u32;
             if !pointer.is_null() {
-                cut = (*pointer & 2) != 0;
+                effect_value = Some(*pointer);
                 let _ = windows::Win32::System::Memory::GlobalUnlock(
                     windows::Win32::Foundation::HGLOBAL(effect_handle.0),
                 );
@@ -300,10 +384,9 @@ pub fn clipboard_get_files() -> Option<(Vec<PathBuf>, bool)> {
         }
         let _ = CloseClipboard();
         if paths.is_empty() {
-            None
-        } else {
-            Some((paths, cut))
+            return None;
         }
+        Some((paths, effect_value))
     }
 }
 
@@ -321,9 +404,8 @@ pub fn paste_into(dest: &Path) -> Result<usize, String> {
     if cut {
         let moved = move_into(&paths, dest)?;
         log::info!("paste: moved {moved}");
-        // 剪切完成后清空剪贴板里的「剪切」标记（换成复制语义），
-        // 否则再粘贴一次会重复搬同一个文件。
-        let _ = clipboard_set_files(&[], false);
+        // 剪切完成后清空剪贴板，和资源管理器一致。
+        clipboard_clear();
         Ok(moved)
     } else {
         let copied = copy_into(&paths, dest)?;
@@ -338,6 +420,19 @@ pub fn paste_into(dest: &Path) -> Result<usize, String> {
 /// `$I<id>`（元数据，里面有原始完整路径）和 `$R<id>`（实际内容）。
 /// 这里按原始路径找到对应的一对，把 `$R` 搬回去、删掉 `$I`，
 /// 效果就等于在回收站里点「还原」。
+/// 清空剪贴板。剪切粘贴完成后调用，和资源管理器一致 —— 否则同一批文件
+/// 还能再粘一次，而源已经没了。
+pub fn clipboard_clear() {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard};
+    // SAFETY: 拿到所有权才清空；被别的程序占着就直接放弃。
+    unsafe {
+        if open_clipboard_with_retry() {
+            let _ = EmptyClipboard();
+            let _ = CloseClipboard();
+        }
+    }
+}
+
 pub fn restore_trashed(original: &std::path::Path) -> Result<(), String> {
     use std::path::Component;
 
@@ -405,6 +500,25 @@ pub fn restore_trashed(original: &std::path::Path) -> Result<(), String> {
         original.display()
     ))
 }
+/// 只从**系统缩略图缓存**里取，不触发抽取：命中就立刻返回，没命中也是立刻
+/// 放弃。资源管理器用的是同一份缓存，所以它显示过的图这里多半也有。
+pub fn thumbnail_cached_rgba(path: &Path, size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    ensure_com();
+    // SAFETY: 位图归 ISharedBitmap 所有（Detach 才会转移所有权），读完随接口
+    // 一起释放，这里不能 DeleteObject。
+    unsafe {
+        let cache: IThumbnailCache =
+            CoCreateInstance(&LocalThumbnailCache, None, CLSCTX_ALL).ok()?;
+        let item: IShellItem = SHCreateItemFromParsingName(&wide(path), None).ok()?;
+        let mut thumb: Option<ISharedBitmap> = None;
+        cache
+            .GetThumbnail(&item, size, WTS_INCACHEONLY, Some(&mut thumb), None, None)
+            .ok()?;
+        let bitmap = thumb?.GetSharedBitmap().ok()?;
+        bitmap_to_rgba(bitmap)
+    }
+}
+
 /// 取缩略图（RGBA）。拿不到缩略图时 Shell 会退化成图标，两者都失败才返回 None。
 pub fn thumbnail_rgba(path: &Path, size: u32) -> Option<(Vec<u8>, u32, u32)> {
     ensure_com();

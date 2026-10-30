@@ -103,7 +103,7 @@ impl Config {
 pub struct HotkeySettings {
     pub pause: String,
     pub phrases_panel: String,
-    /// 呼出「面板」（快捷启动 + 文件区）的快捷键。
+    /// 呼出「快捷面板」的快捷键。
     pub launcher: String,
 }
 
@@ -162,6 +162,9 @@ pub struct LauncherLocation {
     pub base: String,
     pub label: String,
     pub path: String,
+    /// 这个 base 是「快速访问」里的文件夹（而不是启动分类）。
+    /// 同一个文件夹可能两边都有，回落时要能分出来是哪一行。
+    pub pinned: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -170,11 +173,11 @@ pub struct LauncherSettings {
     pub enabled: bool,
     /// 常用文件夹：面板左侧可以直接跳过去，顺序就是这里的顺序。
     pub folders: Vec<String>,
-    /// 启动器的根目录：它的每个子文件夹就是一个分类。
+    /// 分类的根目录：它的每个子文件夹就是一个分类。
     pub root: String,
     /// 分类的显示顺序（按子文件夹名）；不在这里的分类排在后面。
     pub category_order: Vec<String>,
-    /// 面板里的「网址」分组：可以在面板里直接打开这些站点。
+    /// 内置网页的站点列表：网页窗口顶栏就是它们。
     pub sites: Vec<LauncherSite>,
     /// 内置网页总开关（关掉就只有文件夹，不创建任何 WebView）。
     pub web_enabled: bool,

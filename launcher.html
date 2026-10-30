@@ -58,7 +58,10 @@
         /* 外框用一个固定的浅灰（#bcbcbc）：和右侧网页面板接缝处实测的
         渲染值完全一致，两个面板的边框看起来才是同一根线。 */
         border: 1px solid #bcbcbc;
-        border-radius: 8px;
+        /* 圆角交给窗口自己（后端对面板调了 DWMWCP_ROUND，和设置窗口同一个 8px），
+        这里不再自己画：自绘的圆角外面那圈三角 WebView 会补成白色，深色主题下
+        四个角就是白点；两条弧线也不会完全重合，描边在拐角处会被系统剪掉一截。
+        Win10 没有这个属性，面板就是直角——和设置窗口一样，不做逐像素对齐。 */
         overflow: hidden;
         animation: palette-in 130ms var(--ease) both;
       }
@@ -256,11 +259,6 @@
         opacity: 0.3;
       }
 
-      .tool-btn.wide {
-        padding: 0 10px;
-        font-size: 12px;
-      }
-
       .sort-select {
         flex: 0 0 auto;
         height: 24px;
@@ -403,17 +401,18 @@
         font-weight: 600;
       }
 
+      /* 虚拟滚动：容器只负责滚动，条目按绝对位置摆；总高度由 .virt-space 撑。 */
       .list {
         position: relative;
         flex: 1;
         overflow-y: auto;
-        /* 同样：行间距 = 四周留白 */
-        --cell-gap: 10px;
-        padding: var(--cell-gap);
-        display: flex;
-        flex-direction: column;
-        gap: var(--cell-gap);
+        padding: 0;
         scrollbar-width: thin;
+      }
+
+      .virt-space {
+        width: 100%;
+        pointer-events: none;
       }
 
       .row {
@@ -424,6 +423,7 @@
         border-radius: 7px;
         cursor: default;
         outline: none;
+        box-sizing: border-box;
       }
 
       .row.active {
@@ -479,14 +479,7 @@
         position: relative;
         flex: 1;
         overflow-y: auto;
-        /* 间距 = 四周留白：格子和格子之间、以及和边框之间保持同一个节奏 */
-        --cell-gap: 22px;
-        padding: var(--cell-gap);
-        display: grid;
-        grid-template-columns: repeat(auto-fill, 108px);
-        justify-content: start;
-        gap: var(--cell-gap);
-        align-content: start;
+        padding: 0;
         scrollbar-width: thin;
       }
 
@@ -503,6 +496,9 @@
         border-radius: 10px;
         cursor: default;
         outline: none;
+        /* 虚拟滚动给的是固定格子尺寸：宽度和高度都在内联样式里。 */
+        box-sizing: border-box;
+        overflow: hidden;
       }
 
       .tile.active {
@@ -577,13 +573,23 @@
       }
 
       .empty {
-        grid-column: 1 / -1;
+        position: absolute;
+        inset: 0;
         margin: auto;
         padding: 24px 12px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
         text-align: center;
         color: var(--muted);
         font-size: 12.5px;
         line-height: 1.9;
+        pointer-events: none;
+      }
+
+      .empty button {
+        pointer-events: auto;
       }
 
       .empty strong {

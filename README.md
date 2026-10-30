@@ -4,7 +4,7 @@
 
 > **按显示器最外侧边缘切换 Windows 虚拟桌面** · Multi-monitor aware virtual desktop switching
 
-`v0.1.3` · `Windows 11 主目标 / Windows 10 尽力` · `Tauri 2 + React` · `现代化界面` · `开源`
+`v0.6.0` · `Windows 11 主目标 / Windows 10 尽力` · `Tauri 2 + React` · `现代化界面` · `开源`
 
 ---
 
@@ -173,21 +173,22 @@ rightExposed(M, y) = MonitorFromPoint({ M.right,    y }, MONITOR_DEFAULTTONULL) 
 - **不抢焦点** —— 面板是 `WS_EX_NOACTIVATE` 窗口，点击时焦点仍留在聊天输入框
 - **话术可编辑** —— 主界面「快捷语面板 → 话术」里加 / 改 / 删，面板 1.5 秒内自动同步
 
-**工具三：快捷启动（呼出面板）**
+**工具三：快捷面板（呼出面板）**
 
 - **一个键呼出** —— 默认 `Alt+1`，贴鼠标出现，占屏幕 50%×50%，位置可记
+- **设置里三块** —— **快捷启动**（根目录与分类顺序）/ **快速访问**（钉住的文件夹）/ **内置网页**（网址）
 - **分类来自文件夹** —— 设置里选一个根目录，它的每个子文件夹就是一个分类；分类可拖动排序、用眼睛控制显不显示
-- **常用文件夹** —— 另外几个常用目录放在侧边栏下方，可增删、拖动排序
+- **快速访问** —— 另外几个常用目录钉在侧边栏下方，可增删、拖动排序
 - **真文件管理** —— 框选 / Ctrl / Shift 多选、拖出到资源管理器、从外面拖进来；落在文件夹上就是移进去，跨盘走 `IFileOperation`（带进度条、重名询问）
 - **拖拽中切换分类** —— 拖着文件悬到左侧分类上就切过去，松手直接落进去
 - **右键分类** —— 新建分类（在根目录建子文件夹）、重命名分类
 - **空白处右键 = 资源管理器原生菜单** —— 新建 / 粘贴 / 刷新 / 属性，连 Git、VS Code、7-Zip 这些已安装的扩展都在里面（手写 Shell COM：`IShellFolder::CreateViewObject` 拿背景菜单）
 - **缩略图** —— 图片 / 视频 / PDF 走 shell 缩略图，结果缓存在 `%LOCALAPPDATA%`（200 MB 上限、LRU 清理），设置里有「缓存」页可查看和清空
-- **细节** —— 自然序排序、图标 / 列表两种视图、搜索、Windows 合法文件名校验、快捷方式不显示 `.lnk` 后缀、停在顶层时不显示前进后退
 - **撤销与剪贴板** —— 删除走回收站，`Ctrl+Z` 能还原（含从回收站找回）；`Ctrl+C / X / V` 读写系统剪贴板，和资源管理器互通
 - **面板和网页窗口都能拖** —— 拖边缘改大小、拖顶栏移动；尺寸和位置会记住（设置里可关），下次呼出一模一样
 - **跟随主题** —— 面板和网页窗口跟设置里的浅色/深色走，不用重启
 - **内置网页** —— 设置里加常用网址（自动识别站点名和图标），开一个**独立的网页窗口**贴在屏幕左侧或右侧：宽度 / 高度按百分比单独设置、默认不跟随面板（位置固定），需要时也可以勾选「跟随面板」；顶栏用网站图标做标签页，一键切换站点、刷新
+- **细节** —— 自然序排序、图标 / 列表两种视图、搜索、Windows 合法文件名校验、快捷方式不显示 `.lnk` 后缀、停在顶层时不显示前进后退
 体验细节：托盘常驻（左键打开主界面、右键菜单）、开机自启、防误触（拖拽 / 进程黑名单 / 锁屏）、切换后光标回位、暂停热键、切换失败提示、首次使用引导、亮暗主题跟随系统。
 
 ---
@@ -426,6 +427,18 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | `guard.processBlacklist` | string[] | `[]` | ≤ 50 项 | 进程名，不区分大小写 |
 | `guard.pauseHotkey` | string | `Ctrl+Alt+Shift+P` | — | 注册失败时提示改键 |
 | `monitors.overrides` | map | `{}` | — | 每屏开关，按 EDID 作键，**仅本地** |
+| `launcher.root` | string | `""` | — | 启动器根目录，每个子文件夹是一个分类 |
+| `launcher.folders` | string[] | `[]` | — | 快速访问：钉在侧边栏的文件夹 |
+| `launcher.widthPercent` / `launcher.heightPercent` | u32 | `50` / `50` | 25–80 | 呼出面板占工作区百分比 |
+| `launcher.followCursor` | bool | `true` | — | 呼出时贴着鼠标 |
+| `launcher.panelRememberSize` | bool | `true` | — | 记住拖出来的面板大小 |
+| `launcher.webEnabled` | bool | `true` | — | 内置网页总开关 |
+| `launcher.sites` | object[] | `[]` | — | 站点列表（`{ name, url }`） |
+| `launcher.siteWidthPercent` / `siteHeightPercent` | u32 | `24` / `85` | 10–90 / 20–100 | 网页窗口占工作区百分比 |
+| `launcher.siteFollowPanel` | bool | `false` | — | 网页窗口跟随面板 |
+| `launcher.siteSide` | enum | `right` | left / right | 固定时贴哪一侧 |
+| `launcher.siteRememberPosition` | bool | `true` | — | 记住网页窗口的位置和大小 |
+| `launcher.siteKeepAliveSecs` | u32 | `90` | 0–300 | 面板收起后网页保留秒数 |
 | `ui.theme` | enum | `system` | system / light / dark | |
 | `ui.language` | enum | `auto` | auto / zh-CN / en | |
 | `sync.enabled` | bool | `false` | — | |
@@ -539,6 +552,18 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | 长稳 | 72 h、反复插拔显示器 | 句柄 / 内存不增长 |
 | 配置 | 损坏、降级、跨设备同步 | 不丢配置；冲突有提示 |
 | 首次 | 新用户零配置 | 30 秒内能成功触发一次 |
+
+**快捷面板（文件区）**
+
+| 维度 | 用例 | 关注点 |
+| --- | --- | --- |
+| 删除 / 撤销 | 删单个、批量；`Ctrl+Z` | 进回收站；能还原到原路径；回收站已清空时给提示 |
+| 剪贴板 | `Ctrl+C/X` → 换目录 `Ctrl+V`；和资源管理器互粘 | 落到当前目录；剪切不重复粘 |
+| 原生菜单 | 空白处右键；新建文件夹；属性 | 菜单完整；新建后列表自动刷新 |
+| 缩放 / 记忆 | 拖边角；拖顶栏；收起再呼出 | 尺寸不变形；网页不空白；重启后位置一致 |
+| 主题 | 设置里切浅色 / 深色 | 面板与网页窗口立即跟随，不重启 |
+| 侧边栏 | 同名分类 + 常用文件夹；快速划过 | 只亮当前项；不来回跳 |
+| 大目录 | 数千项、缩略图 | 不卡死；图标分批加载 |
 
 ---
 
@@ -660,11 +685,21 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 
 ---
 
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | 版本变更记录 |
+| [docs/web-window-notes.md](docs/web-window-notes.md) | 网页窗口的实现细节、配置项、踩过的坑 |
+| [docs/dev-testing.md](docs/dev-testing.md) | 测试用的固定目录和规矩 |
+| [docs/README.md](docs/README.md) | 文档索引 |
+
 ## 开发
 
 ```bash
 pnpm install                          # 前端依赖（首次）
 pnpm tauri dev                        # 托盘 + 主界面（开发模式）
+npx vite build && cargo build         # 直接跑 target\debug 里的 exe：前端要先打包，cargo 才嵌得进新 dist
 
 cargo test                            # 几何 / 状态机 / 配置单测
 cargo run -p hexbench-cli             # 打印本机显示器与可触发区

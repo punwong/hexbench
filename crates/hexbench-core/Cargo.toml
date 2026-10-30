@@ -33,6 +33,7 @@ winreg = "0.56"
 # handful of user32/shell32 calls, and `windows-sys` has no wrapper cost.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
     "Win32_System_Com",

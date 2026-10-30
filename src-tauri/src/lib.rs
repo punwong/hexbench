@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1269,6 +1269,41 @@ fn hide_all_windows(app: &AppHandle) {
     }
 }
 
+/// 主线程（或正在等主线程的调用方）当前进行到哪一步窗口操作。
+///
+/// 窗口 API 从别的线程调用时是「排队给主线程 + 阻塞等」的，所以主线程一旦卡在
+/// 某个调用里，光看日志只能知道上一步成了、这一步没成。这个标记由调用方在
+/// 进调用之前置上，看门狗发现主线程不应答时把它打出来，就能定位到具体调用。
+static MAIN_OP: AtomicU32 = AtomicU32::new(0);
+
+fn op(id: u32) {
+    MAIN_OP.store(id, Ordering::Relaxed);
+}
+
+fn op_name(id: u32) -> &'static str {
+    match id {
+        0 => "idle",
+        1 => "place_launcher",
+        2 => "launcher.show",
+        3 => "push_theme",
+        4 => "web.place",
+        5 => "web.show",
+        6 => "launcher.set_focus",
+        7 => "sync_web_side",
+        8 => "site.place+show",
+        9 => "emit launcher-shown",
+        10 => "store_panel_size",
+        11 => "launcher.hide",
+        12 => "store_web_geometry",
+        13 => "web.hide",
+        14 => "close_site_window",
+        15 => "read config",
+        16 => "web.sync_web_side(hide)",
+        17 => "force_foreground",
+        _ => "?",
+    }
+}
+
 /// Note how long the event loop is unavailable, so a "frozen" report can be
 /// traced instead of guessed at.
 fn spawn_stall_watchdog(app: AppHandle) {
@@ -1286,7 +1321,11 @@ fn spawn_stall_watchdog(app: AppHandle) {
         }
         let waited = started.elapsed();
         if waited > Duration::from_millis(400) {
-            log::warn!("ui: main thread busy {} ms", waited.as_millis());
+            log::warn!(
+                "ui: main thread busy {} ms (stuck in {})",
+                waited.as_millis(),
+                op_name(MAIN_OP.load(Ordering::Relaxed))
+            );
         }
     });
 }
@@ -1666,7 +1705,7 @@ fn open_main_now(app: &AppHandle) {
         .build();
 }
 
-/// 呼出面板：一个窗口装「快捷启动 + 文件区」。
+/// 呼出面板：一个窗口装「分类侧栏 + 文件区」。
 ///
 /// 懒创建、之后常驻隐藏：呼出要的是「按一下就出」，重建 WebView2 要几百毫秒，
 /// 手感立刻垮掉。第一次呼出慢一点，之后只是一次 show。
@@ -1762,6 +1801,8 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         // 否则外部拖进来的文件系统根本不会通知我们。
         match window.hwnd() {
             Ok(hwnd) => {
+                // 面板是工具窗口，系统默认不给圆角；显式要一个和设置窗口一样的。
+                hexbench_core::sys::round_window_corners(hwnd.0 as isize);
                 let app = app.clone();
                 let late_app = app.clone();
                 let attached = hexbench_core::drop_target::attach(
@@ -1937,16 +1978,45 @@ fn launcher_appearance(app: &AppHandle) -> (bool, (u32, u32)) {
         ),
     )
 }
+/// 面板**真实**的可见状态（直接问 Win32）。
+///
+/// tao 内部缓存了一份 VISIBLE 标志，`is_visible()` 读的是那份缓存。只要有人在
+/// 它背后改过窗口显示状态，缓存就和真实窗口对不上，之后它的 `show()`/`hide()`
+/// 会因为「标志没变化」直接空转：按热键毫无反应、面板再也呼不出来。
+fn panel_visible(window: &tauri::WebviewWindow) -> Option<bool> {
+    window
+        .hwnd()
+        .ok()
+        .map(|hwnd| hexbench_core::sys::window_visible(hwnd.0 as isize))
+}
+
 fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))) {
+    let started = Instant::now();
+    op(1);
     place_launcher(window, appearance.0, appearance.1);
+    op(0);
     LAUNCHER_SHOWN_AT.store(now_millis(), Ordering::Relaxed);
     // 网页模式下窗口是竖版的：这时候再按配置的 50%×50% 摆一次，
     // 网页仍按竖版矩形挂着，两边尺寸对不上就是「排版错位」。
+    op(2);
     let _ = window.show();
+    op(0);
+    let after_show = started.elapsed();
+    // show() 可能是空转的（tao 的可见性缓存被别的代码弄乱了）。这里核对
+    // 真实窗口状态，没出来就直接显示一次，把真实状态和缓存重新对齐。
+    if panel_visible(window) == Some(false) {
+        log::warn!("launcher: show() 没生效，直接纠正窗口显示状态");
+        if let Ok(hwnd) = window.hwnd() {
+            hexbench_core::sys::show_window(hwnd.0 as isize);
+        }
+    }
     // 每次呼出都同步一次主题：设置里改了颜色，常驻窗口要跟上。
+    op(3);
     push_theme_to_windows(window.app_handle());
+    op(0);
     // 设置里开了内置网页：把预建好的网页窗口摆到右侧并显示
     // （只 show，不在这里创建窗口——运行中建窗口会卡住面板）。
+    let mut web_ms = 0u128;
     {
         let app = window.app_handle();
         let enabled = {
@@ -1957,37 +2027,68 @@ fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))
         };
         if enabled {
             if let Some(web) = web_window_handle() {
+                let before = started.elapsed();
+                op(4);
                 place_web_window(app, &web);
+                op(0);
+                op(5);
                 let _ = web.show();
+                op(0);
                 WEB_PANEL_OPEN.store(true, Ordering::Relaxed);
+                web_ms = started.elapsed().saturating_sub(before).as_millis();
             }
         }
     }
+    op(6);
     let _ = window.set_focus();
+    op(0);
     // 之前开着网页面板的话，跟着一起回来（页面没重新加载）。
     // 之前开着网页区的话，跟着一起恢复（子 WebView 留在窗口里，不重新加载）。
-    if WEB_PANEL_OPEN.load(Ordering::Relaxed) {
+    let mut sync_ms = 0u128;
+    if WEB_PANEL_OPEN.load(Ordering::Relaxed) && web_enabled_at(window.app_handle()) {
+        let before = started.elapsed();
         let handle = window.app_handle().clone();
+        op(7);
         let _ = sync_web_side(&handle, true);
+        op(0);
+        sync_ms = started.elapsed().saturating_sub(before).as_millis();
     }
     // Windows 的前台锁会吞掉单纯的 show+focus，必须走 force_foreground，
     // 否则按完快捷键打不了字。
     // show() 只是排进事件循环，此刻窗口可能还没真正绘制出来；延迟一点再抢
     // 一次前台，比在同一帧里连调两次可靠。
+    // 抢前台得在窗口自己的线程上做：跨线程 SetFocus 是同步的，主线程正走在键盘
+    // 消息里时两边互相等，连续呼出几次就死锁。等待放工作线程，执行排回主线程。
     let handle = window.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(130));
-        if let Ok(hwnd) = handle.hwnd() {
-            hexbench_core::sys::force_foreground(hwnd.0 as isize);
-        }
+        let task = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            op(17);
+            if let Ok(hwnd) = task.hwnd() {
+                hexbench_core::sys::force_foreground(hwnd.0 as isize);
+            }
+            op(0);
+        });
     });
     // 网页窗口跟着面板一起回来：页面还在里面，不会重新加载。
-    if let Some(site) = window.app_handle().get_webview_window(SITE_WEBVIEW) {
-        place_site_window(window, &site);
-        let _ = site.show();
+    // 内置网页被关掉时不能跟着弹：它是个 always_on_top 的窗口，会压在面板上。
+    if web_enabled_at(window.app_handle()) {
+        if let Some(site) = window.app_handle().get_webview_window(SITE_WEBVIEW) {
+            op(8);
+            place_site_window(window, &site);
+            let _ = site.show();
+            op(0);
+        }
     }
+    op(9);
     let _ = window.app_handle().emit("launcher-shown", ());
-    log::info!("launcher: shown");
+    op(0);
+    log::info!(
+        "launcher: shown (show={}ms web={web_ms}ms sync={sync_ms}ms total={}ms)",
+        after_show.as_millis(),
+        started.elapsed().as_millis()
+    );
 }
 
 fn open_launcher(app: &AppHandle) {
@@ -2027,24 +2128,52 @@ fn show_launcher(app: &AppHandle) {
 
 
 
-fn hide_launcher(app: &AppHandle) {
+fn hide_launcher(app: &AppHandle, reason: &str) {
+    let started = Instant::now();
     log::info!(
-        "launcher: hide (site_open={})",
+        "launcher: hide ({reason}, site_open={})",
         app.get_webview_window(SITE_WEBVIEW).is_some()
     );
     if let Some(window) = app.get_webview_window("launcher") {
-        store_panel_size(&window);
+        // 已经藏起来了就不要再存一次尺寸、再写一遍配置：连续呼出呼入时
+        // 这里会被失焦事件连续触发，重复写盘只是白白抖硬盘。
+        let was_visible = panel_visible(&window).unwrap_or(false);
+        if was_visible {
+            op(10);
+            store_panel_size(&window);
+            op(0);
+        }
+        let after_store = started.elapsed().as_millis();
+        op(11);
         let _ = window.hide();
+        op(0);
+        let after_hide = started.elapsed().as_millis();
+        if panel_visible(&window) == Some(true) {
+            log::warn!("launcher: hide() 没生效，直接纠正窗口显示状态");
+            if let Ok(hwnd) = window.hwnd() {
+                hexbench_core::sys::hide_window(hwnd.0 as isize);
+            }
+        }
     // 网页窗口是独立窗口：面板收起时一起隐藏
     if let Some(web) = web_window_handle() {
         // 收起前存一次：节流可能把最后一次拖动丢掉，这里以窗口实际状态为准
+        op(12);
         store_current_web_geometry(&web);
+        op(0);
+        let after_web_store = started.elapsed().as_millis();
+        op(13);
         let _ = web.hide();
+        op(0);
+        log::info!(
+            "launcher: hide steps store={after_store}ms panel={after_hide}ms webstore={after_web_store}ms webhide={}ms",
+            started.elapsed().as_millis()
+        );
     }
     }
     // 网页面板跟着面板一起收起：页面继续跑，但不再挡在前台。
     // 用句柄隐藏：这个窗口会从注册表消失，查不到。
     // 网页是面板窗口里的子 WebView，跟着窗口一起隐藏，不用单独处理。
+    op(15);
     let keep = app
         .state::<AppState>()
         .shared
@@ -2053,8 +2182,11 @@ fn hide_launcher(app: &AppHandle) {
         .config
         .launcher
         .site_keep_alive_secs;
+    op(0);
     if keep == 0 {
+        op(14);
         close_site_window(app);
+        op(0);
         return;
     }
     let handle = app.clone();
@@ -2062,13 +2194,15 @@ fn hide_launcher(app: &AppHandle) {
         thread::sleep(Duration::from_secs(keep as u64));
         let visible = handle
             .get_webview_window("launcher")
-            .and_then(|window| window.is_visible().ok())
+            .map(|window| panel_visible(&window).unwrap_or(false))
             .unwrap_or(false);
         if visible {
             return;
         }
         log::info!("launcher: page idle for too long, closing the site window");
+        op(14);
         close_site_window(&handle);
+        op(0);
     });
 }
 
@@ -2112,6 +2246,11 @@ fn reflow_web_page(app: &AppHandle) {
 
 fn sync_web_side(app: &AppHandle, open: bool) -> Result<(), String> {
     log::info!("web: sync_web_side open={open}");
+    // 设置里关掉内置网页之后，任何路径都不该再建出网页窗口/子 WebView。
+    if !web_enabled_at(app) {
+        WEB_PANEL_OPEN.store(false, Ordering::Relaxed);
+        return Ok(());
+    }
     if open {
         ensure_web_window(app)?;
     }
@@ -2120,7 +2259,9 @@ fn sync_web_side(app: &AppHandle, open: bool) -> Result<(), String> {
             place_web_window(app, &web);
             let _ = web.show();
         } else {
+            op(16);
             let _ = web.hide();
+            op(0);
         }
     }
     WEB_PANEL_OPEN.store(open, Ordering::Relaxed);
@@ -2398,6 +2539,19 @@ fn web_window_handle() -> Option<tauri::WebviewWindow> {
     WEB_WINDOW.lock().ok().and_then(|held| held.clone())
 }
 
+/// 设置里的「内置网页」是不是开着（默认开）。
+fn web_enabled_at(app: &AppHandle) -> bool {
+    app.try_state::<AppState>()
+        .and_then(|state| {
+            state
+                .shared
+                .lock()
+                .ok()
+                .map(|shared| shared.config.launcher.web_enabled)
+        })
+        .unwrap_or(false)
+}
+
 /// 网页面板当前是不是「打开着」（用户点了 ✕ 才算关）。
 /// 面板收起时网页跟着藏，但状态保留——下次呼出面板它一起回来。
 static WEB_PANEL_OPEN: AtomicBool = AtomicBool::new(false);
@@ -2502,6 +2656,9 @@ fn launcher_set_web_mode(on: bool) -> Result<WebRect, String> {
 }
 #[tauri::command]
 async fn launcher_open_site(app: AppHandle, url: String) -> Result<(), String> {
+    if !web_enabled_at(&app) {
+        return Err("内置网页已在设置里关闭".to_string());
+    }
     let normalized = hexbench_core::net::normalize_url(&url);
     let parsed: tauri::Url = normalized
         .parse()
@@ -2544,6 +2701,9 @@ fn web_side_state() -> bool {
 
 #[tauri::command]
 async fn web_page_open(app: AppHandle, url: String) -> Result<(), String> {
+    if !web_enabled_at(&app) {
+        return Err("内置网页已在设置里关闭".to_string());
+    }
     let normalized = hexbench_core::net::normalize_url(&url);
     let parsed: tauri::Url = normalized
         .parse()
@@ -2681,8 +2841,9 @@ fn toggle_launcher(app: &AppHandle) {
     if !enabled {
         return;
     }
+    // 用真实可见状态判断，不用 tao 那份可能过期的缓存。
     match app.get_webview_window("launcher") {
-        Some(window) if window.is_visible().unwrap_or(false) => hide_launcher(app),
+        Some(window) if panel_visible(&window).unwrap_or(false) => hide_launcher(app, "toggle"),
         _ => show_launcher(app),
     }
 }
@@ -2700,21 +2861,62 @@ struct LauncherItem {
 }
 
 fn list_folder(path: &std::path::Path, with_icons: bool) -> Vec<LauncherItem> {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
+    /// 一次性接口的上限。面板本身走流式接口、不设上限；这个只用于预读和
+    /// 其他调用方，留个很大的值防止一次吐出几十万条把 IPC 撑爆。
+    const LIST_LIMIT: usize = 20_000;
 
-    let mut items: Vec<LauncherItem> = Vec::new();
+    let mut items = Vec::new();
+    for_each_item(path, with_icons, |item| {
+        items.push(item);
+        items.len() < LIST_LIMIT
+    });
+    if items.len() >= LIST_LIMIT {
+        log::warn!(
+            "launcher: {} 里的条目超过 {LIST_LIMIT}，一次性接口只给前 {LIST_LIMIT} 项",
+            path.display()
+        );
+    }
+    sort_items(&mut items);
+    items
+}
+
+fn sort_items(items: &mut [LauncherItem]) {
+    // 文件夹永远在前，其余按名字（和资源管理器的默认排序一致）。
+    items.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+/// 逐条遍历一个目录。`emit` 返回 false 表示不再继续。
+fn for_each_item(
+    path: &std::path::Path,
+    with_icons: bool,
+    mut emit: impl FnMut(LauncherItem) -> bool,
+) -> usize {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut count = 0usize;
     for entry in entries.flatten() {
-        if items.len() >= 300 {
-            break;
-        }
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
-        let path = entry.path();
+        let item_path = entry.path();
         let metadata = entry.metadata().ok();
+        // 和资源管理器的默认视图一致：隐藏文件和系统文件不列出来。
+        if metadata.as_ref().is_some_and(|meta| {
+            meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+        }) {
+            continue;
+        }
         let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
         let modified = metadata
@@ -2724,25 +2926,31 @@ fn list_folder(path: &std::path::Path, with_icons: bool) -> Vec<LauncherItem> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let icon = if with_icons {
-            hexbench_core::icons::file_icon_base64(&path, is_dir)
+            hexbench_core::icons::file_icon_base64(&item_path, is_dir)
         } else {
             None
         };
-        items.push(LauncherItem {
+        count += 1;
+        if !emit(LauncherItem {
             name,
-            path: path.to_string_lossy().to_string(),
+            path: item_path.to_string_lossy().to_string(),
             is_dir,
             size,
             modified,
             icon,
-        });
+        }) {
+            break;
+        }
     }
-    items.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    items
+    count
+}
+
+/// 流式列目录的一页。面板先拿到第一批就能画，剩下的边读边补。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherPage {
+    items: Vec<LauncherItem>,
+    done: bool,
 }
 
 /// 启动器：根目录下的每个子文件夹就是一个分类。
@@ -2779,6 +2987,8 @@ struct LauncherRoot {
     last_base: String,
     last_label: String,
     last_path: String,
+    /// 上次停在「快速访问」那一行（而不是启动分类）。
+    last_pinned: bool,
 }
 /// 扫一个目录，把子文件夹当成分类；排序按配置里的顺序，其余按名字。
 fn scan_categories(root: &str, order: &[String], hidden: &[String]) -> Vec<LauncherCategory> {
@@ -2864,6 +3074,7 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             last_base: String::new(),
             last_label: String::new(),
             last_path: String::new(),
+            last_pinned: false,
         })
 }
 
@@ -2898,6 +3109,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         last_base: location.base.clone(),
         last_label: location.label.clone(),
         last_path: location.path.clone(),
+        last_pinned: location.pinned,
     };
     if root.trim().is_empty() {
         return empty(root);
@@ -2921,6 +3133,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         last_base: location.base,
         last_label: location.label,
         last_path: location.path,
+        last_pinned: location.pinned,
     }
 }
 
@@ -2931,8 +3144,10 @@ fn launcher_save_location(
     base: String,
     label: String,
     path: String,
+    pinned: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let pinned = pinned.unwrap_or(false);
     let mut shared = state.shared.lock().unwrap();
     let launcher = &mut shared.config.launcher;
     if !launcher.remember_location {
@@ -2941,6 +3156,7 @@ fn launcher_save_location(
     if launcher.last_location.kind == kind
         && launcher.last_location.base == base
         && launcher.last_location.path == path
+        && launcher.last_location.pinned == pinned
     {
         return Ok(());
     }
@@ -2949,6 +3165,7 @@ fn launcher_save_location(
         base,
         label,
         path,
+        pinned,
     };
     let config = shared.config.clone();
     drop(shared);
@@ -3060,19 +3277,75 @@ async fn launcher_items(path: String, with_icons: Option<bool>) -> Vec<LauncherI
     .unwrap_or_default()
 }
 
-/// 批量补图标：面板先出名字，图标随后分批填进来。
+/// 流式列目录：一页一页推给面板，大目录也能立刻出前几屏。
+///
+/// 这里不排序——面板按自己的排序规则排，而且排序需要拿到全部条目，
+/// 那就又退化成一次性加载了。
+#[tauri::command]
+async fn launcher_items_stream(
+    path: String,
+    on_page: tauri::ipc::Channel<LauncherPage>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        const PAGE: usize = 400;
+        let mut batch: Vec<LauncherItem> = Vec::with_capacity(PAGE);
+        let mut send_error: Option<String> = None;
+        for_each_item(std::path::Path::new(&path), false, |item| {
+            batch.push(item);
+            if batch.len() < PAGE {
+                return true;
+            }
+            let page = LauncherPage {
+                items: std::mem::take(&mut batch),
+                done: false,
+            };
+            if let Err(error) = on_page.send(page) {
+                send_error = Some(error.to_string());
+                return false;
+            }
+            true
+        });
+        if send_error.is_none() {
+            let _ = on_page.send(LauncherPage {
+                items: batch,
+                done: true,
+            });
+        }
+        send_error.map_or(Ok(()), Err)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 批量补图标：返回 `(路径, 缓存键)`，前端用 `hbicon://<键>` 直接取图。
+///
+/// 每个线程用自己的 COM 公寓和图标列表，所以这里可以真并行；面板只请求
+/// 屏幕上看得见的那几十项，一批分给 3 个线程足够。
 #[tauri::command]
 async fn launcher_icons(paths: Vec<String>) -> Vec<(String, Option<String>)> {
     tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|raw| {
-                let path = std::path::PathBuf::from(&raw);
-                let is_dir = path.is_dir();
-                let icon = hexbench_core::icons::file_icon_base64(&path, is_dir);
-                (raw, icon)
-            })
-            .collect::<Vec<_>>()
+        let workers = paths.len().clamp(1, 3);
+        let chunk = paths.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for slice in paths.chunks(chunk.max(1)) {
+                handles.push(scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|raw| {
+                            let path = std::path::PathBuf::from(raw);
+                            let is_dir = path.is_dir();
+                            let key = hexbench_core::icons::icon_key(&path, is_dir);
+                            (raw.clone(), key)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap_or_default())
+                .collect::<Vec<_>>()
+        })
     })
     .await
     .unwrap_or_default()
@@ -3258,6 +3531,106 @@ fn launcher_paste(dest: String) -> Result<usize, String> {
     log::info!("clipboard: paste into {dest}");
     hexbench_core::shell_ops::paste_into(&PathBuf::from(dest))
 }
+/// 面板菜单里调起的 Shell 命令（压缩、复制、发送到…）跑完之前，别因为前台被
+/// 它的进度窗口拿走就收起面板。
+///
+/// 值为「至少要守到什么时候」（毫秒时间戳）。这些命令都是异步的：
+/// `InvokeCommand` 立刻返回，进度窗口过一会儿才出现；目标目录还在变就说明活儿
+/// 没干完，截止时间顺延。
+static SHELL_OP_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// 已经有线程在等这次命令结束、准备收面板了，别重复起。
+static SHELL_OP_WATCHING: AtomicBool = AtomicBool::new(false);
+
+const SHELL_OP_GRACE_MS: u64 = 2500;
+
+fn shell_op_active() -> bool {
+    now_millis() < SHELL_OP_UNTIL.load(Ordering::Relaxed)
+}
+
+/// 目录的「动静」：条目数、最新修改时间、总大小。压缩 / 复制这类操作会持续改它。
+///
+/// 只看前 4000 项：这是给「命令还在不在跑」用的粗略信号，不是清单，
+/// 大目录每 250ms 全量 stat 一遍不值得。
+fn dir_activity(path: &std::path::Path) -> (usize, u128, u64) {
+    let mut count = 0usize;
+    let mut newest = 0u128;
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if count >= 4000 {
+                break;
+            }
+            count += 1;
+            if let Ok(meta) = entry.metadata() {
+                total = total.saturating_add(meta.len());
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(delta) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        newest = newest.max(delta.as_millis());
+                    }
+                }
+            }
+        }
+    }
+    (count, newest, total)
+}
+
+/// 记下「刚从面板菜单发了一条 Shell 命令」，并盯住目录给它续期。
+fn watch_shell_op(dir: PathBuf) {
+    SHELL_OP_UNTIL.store(now_millis() + SHELL_OP_GRACE_MS, Ordering::Relaxed);
+    thread::spawn(move || {
+        let mut last = dir_activity(&dir);
+        let mut idle = 0;
+        // 最多盯 5 分钟：真有超长的活儿，用户自己点回来也不会被收。
+        for _ in 0..1200 {
+            thread::sleep(Duration::from_millis(250));
+            let now = dir_activity(&dir);
+            if now != last {
+                last = now;
+                idle = 0;
+                SHELL_OP_UNTIL.store(now_millis() + SHELL_OP_GRACE_MS, Ordering::Relaxed);
+            } else {
+                idle += 1;
+                if idle >= 10 {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Shell 命令期间没收面板：命令结束、前台也不再是它了，再补一次「该收了」。
+fn hide_after_shell_op(app: AppHandle) {
+    if SHELL_OP_WATCHING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    thread::spawn(move || {
+        while shell_op_active() {
+            thread::sleep(Duration::from_millis(250));
+            let visible = app
+                .get_webview_window("launcher")
+                .map(|window| panel_visible(&window).unwrap_or(false))
+                .unwrap_or(false);
+            if !visible {
+                SHELL_OP_WATCHING.store(false, Ordering::Relaxed);
+                return;
+            }
+        }
+        SHELL_OP_WATCHING.store(false, Ordering::Relaxed);
+        // 命令刚结束那一会儿前台可能还在切换，稍等一下再看。
+        thread::sleep(Duration::from_millis(400));
+        if shell_op_active() || hexbench_core::sys::foreground_is_current_process() {
+            return;
+        }
+        if let Some(window) = app.get_webview_window("launcher") {
+            if panel_visible(&window) == Some(true) {
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    hide_launcher(&handle, "focus-lost (shell done)");
+                });
+            }
+        }
+    });
+}
 /// 文件夹空白处的原生右键菜单（新建 / 粘贴 / 属性 / 刷新）。
 #[tauri::command]
 fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> {
@@ -3338,7 +3711,12 @@ fn launcher_context_menu(path: String, app: AppHandle) -> Result<Option<String>,
         .unwrap_or(0);
     log::info!("launcher: context menu for {path} at {x},{y}");
     LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
-    let result = hexbench_core::sys::show_shell_context_menu(&target, x, y, owner);
+    let result = hexbench_core::sys::show_shell_context_menu(&target, x, y, owner, || {
+        // 先把「命令可能还在跑」的标记戴上：InvokeCommand 本身就可能等进度
+        // 窗口，这段时间主线程已经会收到失焦了。菜单里选的可能不是系统命令
+        // （改名），那也最多多守几秒。
+        SHELL_OP_UNTIL.store(now_millis() + SHELL_OP_GRACE_MS, Ordering::Relaxed);
+    });
     LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
     match result {
         Ok(choice) => {
@@ -3346,7 +3724,20 @@ fn launcher_context_menu(path: String, app: AppHandle) -> Result<Option<String>,
             // 否则输入框看得见却收不到按键。
 
             let _ = app.emit("launcher-changed", ());
-            Ok(choice.map(|value| value.to_string()))
+            match choice {
+                Some("shell") => {
+                    // 系统命令（压缩 / 复制 / 发送到…）大多还在后台跑，会弹自己的
+                    // 进度窗口：这段时间别把面板收起，否则用户刚点的东西看不到了。
+                    if let Some(dir) = target.parent() {
+                        watch_shell_op(dir.to_path_buf());
+                    }
+                    // 菜单开着时收到的失焦会被忽略，那一刻面板就已经不在前台了；
+                    // 之后不一定再有失焦事件，所以这里直接把「活儿干完再收」排上。
+                    hide_after_shell_op(app.clone());
+                    Ok(None)
+                }
+                other => Ok(other.map(|value| value.to_string())),
+            }
         }
         Err(error) => {
             log::warn!("launcher: context menu failed: {error}");
@@ -3583,7 +3974,7 @@ fn spawn_launcher_watcher(app: AppHandle) {
 /// 面板里按 Esc：前端喊一声，这里收起来。
 #[tauri::command]
 fn dismiss_launcher(app: AppHandle) {
-    hide_launcher(&app);
+    hide_launcher(&app, "dismiss");
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
@@ -3762,6 +4153,217 @@ fn region_dto(region: &Region) -> RegionDto {
     }
 }
 
+/// 文件区自检（仅 debug）：把面板真正调用的那组命令跑一遍，结果按行写进
+/// `hexbench-selftest-out.txt`。用 `%TEMP%` 下的沙箱，不碰配置里的目录。
+#[cfg(debug_assertions)]
+fn selftest_launcher_files(app: &AppHandle) -> String {
+    let mut out = String::new();
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    macro_rules! check {
+        ($name:expr, $ok:expr, $($detail:tt)*) => {{
+            let ok = $ok;
+            if ok { pass += 1; } else { fail += 1; }
+            out += &format!(
+                "files: {} {} — {}\n",
+                if ok { "PASS" } else { "FAIL" },
+                $name,
+                format!($($detail)*)
+            );
+        }};
+    }
+
+    let raw = std::env::temp_dir().join("hexbench-fileset");
+    let _ = std::fs::remove_dir_all(&raw);
+    if let Err(error) = std::fs::create_dir_all(&raw) {
+        return format!("files: FAIL setup — {error}\n");
+    }
+    // `%TEMP%` 可能是 8.3 短路径，回收站里记的是长路径，统一成长路径。
+    let base = std::fs::canonicalize(&raw).unwrap_or(raw);
+    let base = match base.to_string_lossy().strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => base,
+    };
+    let sub = base.join("子目录");
+    let cut_dest = base.join("剪切目标");
+    let _ = std::fs::create_dir_all(&sub);
+    let a = base.join("a.txt");
+    let b = base.join("b.txt");
+    let _ = std::fs::write(&a, "aaa");
+    let _ = std::fs::write(&b, "bbb");
+    let sub_b = sub.join("b.txt");
+    let text = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+    let base_s = base.to_string_lossy().to_string();
+    let sub_s = sub.to_string_lossy().to_string();
+    let cut_s = cut_dest.to_string_lossy().to_string();
+
+    let items = tauri::async_runtime::block_on(launcher_items(base_s.clone(), Some(false)));
+    let names: Vec<String> = items.iter().map(|item| item.name.clone()).collect();
+    check!(
+        "listing",
+        items.len() == 3 && items.first().is_some_and(|item| item.is_dir),
+        "{names:?}（文件夹应排在前面）"
+    );
+
+    let made = launcher_new_folder(base_s.clone());
+    check!(
+        "new-folder",
+        made.as_ref()
+            .is_ok_and(|path| std::path::Path::new(path).is_dir()),
+        "{made:?}"
+    );
+    let _ = launcher_undo(app.clone());
+    check!(
+        "undo-new-folder",
+        made.as_ref()
+            .is_ok_and(|path| !std::path::Path::new(path).exists()),
+        "撤销后刚建的文件夹应消失"
+    );
+
+    let renamed = launcher_rename(a.to_string_lossy().to_string(), "改名.txt".into(), app.clone());
+    let renamed_ok = renamed
+        .as_ref()
+        .map(|path| text(std::path::Path::new(path)) == "aaa")
+        .unwrap_or(false);
+    check!("rename", renamed_ok, "{renamed:?}");
+    let _ = launcher_undo(app.clone());
+    check!("undo-rename", a.exists() && !base.join("改名.txt").exists(), "应改回 a.txt");
+
+    let moved = launcher_move_into(sub_s.clone(), vec![b.to_string_lossy().to_string()], app.clone());
+    check!(
+        "move",
+        moved.as_ref().is_ok_and(|count| *count == 1) && sub_b.exists() && !b.exists(),
+        "{moved:?}"
+    );
+    let _ = launcher_undo(app.clone());
+    check!("undo-move", b.exists() && !sub_b.exists(), "应搬回原处");
+
+    let _ = launcher_clipboard_copy(vec![b.to_string_lossy().to_string()], false);
+    let pasted = launcher_paste(sub_s.clone());
+    check!(
+        "copy-paste",
+        pasted.as_ref().is_ok_and(|count| *count == 1) && b.exists() && sub_b.exists(),
+        "{pasted:?}"
+    );
+
+    let _ = std::fs::create_dir_all(&cut_dest);
+    let cut_write = launcher_clipboard_copy(vec![b.to_string_lossy().to_string()], true);
+    let readback = hexbench_core::shell_ops::clipboard_get_files();
+    out += &format!(
+        "files: INFO cut-write — {cut_write:?} readback={:?}\n",
+        readback
+            .as_ref()
+            .map(|(paths, cut)| (paths.len(), *cut))
+    );
+    let cut = launcher_paste(cut_s.clone());
+    check!(
+        "cut-paste",
+        cut.as_ref().is_ok_and(|count| *count == 1)
+            && !b.exists()
+            && cut_dest.join("b.txt").exists(),
+        "{cut:?}"
+    );
+    check!(
+        "clipboard-cleared",
+        hexbench_core::shell_ops::clipboard_get_files().is_none(),
+        "剪切粘贴后剪贴板应清空"
+    );
+
+    let icon_path = cut_dest.join("b.txt").to_string_lossy().to_string();
+    let mut icon_ok = false;
+    for _ in 0..5 {
+        let icons = tauri::async_runtime::block_on(launcher_icons(vec![icon_path.clone()]));
+        // 现在回的是缓存键：文件真落盘了才算拿到，面板才能用 hbicon:// 取到。
+        if icons
+            .first()
+            .and_then(|(_, key)| key.as_ref())
+            .is_some_and(|key| {
+                hexbench_core::icons::cache_file(key)
+                    .is_some_and(|file| file.metadata().map(|meta| meta.len() > 0).unwrap_or(false))
+            })
+        {
+            icon_ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    check!("icon", icon_ok, "文本文件应能从 Shell 拿到图标并写进缓存");
+
+    // 资源管理器会隐藏隐藏/系统属性的项，面板跟它一致。
+    let hidden_dir = base.join("隐藏检查");
+    let _ = std::fs::create_dir_all(&hidden_dir);
+    let _ = std::fs::write(hidden_dir.join("看得见.txt"), "x");
+    let hidden_file = hidden_dir.join("藏起来.txt");
+    let _ = std::fs::write(&hidden_file, "x");
+    let _ = std::process::Command::new("attrib")
+        .arg("+h")
+        .arg(&hidden_file)
+        .status();
+    let hidden_items = tauri::async_runtime::block_on(launcher_items(
+        hidden_dir.to_string_lossy().to_string(),
+        Some(false),
+    ));
+    let hidden_names: Vec<String> = hidden_items.iter().map(|item| item.name.clone()).collect();
+    check!(
+        "hidden-filtered",
+        hidden_items.len() == 1 && hidden_names[0] == "看得见.txt",
+        "{hidden_names:?}（隐藏文件不应出现）"
+    );
+    let _ = std::process::Command::new("attrib")
+        .arg("-h")
+        .arg(&hidden_file)
+        .status();
+
+    // 撞名时自动编号（和资源管理器一样变成「xxx - 副本.txt」），不能覆盖。
+    let clash_dest = base.join("撞名目标");
+    let _ = std::fs::create_dir_all(&clash_dest);
+    let _ = std::fs::write(clash_dest.join("同名.txt"), "原有的");
+    let clash_src = base.join("同名.txt");
+    let _ = std::fs::write(&clash_src, "新来的");
+    let clash = launcher_move_into(
+        clash_dest.to_string_lossy().to_string(),
+        vec![clash_src.to_string_lossy().to_string()],
+        app.clone(),
+    );
+    let clash_names: Vec<String> = std::fs::read_dir(&clash_dest)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    check!(
+        "collision-rename",
+        clash.as_ref().is_ok_and(|count| *count == 1)
+            && clash_names.len() == 2
+            && std::fs::read_to_string(clash_dest.join("同名.txt")).unwrap_or_default() == "原有的",
+        "{clash_names:?}"
+    );
+
+    // 大目录不再截断（面板那边是虚拟滚动 + 流式分页）。
+    let many = base.join("很多");
+    let _ = std::fs::create_dir_all(&many);
+    for index in 0..1050 {
+        let _ = std::fs::write(many.join(format!("f-{index:04}.txt")), "x");
+    }
+    let started = std::time::Instant::now();
+    let many_items = tauri::async_runtime::block_on(launcher_items(
+        many.to_string_lossy().to_string(),
+        Some(false),
+    ));
+    check!(
+        "listing-no-truncation",
+        many_items.len() == 1050,
+        "1050 项应全部返回，实际 {} 项，耗时 {:?}",
+        many_items.len(),
+        started.elapsed()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    out += &format!("files: SUMMARY pass={pass} fail={fail}\n");
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// 调试自测通道（仅 debug 构建）：文件触发、结果写文件，不依赖屏幕坐标。
 #[cfg(debug_assertions)]
@@ -3801,8 +4403,105 @@ fn spawn_selftest(app: AppHandle) {
         let _ = sync_web_side(&app, false);
         thread::sleep(Duration::from_millis(500));
         out += &format!("after close web_open={}\n", WEB_PANEL_OPEN.load(Ordering::Relaxed));
+        out += &selftest_launcher_files(&app);
         let _ = std::fs::write(std::env::temp_dir().join("hexbench-selftest-out.txt"), out);
     });
+}
+
+/// 面板的界面自动化：把一段 JS 放进 `%TEMP%\hexbench-ui.js`，应用会在面板里
+/// 执行它（只在 debug 构建里有），脚本用 `selftest_report` 把结果写回来。
+///
+/// 为什么不用系统级模拟点击：面板是 always_on_top 的小窗口，别的程序浮在上面
+/// 时 `mouse_event` 打不到它；而 eval 直接在页面里派发 DOM 事件，测的就是前台
+/// 真实的那些 handler。
+fn spawn_ui_eval(app: AppHandle) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    thread::spawn(move || {
+        let script_path = std::env::temp_dir().join("hexbench-ui.js");
+        let probe_path = std::env::temp_dir().join("hexbench-probe.txt");
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            // 主线程卡死时 webview 也调不动，用文件触发 Rust 侧探针。
+            if probe_path.exists() {
+                let _ = std::fs::remove_file(&probe_path);
+                probe_state(&app);
+            }
+            if !script_path.exists() {
+                continue;
+            }
+            let Ok(script) = std::fs::read_to_string(&script_path) else {
+                continue;
+            };
+            let _ = std::fs::remove_file(&script_path);
+            let Some(window) = app.get_webview_window("launcher") else {
+                log::warn!("ui-eval: launcher missing");
+                continue;
+            };
+            let _ = window.show();
+            let _ = window.eval(&script);
+            log::info!("ui-eval: script injected ({} bytes)", script.len());
+        }
+    });
+}
+
+/// 卡死诊断用：主线程回不回应、shared 锁有没有被占着。
+///
+/// 必须是 async 命令（跑在异步线程池上）——同步命令本身就在主线程上执行，
+/// 主线程卡住时它连进来都进不来。
+#[tauri::command]
+async fn debug_probe(app: AppHandle) -> String {
+    if !cfg!(debug_assertions) {
+        return String::new();
+    }
+    probe_state(&app)
+}
+
+/// 主线程 / 锁状态探针：结果写进 `%TEMP%\hexbench-debug.txt`。
+///
+/// 不依赖 webview：主线程卡住时 IPC 也回不来，只能从普通线程里问。
+fn probe_state(app: &AppHandle) -> String {
+    let lock_free = {
+        let state = app.state::<AppState>();
+        state.shared.try_lock().is_ok()
+    };
+    let path = std::env::temp_dir().join("hexbench-debug.txt");
+    let _ = std::fs::write(&path, format!("lock_free={lock_free}\n"));
+    // run_on_main_thread 自己就可能卡住（主线程不接消息时它会一直等），
+    // 所以放到单独的线程里，结果再写进文件。
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sent = handle
+            .run_on_main_thread(move || {
+                let _ = tx.send(());
+            })
+            .is_ok();
+        let main_ok = if sent {
+            rx.recv_timeout(Duration::from_millis(1500)).is_ok()
+        } else {
+            false
+        };
+        let _ = std::fs::write(&path, format!("lock_free={lock_free}\nmain_responsive={main_ok}\n"));
+    });
+    format!("lock_free={lock_free}")
+}
+
+/// 界面自动化脚本的回报通道。只在 debug 构建里写文件。
+#[tauri::command]
+fn selftest_report(text: String) -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Err("disabled".to_string());
+    }
+    use std::io::Write;
+    let path = std::env::temp_dir().join("hexbench-ui-out.txt");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{text}").map_err(|error| error.to_string())
 }
 
 pub fn run() {
@@ -3912,6 +4611,24 @@ pub fn run() {
             panel_open: AtomicBool::new(false),
             panel_desktop_id: Mutex::new(None),
         })
+        // 图标直接从磁盘给 WebView：`http://hbicon.localhost/<缓存键>`。
+        // 走协议比把 base64 塞进 IPC 省得多——解码和缓存都交给引擎。
+        .register_uri_scheme_protocol("hbicon", |_app, request| {
+            let key = request.uri().path().trim_start_matches('/');
+            let body = hexbench_core::icons::cache_file(key)
+                .and_then(|file| std::fs::read(file).ok())
+                .unwrap_or_default();
+            let status = if body.is_empty() { 404 } else { 200 };
+            tauri::http::Response::builder()
+                .status(status)
+                .header("Content-Type", "image/png")
+                // 键里带了修改时间，内容不会再变。
+                .header("Cache-Control", "public, max-age=31536000, immutable")
+                // <img> 不需要 CORS，但 fetch 要：自动化测试/调试时能直接读回图标。
+                .header("Access-Control-Allow-Origin", "*")
+                .body(body)
+                .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+        })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             diagnostics,
@@ -3941,6 +4658,7 @@ pub fn run() {
             launcher_categories,
             launcher_categories_at,
             launcher_items,
+            launcher_items_stream,
             launcher_pick_folder,
             launcher_open,
             launcher_begin_drag,
@@ -3976,6 +4694,8 @@ pub fn run() {
     web_page_nav,
     launcher_web_sites,
     launcher_site_bounds,
+    selftest_report,
+    debug_probe,
             launcher_save_location,
             launcher_icons,
             launcher_save_view,
@@ -4046,6 +4766,7 @@ pub fn run() {
                     spawn_launcher_watcher(handle.clone());
             #[cfg(debug_assertions)]
             spawn_selftest(handle.clone());
+            spawn_ui_eval(handle.clone());
 
             // A tray app can run for days: checking only at launch would mean
             // "restart to find out you have an update". latest.json is a few
@@ -4073,12 +4794,24 @@ pub fn run() {
             {
         // 网页窗口也在启动时预建（隐藏）：创建窗口必须在启动阶段的主线程，
         // 运行中创建会得到「有外壳、没注册」的窗口（自测已验证）。
-        if let Err(error) = ensure_web_window(app.handle()) {
-            log::warn!("web: pre-build failed: {error}");
-        }
-        // visible(false) 在透明/无边框窗口上不一定生效，补一次隐藏
-        if let Some(web) = web_window_handle() {
-            let _ = web.hide();
+        // 设置里关掉内置网页就一个 WebView 都不建（这正是那个开关的承诺，
+        // 之前没照做：web.html 照样加载，还自动打开了第一个站点）。
+        let web_enabled = app
+            .state::<AppState>()
+            .shared
+            .lock()
+            .map(|shared| shared.config.launcher.web_enabled)
+            .unwrap_or(false);
+        if web_enabled {
+            if let Err(error) = ensure_web_window(app.handle()) {
+                log::warn!("web: pre-build failed: {error}");
+            }
+            // visible(false) 在透明/无边框窗口上不一定生效，补一次隐藏
+            if let Some(web) = web_window_handle() {
+                let _ = web.hide();
+            }
+        } else {
+            log::info!("web: disabled in settings, no webview built");
         }
         if let Some(window) = build_launcher(app.handle()) {
                     let _ = window.hide();
@@ -4103,7 +4836,7 @@ pub fn run() {
                 // 所以只要面板开着、光标又在面板里，就先交给面板处理。
                 let app = window.app_handle();
                 if let Some(launcher) = app.get_webview_window("launcher") {
-                    if launcher.is_visible().unwrap_or(false) {
+                    if panel_visible(&launcher).unwrap_or(false) {
                         let frame = launcher.outer_position().ok().zip(launcher.inner_size().ok());
                         if let Some((position, size)) = frame {
                             let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
@@ -4196,9 +4929,23 @@ pub fn run() {
                     let menu_open = LAUNCHER_MENU_OPEN.load(Ordering::Relaxed);
                     // 内嵌网页是同一进程的子窗口，抢焦点时不能当成「点到别处」。
                     let left = !hexbench_core::sys::foreground_is_current_process();
-                    if left && !menu_open && now_millis().saturating_sub(since) > 500 {
+                    let age = now_millis().saturating_sub(since);
+                    if left && !menu_open && age > 500 && shell_op_active() {
+                        // 刚从菜单里发了一条系统命令（多半是压缩 / 复制），它自己的
+                        // 进度窗口把前台拿走了：这不是「点走了」，面板留着。
+                        log::info!(
+                            "launcher: keep panel open (shell command running, label={})",
+                            window.label()
+                        );
+                        hide_after_shell_op(window.app_handle().clone());
+                    } else if left && !menu_open && age > 500 {
                         // 走统一的收起逻辑：面板和网页面板一起收。
-                        hide_launcher(window.app_handle());
+                        hide_launcher(window.app_handle(), "focus-lost");
+                    } else {
+                        log::info!(
+                            "launcher: focus lost ignored (label={}, left={left}, menu={menu_open}, age={age}ms)",
+                            window.label()
+                        );
                     }
                 }
                 return;

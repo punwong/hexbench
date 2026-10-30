@@ -999,16 +999,34 @@ pub fn window_apps() -> Vec<AppEntry> {
 /// Windows 有前台锁：进程不在前台时 `SetForegroundWindow` 往往只是闪一下任务栏。
 /// 标准绕法是临时把自己挂到当前前台线程的输入队列上（`AttachThreadInput`），
 /// 拿到输入所有权后再设置前台，最后解挂。启动器按快捷键必须立刻能打字，靠的就是它。
+/// 注意：这里**不碰**显示状态。tao 自己缓存了一份窗口的 VISIBLE 标志，
+/// 在外面直接 `ShowWindow` 会让缓存和真实状态对不上，之后 tao 的
+/// `show()`/`hide()` 会因为「标志没变」直接空转 —— 用户看到的就是面板
+/// 呼不出来（连续呼出呼入几次就必然复现）。显隐只走 `show_window`/`hide_window`。
+/// 把窗口抢到前台并给它键盘焦点。
+///
+/// **必须在窗口自己所属的线程上调用**（对 Tauri 窗口就是主线程）。从别的线程调
+/// `SetFocus` 等于跨线程发 WM_KILLFOCUS / WM_SETFOCUS，是同步的：调用方会一直等
+/// 主线程处理完。连续呼出呼入时主线程正走在键盘消息里（tao 在里面持有
+/// `KEY_EVENT_BUILDERS` 锁），两边一交叉就死锁——用户看到的是面板卡死、
+/// 快捷键也没反应。调用方用 `run_on_main_thread` 把它排进主线程队列。
 pub fn force_foreground(hwnd: isize) {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
     if hwnd == 0 {
         return;
     }
     // SAFETY: 全是标准窗口/线程 API，句柄由调用方保证有效。
     unsafe {
         let target = hwnd as HWND;
+        if SetForegroundWindow(target) != 0 {
+            // 已经在窗口自己的线程上：SetFocus 是纯线程内的，不会卡。
+            let _ = SetFocus(target);
+            return;
+        }
+        // 前台锁拦住了：临时挂接当前前台线程的输入队列再试一次。
+        // 只在前台线程不属于自己时才挂，挂完立刻摘掉。
         let foreground = GetForegroundWindow();
         let foreground_thread = if foreground.is_null() {
             0
@@ -1020,13 +1038,75 @@ pub fn force_foreground(hwnd: isize) {
         if attached {
             let _ = AttachThreadInput(foreground_thread, this_thread, 1);
         }
-        ShowWindow(target, SW_SHOW);
         let _ = SetForegroundWindow(target);
         let _ = SetFocus(target);
         if attached {
             let _ = AttachThreadInput(foreground_thread, this_thread, 0);
         }
     }
+}
+
+/// 窗口现在**真的**可见吗。
+///
+/// 不用 tao 的 `is_visible()`：那是它自己缓存的状态，一旦和真实窗口不一致
+/// （外部改过显示状态、或者被别的窗口系统操作过），判断就会一直是错的。
+pub fn window_visible(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: 标准窗口查询；句柄无效时返回 0。
+    unsafe { IsWindowVisible(hwnd as HWND) != 0 }
+}
+
+/// 直接把窗口显示出来 / 藏起来（兜底用：tao 的 show/hide 空转时纠正真实状态，
+/// 让真实状态跟 tao 的缓存重新一致）。
+pub fn show_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 标准窗口操作。
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_SHOW);
+    }
+}
+
+pub fn hide_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 标准窗口操作。
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_HIDE);
+    }
+}
+
+/// 让 Win11 给窗口剪圆角。
+///
+/// 面板是工具窗口（不占任务栏），系统不会自动给它圆角；之前靠 CSS 自己画，
+/// 圆角外面那圈三角露出的是 WebView 的白底——深色主题下四个角就是四个白点，
+/// 浅色主题下描边又被系统剪掉一截，看着和设置窗口不一样。
+/// 这里直接让系统按和普通窗口一样的方式剪（8px）。
+pub fn round_window_corners(hwnd: isize) -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    if hwnd == 0 {
+        return false;
+    }
+    let preference = DWMWCP_ROUND;
+    // SAFETY: 只读一个 i32；Win10 上这个属性不存在，返回错误码，调用方忽略。
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&preference as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    result == 0
 }
 
 /// 在主线程上初始化 OLE。窗口创建时要注册拖放目标，没有这个初始化的话
@@ -1312,6 +1392,7 @@ pub fn show_shell_context_menu(
     x: i32,
     y: i32,
     owner: isize,
+    before_invoke: impl FnOnce(),
 ) -> Result<Option<&'static str>, String> {
     /// 自己加的菜单项用高位 id，和 Shell 的 1..0x7FFF 区分开。
     const CMD_RENAME: u32 = 0x8000;
@@ -1381,41 +1462,50 @@ pub fn show_shell_context_menu(
 
         // 「重命名」在资源管理器里由视图层提供；这里插到「删除」上方。
         // 先找「删除」，找不到再找「属性」，都没有就追加到末尾——至少功能还在。
-        let mut inserted = false;
-        for needle in ["删除", "属性"] {
-            let count = GetMenuItemCount(popup);
-            for index in 0..count {
-                let mut text = [0u16; 64];
-                let length = GetMenuStringW(
-                    popup,
-                    index as u32,
-                    text.as_mut_ptr(),
-                    text.len() as i32,
-                    MF_BYPOSITION,
-                );
-                if length <= 0 {
-                    continue;
-                }
-                let label = String::from_utf16_lossy(&text[..length as usize]);
-                if label.starts_with(needle) {
-                    InsertMenuW(
+        let anchor = {
+            let mut found = None;
+            'outer: for needle in ["删除", "属性"] {
+                let count = GetMenuItemCount(popup);
+                for index in 0..count {
+                    let mut text = [0u16; 64];
+                    let length = GetMenuStringW(
                         popup,
                         index as u32,
-                        MF_BYPOSITION | MF_STRING,
-                        CMD_RENAME as usize,
-                        windows_sys::core::w!("重命名(&M)"),
+                        text.as_mut_ptr(),
+                        text.len() as i32,
+                        MF_BYPOSITION,
                     );
-                    inserted = true;
-                    break;
+                    if length <= 0 {
+                        continue;
+                    }
+                    let label = String::from_utf16_lossy(&text[..length as usize]);
+                    if label.starts_with(needle) {
+                        found = Some(index as u32);
+                        break 'outer;
+                    }
                 }
             }
-            if inserted {
-                break;
+            found
+        };
+        match anchor {
+            Some(index) => {
+                InsertMenuW(
+                    popup,
+                    index,
+                    MF_BYPOSITION | MF_STRING,
+                    CMD_RENAME as usize,
+                    windows_sys::core::w!("重命名(&M)"),
+                );
             }
-        }
-        if !inserted {
-            AppendMenuW(popup, MF_SEPARATOR, 0, std::ptr::null());
-            AppendMenuW(popup, MF_STRING, CMD_RENAME as usize, windows_sys::core::w!("重命名(&M)"));
+            None => {
+                AppendMenuW(popup, MF_SEPARATOR, 0, std::ptr::null());
+                AppendMenuW(
+                    popup,
+                    MF_STRING,
+                    CMD_RENAME as usize,
+                    windows_sys::core::w!("重命名(&M)"),
+                );
+            }
         }
 
         let owner_window = if owner != 0 {
@@ -1438,6 +1528,10 @@ pub fn show_shell_context_menu(
             0 => {}
             CMD_RENAME => choice = Some("rename"),
             other => {
+                // InvokeCommand 可能同步跑上一会儿（等自己的进度窗口出来）。
+                // 调用方要在这之前就知道「命令开始了」，否则这段时间收到的
+                // 失焦会先把面板收掉——压缩过程中面板就没了。
+                before_invoke();
                 // QueryContextMenu 从 1 开始编号，调用时要用相对偏移。
                 let command = CMINVOKECOMMANDINFO {
                     cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
@@ -1456,6 +1550,10 @@ pub fn show_shell_context_menu(
                     return Err(format!("InvokeCommand 0x{hr:08x}"));
                 }
                 log::info!("context menu: invoked shell command {other}");
+                // 这些命令大多是异步的：InvokeCommand 返回了，真正的活儿
+                // （压缩、复制、发送到…）还在 Shell 里跑，过程中会弹自己的
+                // 进度窗口抢走前台。调用方据此别把面板收起。
+                choice = Some("shell");
             }
         }
         release_object(menu_object);
@@ -1555,10 +1653,12 @@ pub fn rename_path(
     if target == path {
         return Ok(target);
     }
-    if target.exists() {
+    // Windows 不区分大小写：只改大小写时 `target.exists()` 也为 true，
+    // 但那其实是同一个文件。资源管理器允许这样改名，这里也允许。
+    if target.exists() && !target.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy()) {
         return Err("已经有同名文件".to_string());
     }
-    std::fs::rename(path, &target).map_err(|error| error.to_string())?;
+    crate::shell_ops::rename(path, name)?;
     log::info!("renamed {} -> {}", path.display(), target.display());
     Ok(target)
 }

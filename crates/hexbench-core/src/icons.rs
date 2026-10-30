@@ -33,6 +33,24 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICON
 thread_local! {
     /// COM 是按线程初始化的：每个线程第一次要图标前调一次。
     static COM_READY: std::cell::OnceCell<()> = const { std::cell::OnceCell::new() };
+    /// 系统图标列表（`IImageList`）不是线程安全的，但按线程各存一份就没事：
+    /// 取图可以在多个线程上并行，不必再全局排队。
+    static EXTRA_LARGE: std::cell::RefCell<Option<ImageList>> = const { std::cell::RefCell::new(None) };
+    static JUMBO: std::cell::RefCell<Option<ImageList>> = const { std::cell::RefCell::new(None) };
+}
+
+fn system_icon(which: u32, index: i32) -> Option<*mut std::ffi::c_void> {
+    let pick = |slot: &mut Option<ImageList>| -> Option<*mut std::ffi::c_void> {
+        if slot.is_none() {
+            *slot = ImageList::system(which);
+        }
+        slot.as_ref()?.icon(index)
+    };
+    if which == SHIL_JUMBO {
+        JUMBO.with(|cell| pick(&mut cell.borrow_mut()))
+    } else {
+        EXTRA_LARGE.with(|cell| pick(&mut cell.borrow_mut()))
+    }
 }
 
 fn ensure_com() {
@@ -129,16 +147,20 @@ impl Drop for ImageList {
     }
 }
 
-/// PNG（base64）按路径缓存，`None` 也缓存——省得对同一个坏路径反复问 Shell。
-/// 缓存项：文件修改时间 + 图标（`None` 表示这个路径取不到图标）。
-type CacheEntry = (u64, Option<String>);
+/// 取不到图标的结果只记一小会儿：Shell 偶尔会抽风一次，永久记住的话这个
+/// 文件就再也不会出图了（之前 `.none` 落盘就是这个毛病）。
+const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 每项：文件修改时间 + 图标缓存键（`None` 表示这次没取到）+ 失败时间。
+struct CacheEntry {
+    stamp: u64,
+    key: Option<String>,
+    failed_at: Option<std::time::Instant>,
+}
+
 type IconCache = HashMap<PathBuf, CacheEntry>;
 
 static CACHE: Mutex<Option<IconCache>> = Mutex::new(None);
-
-/// Shell 的图标接口（COM 公寓里的 IImageList）不是线程安全的：多个线程同时
-/// 要图标会偶发失败。转换过程串行化，缓存之后就不会再走这里。
-static SHELL_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // 磁盘缓存：进程重启、切回目录都不用再问 Shell
@@ -171,13 +193,13 @@ fn disk_key(path: &Path, stamp: u64) -> String {
     format!("{hash:016x}")
 }
 
-fn cache_path(path: &Path, stamp: u64, hit: bool) -> Option<PathBuf> {
-    let name = disk_key(path, stamp);
-    Some(cache_dir()?.join(if hit {
-        format!("{name}.png")
-    } else {
-        format!("{name}.none")
-    }))
+/// 缓存文件就叫 `<16 位十六进制>.png`。前端拿到的也是这个键，
+/// 再用 `hbicon://<键>` 让 WebView 直接从磁盘取，不走 base64。
+pub fn cache_file(key: &str) -> Option<PathBuf> {
+    if key.len() != 16 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(cache_dir()?.join(format!("{key}.png")))
 }
 
 /// 只清理一次：按修改时间从旧到新删到低水位。
@@ -194,7 +216,14 @@ fn prune_once(dir: &Path) {
                 if !meta.is_file() {
                     return None;
                 }
-                Some((meta.modified().ok()?, meta.len(), entry.path()))
+                // 旧版本把「没取到图标」写成 `.none` 落盘，等于永久生效。
+                // 那些文件没有用了，顺手清掉。
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("none") {
+                    let _ = std::fs::remove_file(&path);
+                    return None;
+                }
+                Some((meta.modified().ok()?, meta.len(), path))
             })
             .collect();
         let total: u64 = files.iter().map(|(_, size, _)| size).sum();
@@ -215,77 +244,112 @@ fn prune_once(dir: &Path) {
     });
 }
 
-/// 读磁盘缓存。`Some(None)` 表示「上次就没取到图标」，也是有效命中。
-fn disk_lookup(path: &Path, stamp: u64) -> Option<Option<String>> {
-    let hit_file = cache_path(path, stamp, true)?;
-    if let Ok(bytes) = std::fs::read(&hit_file) {
-        if !bytes.is_empty() {
-            // 顺手更新访问时间，清理时按「最久没用」淘汰。
-            let _ = std::fs::File::open(&hit_file).and_then(|file| file.set_modified(std::time::SystemTime::now()));
-            return Some(Some(BASE64.encode(&bytes)));
-        }
-    }
-    let miss_file = cache_path(path, stamp, false)?;
-    if miss_file.exists() {
-        return Some(None);
-    }
-    None
-}
-
-fn disk_store(path: &Path, stamp: u64, icon: &Option<String>) {
+/// 把 PNG 落到缓存目录，返回是否成功。先写临时文件再改名，别的线程/协议
+/// 读到的永远是完整的图。
+fn write_icon(key: &str, png: &[u8]) -> bool {
     let Some(dir) = cache_dir() else {
-        return;
+        return false;
     };
     prune_once(&dir);
-    match icon {
-        Some(base64) => {
-            if let Some(target) = cache_path(path, stamp, true) {
-                if let Ok(bytes) = BASE64.decode(base64.as_bytes()) {
-                    let _ = std::fs::write(target, bytes);
-                }
-            }
-        }
-        None => {
-            if let Some(target) = cache_path(path, stamp, false) {
-                let _ = std::fs::write(target, b"");
-            }
-        }
-    }
-}
-/// 图标缓存命中/写入。缓存不可用时退化成直接转换。
-pub fn file_icon_base64(path: &Path, is_dir: bool) -> Option<String> {
-    let stamp = modified_stamp(path);
-    // 命中就直接返回；锁只在这几行里拿着，转换过程不占锁，否则多线程读文件夹
-    // 会退化成排队。
-    if let Ok(guard) = CACHE.lock() {
-        if let Some((cached_stamp, icon)) = guard.as_ref().and_then(|cache| cache.get(path)) {
-            if *cached_stamp == stamp {
-                return icon.clone();
-            }
-        }
-    }
-
-    // 内存没有就问磁盘；重启后命中率很高。
-    let icon = match disk_lookup(path, stamp) {
-        Some(cached) => cached,
-        None => {
-            let fresh = {
-                let _serialized = SHELL_LOCK.lock().ok();
-                shell_icon_png(path, is_dir)
-            }
-            .map(|png| BASE64.encode(png));
-            disk_store(path, stamp, &fresh);
-            fresh
-        }
+    let Some(target) = cache_file(key) else {
+        return false;
     };
+    let temp = dir.join(format!(
+        "{key}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    if std::fs::write(&temp, png).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return false;
+    }
+    if std::fs::rename(&temp, &target).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return false;
+    }
+    true
+}
+
+fn remember(path: &Path, stamp: u64, key: Option<String>) {
     if let Ok(mut guard) = CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
         if cache.len() >= CACHE_LIMIT {
             cache.clear();
         }
-        cache.insert(path.to_path_buf(), (stamp, icon.clone()));
+        cache.insert(
+            path.to_path_buf(),
+            CacheEntry {
+                stamp,
+                failed_at: key.is_none().then(std::time::Instant::now),
+                key,
+            },
+        );
     }
-    icon
+}
+
+fn cached_entry(path: &Path, stamp: u64) -> Option<Option<String>> {
+    let guard = CACHE.lock().ok()?;
+    let entry = guard.as_ref()?.get(path)?;
+    if entry.stamp != stamp {
+        return None;
+    }
+    match &entry.key {
+        Some(key) => Some(Some(key.clone())),
+        None => {
+            // 失败结果只压一小会儿，过了就重新问 Shell。
+            let expired = entry
+                .failed_at
+                .is_none_or(|at| at.elapsed() >= MISS_TTL);
+            if expired {
+                None
+            } else {
+                Some(None)
+            }
+        }
+    }
+}
+
+/// 取图标的缓存键。键就是缓存文件名，前端用 `hbicon://<键>` 直接拿图。
+///
+/// 失败不落盘，只在内存里记 5 分钟——Shell 偶发失败不该让一个文件永远没图标。
+pub fn icon_key(path: &Path, is_dir: bool) -> Option<String> {
+    let stamp = modified_stamp(path);
+    if let Some(cached) = cached_entry(path, stamp) {
+        return cached;
+    }
+
+    let key = disk_key(path, stamp);
+    if let Some(file) = cache_file(&key) {
+        if file.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
+            // 更新访问时间，清理时按「最久没用」淘汰。
+            let _ = std::fs::File::open(&file)
+                .and_then(|handle| handle.set_modified(std::time::SystemTime::now()));
+            remember(path, stamp, Some(key.clone()));
+            return Some(key);
+        }
+    }
+
+    // 每个线程用自己的 COM 公寓和 IImageList；不同线程之间不共享接口，
+    // 也就不需要全局串行。
+    let fresh = match shell_icon_png(path, is_dir) {
+        Some(png) => write_icon(&key, &png).then_some(key),
+        None => None,
+    };
+    remember(path, stamp, fresh.clone());
+    fresh
+}
+
+/// 兼容旧接口：直接给 base64。面板已经改成 `icon_key` + 协议。
+pub fn file_icon_base64(path: &Path, is_dir: bool) -> Option<String> {
+    let key = icon_key(path, is_dir)?;
+    let bytes = std::fs::read(cache_file(&key)?).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(BASE64.encode(bytes))
 }
 
 fn modified_stamp(path: &Path) -> u64 {
@@ -333,13 +397,16 @@ fn shell_icon_png(path: &Path, is_dir: bool) -> Option<Vec<u8>> {
     // 先问缩略图：照片、视频首帧、PDF 能给真预览。
     // 只对这类文件尝试 —— 文本、文件夹取缩略图要几十毫秒还拿不到，纯属浪费。
     if !is_dir && wants_thumbnail(path) {
-    if let Some((pixels, width, height)) =
-        crate::shell_ops::thumbnail_rgba(path, (OUTPUT_ICON_PX * 2) as u32)
-    {
-        if let Some(png) = rgba_to_png(pixels, width as i32, height as i32) {
-            return Some(png);
+        // 先问系统缩略图缓存：命中就是现成的图，不触发抽取；
+        // 没命中再走 GetImage 抽取（抽出来的图也会进系统缓存）。
+        let size = (OUTPUT_ICON_PX * 2) as u32;
+        if let Some((pixels, width, height)) = crate::shell_ops::thumbnail_cached_rgba(path, size)
+            .or_else(|| crate::shell_ops::thumbnail_rgba(path, size))
+        {
+            if let Some(png) = rgba_to_png(pixels, width as i32, height as i32) {
+                return Some(png);
+            }
         }
-    }
     }
     let _ = is_dir;
     ensure_com();
@@ -355,15 +422,13 @@ fn shell_icon_png(path: &Path, is_dir: bool) -> Option<Vec<u8>> {
             SHGFI_SYSICONINDEX,
         );
         if ok != 0 {
-            // 先用 JUMBO（96px），没有就退到 EXTRALARGE（48px）。
+            // 先用 EXTRALARGE（48px），没有就退到 JUMBO（96px）。
             for which in [SHIL_EXTRALARGE, SHIL_JUMBO] {
-                if let Some(list) = ImageList::system(which) {
-                    if let Some(icon) = list.icon(info.iIcon) {
-                        let png = icon_to_png(icon);
-                        DestroyIcon(icon);
-                        if png.is_some() {
-                            return png;
-                        }
+                if let Some(icon) = system_icon(which, info.iIcon) {
+                    let png = icon_to_png(icon);
+                    DestroyIcon(icon);
+                    if png.is_some() {
+                        return png;
                     }
                 }
             }
@@ -583,9 +648,19 @@ mod tests {
         }
     }
 
+    /// 同一个进程里的 Shell 取图标（COM 公寓 + 系统图标列表）不是线程安全的：
+    /// 几个测试并行跑会互相踩，`folders_have_their_own_icon` 隔几次就挂一次、
+    /// 单跑又必过。这里的测试都拿着这把锁排队。
+    static ICON_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn icon_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        ICON_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     /// 转换和缓存放在同一个测试里：缓存是进程级的全局状态，拆开会互相污染。
     #[test]
     fn converts_icons_to_png_and_caches_by_path() {
+        let _guard = icon_test_guard();
         reset_cache();
         let exe = std::env::current_exe().expect("test binary path");
         let icon = file_icon_base64(&exe, false).expect("exe should have a shell icon");
@@ -600,6 +675,7 @@ mod tests {
     #[test]
     fn different_programs_get_different_icons() {
         // 这是之前按扩展名缓存的 bug：所有 exe 都会拿到第一张图标。
+        let _guard = icon_test_guard();
         reset_cache();
         let system = Path::new(r"C:\Windows\System32");
         let notepad = system.join("notepad.exe");
@@ -615,6 +691,7 @@ mod tests {
 
     #[test]
     fn folders_have_their_own_icon() {
+        let _guard = icon_test_guard();
         reset_cache();
         let dir = std::env::temp_dir();
         let icon = file_icon_base64(&dir, true).expect("folders have an icon");
@@ -623,6 +700,7 @@ mod tests {
 
     #[test]
     fn icons_are_at_least_48px_so_the_panel_stays_sharp() {
+        let _guard = icon_test_guard();
         reset_cache();
         let exe = std::env::current_exe().expect("test binary path");
         let icon = file_icon_base64(&exe, false).expect("icon");
