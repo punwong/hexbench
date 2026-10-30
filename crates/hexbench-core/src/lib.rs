@@ -14,6 +14,7 @@ pub mod net;
 pub mod model;
 pub mod sync;
 pub mod trigger;
+pub mod usage;
 
 #[cfg(target_os = "windows")]
 pub mod engine;

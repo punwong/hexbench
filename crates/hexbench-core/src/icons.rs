@@ -312,25 +312,39 @@ fn cached_entry(path: &Path, stamp: u64) -> Option<Option<String>> {
     }
 }
 
+/// 只看缓存（内存 + 磁盘），不问 Shell。
+///
+/// 面板首屏要的就是这个：命中的立刻出图，没命中的丢给后台慢慢抽。
+/// 返回 `Some(None)` 表示「刚试过、没取到」，`None` 表示还没试过。
+pub fn cached_icon_key(path: &Path) -> Option<Option<String>> {
+    let stamp = modified_stamp(path);
+    if let Some(cached) = cached_entry(path, stamp) {
+        return Some(cached);
+    }
+
+    let key = disk_key(path, stamp);
+    let file = cache_file(&key)?;
+    if file.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
+        // 更新访问时间，清理时按「最久没用」淘汰。
+        let _ = std::fs::File::open(&file)
+            .and_then(|handle| handle.set_modified(std::time::SystemTime::now()));
+        remember(path, stamp, Some(key.clone()));
+        Some(Some(key))
+    } else {
+        None
+    }
+}
+
 /// 取图标的缓存键。键就是缓存文件名，前端用 `hbicon://<键>` 直接拿图。
 ///
 /// 失败不落盘，只在内存里记 5 分钟——Shell 偶发失败不该让一个文件永远没图标。
 pub fn icon_key(path: &Path, is_dir: bool) -> Option<String> {
-    let stamp = modified_stamp(path);
-    if let Some(cached) = cached_entry(path, stamp) {
+    if let Some(cached) = cached_icon_key(path) {
         return cached;
     }
 
+    let stamp = modified_stamp(path);
     let key = disk_key(path, stamp);
-    if let Some(file) = cache_file(&key) {
-        if file.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
-            // 更新访问时间，清理时按「最久没用」淘汰。
-            let _ = std::fs::File::open(&file)
-                .and_then(|handle| handle.set_modified(std::time::SystemTime::now()));
-            remember(path, stamp, Some(key.clone()));
-            return Some(key);
-        }
-    }
 
     // 每个线程用自己的 COM 公寓和 IImageList；不同线程之间不共享接口，
     // 也就不需要全局串行。
@@ -340,6 +354,48 @@ pub fn icon_key(path: &Path, is_dir: bool) -> Option<String> {
     };
     remember(path, stamp, fresh.clone());
     fresh
+}
+
+/// 把内存里的「上次没取到」抹掉，让下一次 `icon_key` 真的再去问 Shell。
+/// 刚失败就重试时用：`icon_key` 自己会把失败记 5 分钟。
+pub fn forget_miss(path: &Path) {
+    if let Ok(mut guard) = CACHE.lock() {
+        let Some(cache) = guard.as_mut() else {
+            return;
+        };
+        if cache.get(path).is_some_and(|entry| entry.key.is_none()) {
+            cache.remove(path);
+        }
+    }
+}
+
+/// 正在抽取的路径。可见区、预取、滚动三处的请求会重叠，
+/// 同一张图没必要抽好几遍；后来者直接跳过，结果由先来的那一路发出去。
+static IN_FLIGHT: Mutex<Option<std::collections::HashSet<PathBuf>>> = Mutex::new(None);
+
+/// 占着一条路径的分发权；`None` 表示别的线程正在抽，别重复劳动。
+pub struct ExtractClaim(PathBuf);
+
+impl Drop for ExtractClaim {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = IN_FLIGHT.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.remove(&self.0);
+            }
+        }
+    }
+}
+
+pub fn claim_extraction(path: &Path) -> Option<ExtractClaim> {
+    let mut guard = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    if set.insert(path.to_path_buf()) {
+        Some(ExtractClaim(path.to_path_buf()))
+    } else {
+        None
+    }
 }
 
 /// 兼容旧接口：直接给 base64。面板已经改成 `icon_key` + 协议。
@@ -552,17 +608,19 @@ fn rgba_to_png(pixels: Vec<u8>, width: i32, height: i32) -> Option<Vec<u8>> {
 /// 盒式降采样：每 `factor × factor` 个源像素平均成一个目标像素。
 ///
 /// 图标本来就画得干净，盒式平均足够，也不会像最近邻那样丢细节。
+/// 按**长边**缩：缩略图不是方的（16:9 的截图、视频首帧），按短边缩的话
+/// 长边还停在 128px，白白多占一半缓存。
 fn downscale(
     pixels: Vec<u8>,
     width: i32,
     height: i32,
     target: i32,
 ) -> (Vec<u8>, i32, i32) {
-    let side = width.min(height);
-    if side <= target || target <= 0 {
+    let long = width.max(height);
+    if long <= target || target <= 0 {
         return (pixels, width, height);
     }
-    let factor = (side / target).max(1);
+    let factor = (long / target).max(1);
     let out_width = (width / factor).max(1);
     let out_height = (height / factor).max(1);
     let mut out = vec![0u8; (out_width * out_height * 4) as usize];

@@ -221,12 +221,17 @@ pub struct LauncherSettings {
     /// 保存这份尺寸时用的百分比，改百分比就作废。
     pub panel_pct_w: u32,
     pub panel_pct_h: u32,
-    /// 视图：grid（图标）或 list（列表）。
+    /// 视图：grid（图标）或 list（列表）。这是「快速启动」（分类）那一套。
     pub view: String,
     /// 排序字段：name / modified / size / type。
     pub sort_key: String,
     /// 排序方向：1 升序，-1 降序。
     pub sort_dir: i32,
+    /// 「快速访问」（钉住的文件夹）单独记的视图 / 排序。
+    /// 空 / 0 表示还没单独设过，跟着分类那一套走。
+    pub pinned_view: String,
+    pub pinned_sort_key: String,
+    pub pinned_sort_dir: i32,
     /// 呼出时回到上次浏览的位置。
     pub remember_location: bool,
     /// 上次浏览的位置（`remember_location` 关掉时忽略）。
@@ -269,6 +274,9 @@ impl Default for LauncherSettings {
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,
+            pinned_view: String::new(),
+            pinned_sort_key: String::new(),
+            pinned_sort_dir: 0,
             remember_location: true,
             last_location: LauncherLocation::default(),
         }

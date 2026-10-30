@@ -17,6 +17,8 @@
         --marquee-line: rgba(0, 0, 0, 0.3);
         --marquee-fill: rgba(0, 0, 0, 0.05);
         --ease: cubic-bezier(0.2, 0, 0, 1);
+        /* 滑块、列表这类「有惯性」的移动：起手快、收尾软，不弹过头。 */
+        --glide: cubic-bezier(0.25, 0.9, 0.3, 1);
       }
 
       :root[data-theme="dark"] {
@@ -63,13 +65,24 @@
         四个角就是白点；两条弧线也不会完全重合，描边在拐角处会被系统剪掉一截。
         Win10 没有这个属性，面板就是直角——和设置窗口一样，不做逐像素对齐。 */
         overflow: hidden;
-        animation: palette-in 130ms var(--ease) both;
       }
 
-      @keyframes palette-in {
+      /* 入场在 launcher.tsx 里用 Web Animations 播（只淡入、不缩放）：
+      面板贴着屏幕边缘，缩放会在边上露出一圈窗口背景的缝；而且窗口是常驻的，
+      CSS 动画只在页面加载时跑一次，每次呼出都要重播才行。 */
+
+      /* 换分类：新内容淡入 + 轻轻上移一点。用 CSS 而不是 View Transitions：
+      侧边栏是悬停即预览的，每次切换都会截图冻结整个面板 150ms，
+      鼠标划过几行就会一顿一顿的。 */
+      .grid.view-in,
+      .list.view-in {
+        animation: view-in 200ms var(--ease) both;
+      }
+
+      @keyframes view-in {
         from {
           opacity: 0;
-          transform: scale(0.995);
+          transform: translateY(6px);
         }
       }
 
@@ -118,6 +131,31 @@
         border-right: 1px solid var(--line);
         overflow-y: auto;
         scrollbar-width: thin;
+        /* 选中高亮是里面那块绝对定位的滑块，靠它定位。 */
+        position: relative;
+      }
+
+      /* 选中高亮：整块只有它一个形状，切换时滑过去，而不是两行各自变色。 */
+      .side-hl {
+        position: absolute;
+        left: 9px;
+        right: 9px;
+        top: 0;
+        height: 0;
+        border-radius: 9px;
+        background: var(--surface-2);
+        pointer-events: none;
+        z-index: 0;
+        will-change: transform, height;
+        transition:
+          transform 240ms var(--glide),
+          height 240ms var(--glide),
+          opacity 140ms ease;
+      }
+
+      /* 第一帧不要从顶上滑下来。 */
+      .side-hl.still {
+        transition: none;
       }
 
       .side-item {
@@ -131,7 +169,7 @@
         border: none;
         border-radius: 9px;
         background: transparent;
-        transition: background 60ms ease;
+        transition: background 120ms ease, color 120ms ease;
         color: var(--text);
         font: inherit;
         font-size: 13px;
@@ -139,6 +177,8 @@
         cursor: default;
         overflow: hidden;
         white-space: nowrap;
+        position: relative;
+        z-index: 1;
       }
 
       .side-item span:first-child {
@@ -151,8 +191,9 @@
         background: var(--surface-2, rgba(0, 0, 0, 0.05));
       }
 
+      /* 底色由滑块给，这里只加粗——两行同时有底色就成了「亮错行」。 */
       .side-item.active {
-        background: var(--surface-2);
+        background: transparent;
         font-weight: 600;
       }
 
@@ -327,6 +368,12 @@
         background: var(--surface-2);
         box-shadow: inset 0 0 0 2px var(--text);
       }
+      /* 面包屑同理：拖到哪一段上，松手就移进那一层。 */
+      .crumb.drop-hover {
+        background: var(--surface-2);
+        box-shadow: inset 0 0 0 2px var(--text);
+        color: var(--text);
+      }
       /* 一闪而过的提示条 */
       .toast {
         position: absolute;
@@ -424,6 +471,11 @@
         cursor: default;
         outline: none;
         box-sizing: border-box;
+        transition: background 130ms var(--ease), transform 130ms var(--ease);
+      }
+
+      .row:active {
+        transform: scale(0.99);
       }
 
       .row.active {
@@ -442,6 +494,8 @@
       .row .tile-icon img {
         width: 22px;
         height: 22px;
+        /* 缩略图保持原图比例（资源管理器就是这样），不要拉成方图。 */
+        object-fit: contain;
       }
 
       .row .tile-glyph {
@@ -499,6 +553,11 @@
         /* 虚拟滚动给的是固定格子尺寸：宽度和高度都在内联样式里。 */
         box-sizing: border-box;
         overflow: hidden;
+        transition: background 130ms var(--ease), transform 130ms var(--ease);
+      }
+
+      .tile:active {
+        transform: scale(0.985);
       }
 
       .tile.active {
@@ -533,6 +592,20 @@
       .tile-icon img {
         width: 48px;
         height: 48px;
+        /* 同上：非方图按比例缩放在 48×48 的框里，四周留白。 */
+        object-fit: contain;
+        /* 图还没到之前不占位（下面有字形兜底）；解码完成才淡进来，
+        这样一屏图标是一张一张浮现的，而不是同时「啪」地跳出来。 */
+        opacity: 0;
+        transform: scale(0.9);
+        transition:
+          opacity 140ms var(--ease),
+          transform 180ms var(--ease);
+      }
+
+      .tile-icon img.ready {
+        opacity: 1;
+        transform: none;
       }
 
       .tile-glyph {
@@ -786,6 +859,33 @@
       .web-tab.active {
         border-color: #2f6fed;
         background: rgba(47, 111, 237, 0.1);
+      }
+
+      /* 小控件统一给一点过渡：悬停、按下不再是「瞬间换色」，而是 120ms。
+      统一在这里写，免得每个按钮各写一份、时长还不一样。 */
+      .tool-btn,
+      .crumb,
+      .empty-action,
+      .sort-item,
+      .ctx-menu button,
+      .site-tab,
+      .web-tab {
+        transition:
+          background 120ms ease,
+          color 120ms ease,
+          border-color 120ms ease,
+          opacity 120ms ease;
+      }
+
+      /* 用户在系统里关掉动画时，这些全都不做。 */
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 1ms !important;
+          animation-delay: 0ms !important;
+          transition-duration: 1ms !important;
+        }
       }
 </style>
   </head>

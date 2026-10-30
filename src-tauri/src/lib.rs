@@ -2010,6 +2010,9 @@ fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))
             hexbench_core::sys::show_window(hwnd.0 as isize);
         }
     }
+    // 面板窗口是常驻的：页面只在第一次加载时播 CSS 动画。每次呼出都告诉
+    // 前端一声，入场动效才每次都播（不播也不影响功能）。
+    let _ = window.app_handle().emit("launcher-shown", ());
     // 每次呼出都同步一次主题：设置里改了颜色，常驻窗口要跟上。
     op(3);
     push_theme_to_windows(window.app_handle());
@@ -2977,10 +2980,16 @@ struct LauncherRoot {
     sites: Vec<hexbench_core::config::LauncherSite>,
     /// 设置里的「内置网页」开关：开着就默认展开右侧网页栏。
     web_enabled: bool,
-    /// 上次用的视图和排序。
+    /// 上次用的视图和排序（快速启动 / 分类这一组）。
     view: String,
     sort_key: String,
     sort_dir: i32,
+    /// 快速访问（钉住的文件夹）单独记的一套；没单独设过就等于上面那套。
+    pinned_view: String,
+    pinned_sort_key: String,
+    pinned_sort_dir: i32,
+    /// 快速访问是否已经单独设过（没设过就跟着分类那套走）。
+    pinned_view_set: bool,
     /// 下次呼出要不要回到上次的位置。
     remember_location: bool,
     last_kind: String,
@@ -3069,6 +3078,10 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,
+            pinned_view: "grid".to_string(),
+            pinned_sort_key: "name".to_string(),
+            pinned_sort_dir: 1,
+            pinned_view_set: false,
             remember_location: false,
             last_kind: String::new(),
             last_base: String::new(),
@@ -3091,6 +3104,20 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
     let view = shared.config.launcher.view.clone();
     let sort_key = shared.config.launcher.sort_key.clone();
     let sort_dir = shared.config.launcher.sort_dir;
+    // 快速访问那一组还没单独设过时，先用分类这套，界面拿到的永远是能直接用的值。
+    let pinned_view = match shared.config.launcher.pinned_view.as_str() {
+        "" => view.clone(),
+        other => other.to_string(),
+    };
+    let pinned_sort_key = match shared.config.launcher.pinned_sort_key.as_str() {
+        "" => sort_key.clone(),
+        other => other.to_string(),
+    };
+    let pinned_sort_dir = match shared.config.launcher.pinned_sort_dir {
+        0 => sort_dir,
+        other => other,
+    };
+    let pinned_view_set = !shared.config.launcher.pinned_view.is_empty();
     let web_enabled = shared.config.launcher.web_enabled;
     drop(shared);
     let all_visible = !hidden.iter().any(|entry| entry == "__all__");
@@ -3104,6 +3131,10 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         view: view.clone(),
         sort_key: sort_key.clone(),
         sort_dir,
+        pinned_view: pinned_view.clone(),
+        pinned_sort_key: pinned_sort_key.clone(),
+        pinned_sort_dir,
+        pinned_view_set,
         remember_location,
         last_kind: location.kind.clone(),
         last_base: location.base.clone(),
@@ -3128,6 +3159,10 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         view,
         sort_key,
         sort_dir,
+        pinned_view,
+        pinned_sort_key,
+        pinned_sort_dir,
+        pinned_view_set,
         remember_location,
         last_kind: location.kind,
         last_base: location.base,
@@ -3182,22 +3217,33 @@ fn open_settings(page: String, tab: Option<String>, app: AppHandle) {
     }
     let _ = app.emit("navigate", serde_json::json!({ "page": page, "tab": tab }));
 }
-/// 记住面板的视图和排序方式。
+/// 记住面板的视图和排序方式。`pinned` 表示这份是「快速访问」那一组的，
+/// 和「快速启动」（分类）各记各的。
 #[tauri::command]
 fn launcher_save_view(
     view: String,
     sort_key: String,
     sort_dir: i32,
+    pinned: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut shared = state.shared.lock().unwrap();
     let launcher = &mut shared.config.launcher;
-    if launcher.view == view && launcher.sort_key == sort_key && launcher.sort_dir == sort_dir {
+    let (slot_view, slot_key, slot_dir) = if pinned {
+        (
+            &mut launcher.pinned_view,
+            &mut launcher.pinned_sort_key,
+            &mut launcher.pinned_sort_dir,
+        )
+    } else {
+        (&mut launcher.view, &mut launcher.sort_key, &mut launcher.sort_dir)
+    };
+    if *slot_view == view && *slot_key == sort_key && *slot_dir == sort_dir {
         return Ok(());
     }
-    launcher.view = view;
-    launcher.sort_key = sort_key;
-    launcher.sort_dir = sort_dir;
+    *slot_view = view;
+    *slot_key = sort_key;
+    *slot_dir = sort_dir;
     let config = shared.config.clone();
     drop(shared);
     hexbench_core::config::save(&state.config_path, &config).map_err(|error| error.to_string())
@@ -3215,6 +3261,7 @@ fn launcher_move_into(dest: String, paths: Vec<String>, app: AppHandle) -> Resul
         .filter(|path| path.exists())
         .collect();
     if sources.is_empty() {
+        log::warn!("launcher: nothing to move, sources are gone: {paths:?}");
         return Err("文件已经不在了".to_string());
     }
     let moved = move_paths_into(&dir, &sources);
@@ -3317,41 +3364,145 @@ async fn launcher_items_stream(
     .map_err(|error| error.to_string())?
 }
 
-/// 批量补图标：返回 `(路径, 缓存键)`，前端用 `hbicon://<键>` 直接取图。
-///
-/// 每个线程用自己的 COM 公寓和图标列表，所以这里可以真并行；面板只请求
-/// 屏幕上看得见的那几十项，一批分给 3 个线程足够。
-#[tauri::command]
-async fn launcher_icons(paths: Vec<String>) -> Vec<(String, Option<String>)> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let workers = paths.len().clamp(1, 3);
-        let chunk = paths.len().div_ceil(workers);
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for slice in paths.chunks(chunk.max(1)) {
-                handles.push(scope.spawn(move || {
-                    slice
-                        .iter()
-                        .map(|raw| {
-                            let path = std::path::PathBuf::from(raw);
-                            let is_dir = path.is_dir();
-                            let key = hexbench_core::icons::icon_key(&path, is_dir);
-                            (raw.clone(), key)
-                        })
-                        .collect::<Vec<_>>()
-                }));
-            }
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().unwrap_or_default())
-                .collect::<Vec<_>>()
-        })
+/// 一次最多同时抽几张图。缩略图是「读盘 + 解码」，几路并行能把整屏的等待
+/// 摊薄；再多就开始抢磁盘和 Shell 的缩略图服务，收益很小。
+const ICON_WORKERS: usize = 6;
+
+/// 后台抽好一张图标后推给前端的载荷。
+#[derive(Clone, Serialize)]
+struct LauncherIcon {
+    path: String,
+    key: Option<String>,
+}
+
+/// 抽取队列：两档优先级。屏幕上看得见的那一屏先抽，往后预取的排在后面——
+/// 快速滚动时新一屏的请求不能被前面预取的几百张堵住。
+/// （任务和唤醒信号分开：信号走 mpsc，任务留在队列里好重新排序。）
+#[derive(Default)]
+struct IconQueues {
+    visible: std::collections::VecDeque<(AppHandle, String)>,
+    ahead: std::collections::VecDeque<(AppHandle, String)>,
+}
+
+static ICON_QUEUE: Mutex<Option<IconQueues>> = Mutex::new(None);
+static ICON_WAKE: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+
+/// 固定 6 个长驻线程碰 Shell：滚得再快也不会一下子开几十个线程抢磁盘。
+/// 线程里第一次取图时各自初始化 COM 公寓，之后一直复用。
+fn icon_wake() -> &'static std::sync::mpsc::Sender<()> {
+    ICON_WAKE.get_or_init(|| {
+        let (wake, sleep) = std::sync::mpsc::channel::<()>();
+        let sleep = Arc::new(Mutex::new(sleep));
+        for _ in 0..ICON_WORKERS {
+            let sleep = Arc::clone(&sleep);
+            thread::spawn(move || loop {
+                let woken = sleep
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv();
+                if woken.is_err() {
+                    return;
+                }
+                let task = {
+                    let mut guard = ICON_QUEUE.lock().unwrap_or_else(|error| error.into_inner());
+                    let queues = guard.get_or_insert_with(IconQueues::default);
+                    queues
+                        .visible
+                        .pop_front()
+                        .or_else(|| queues.ahead.pop_front())
+                };
+                if let Some((app, raw)) = task {
+                    extract_icon(&app, &raw);
+                }
+            });
+        }
+        wake
     })
-    .await
-    .unwrap_or_default()
+}
+
+fn extract_icon(app: &AppHandle, raw: &str) {
+    let path = PathBuf::from(raw);
+    // 可见区、预取和滚动会重复请求同一批路径，先来先抽。
+    let Some(_claim) = hexbench_core::icons::claim_extraction(&path) else {
+        return;
+    };
+    let is_dir = path.is_dir();
+    let mut key = hexbench_core::icons::icon_key(&path, is_dir);
+    if key.is_none() {
+        // Shell 偶发抽风一次就被记 5 分钟，这里立刻抹掉重试，
+        // 别让一次失败变成「这个文件永远只有图标」。
+        hexbench_core::icons::forget_miss(&path);
+        thread::sleep(Duration::from_millis(150));
+        key = hexbench_core::icons::icon_key(&path, is_dir);
+    }
+    let _ = app.emit(
+        "launcher-icon",
+        LauncherIcon {
+            path: raw.to_string(),
+            key,
+        },
+    );
+}
+
+/// 批量补图标：`(路径, 缓存键)`，前端用 `hbicon://<键>` 直接取图。
+///
+/// 缓存命中的随返回值立刻给；没命中的丢到抽取队列，**抽完一张发一条
+/// `launcher-icon`**——不能等整批，一批里最慢的那张（大视频、网络盘）
+/// 会把整批已经抽好的图标一起扣住，看起来就是「缩略图加载得很慢」。
+#[tauri::command]
+async fn launcher_icons(
+    app: AppHandle,
+    paths: Vec<String>,
+    ahead: Option<Vec<String>>,
+) -> Vec<(String, Option<String>)> {
+    let mut ready = Vec::new();
+    let mut visible_todo = Vec::new();
+    let mut later_todo = Vec::new();
+    for raw in paths {
+        let path = PathBuf::from(&raw);
+        match hexbench_core::icons::cached_icon_key(&path) {
+            Some(key) => ready.push((raw, key)),
+            None => visible_todo.push(raw),
+        }
+    }
+    for raw in ahead.unwrap_or_default() {
+        let path = PathBuf::from(&raw);
+        match hexbench_core::icons::cached_icon_key(&path) {
+            Some(key) => ready.push((raw, key)),
+            None => later_todo.push(raw),
+        }
+    }
+    if visible_todo.is_empty() && later_todo.is_empty() {
+        return ready;
+    }
+
+    let queued = visible_todo.len() + later_todo.len();
+    {
+        let mut guard = ICON_QUEUE.lock().unwrap_or_else(|error| error.into_inner());
+        let queues = guard.get_or_insert_with(IconQueues::default);
+        for raw in visible_todo {
+            // 之前作为预取排进队的，现在滚到眼前了：从后面挪到前面。
+            queues.ahead.retain(|(_, path)| *path != raw);
+            queues.visible.push_back((app.clone(), raw));
+        }
+        for raw in later_todo {
+            queues.ahead.push_back((app.clone(), raw));
+        }
+    }
+    let wake = icon_wake();
+    for _ in 0..queued {
+        let _ = wake.send(());
+    }
+
+    ready
 }
 
 /// 面板里按住一个条目拖出去：交给 OLE，资源管理器 / 浏览器都认。
+///
+/// `DoDragDrop` 必须留在主线程上：它靠 `SetCapture` 拿鼠标，而只有前台线程拿得到，
+/// 换到别的线程上松手时那段模态循环收不到消息，会一直挂着不返回。
+/// 代价是拖拽期间主线程不理 WebView2 的消息——`hbicon://` 的图片请求和取图标的命令
+/// 都排着队。所以那期间才显示的缩略图得提前备在渲染进程里（前端的 `warmPreview`）。
 #[tauri::command]
 fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String> {
     let targets: Vec<PathBuf> = paths
@@ -3364,7 +3515,11 @@ fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String
         return Err("文件已经不在了".to_string());
     }
     log::info!("launcher: drag requested for {} item(s)", targets.len());
+    run_file_drag(&app, &targets)
+}
 
+/// 拖拽本体：建数据对象 → OLE 模态循环 → 松手时把落点交回界面。
+fn run_file_drag(app: &AppHandle, targets: &[PathBuf]) -> Result<u32, String> {
     // 面板在屏幕上的位置：松手时用它判断「还在面板里」。
     let frame = app.get_webview_window("launcher").and_then(|window| {
         let position = window.outer_position().ok()?;
@@ -3395,7 +3550,7 @@ fn launcher_begin_drag(paths: Vec<String>, app: AppHandle) -> Result<u32, String
     };
 
     hexbench_core::drop_target::set_drag_out(true);
-    let result = hexbench_core::sys::start_file_drag(&targets);
+    let result = hexbench_core::sys::start_file_drag(targets);
     hexbench_core::drop_target::set_drag_out(false);
 
     stop.store(true, Ordering::SeqCst);
@@ -3701,6 +3856,7 @@ fn launcher_background_menu(path: String, app: AppHandle) -> Result<(), String> 
 fn launcher_context_menu(path: String, app: AppHandle) -> Result<Option<String>, String> {
     let target = PathBuf::from(&path);
     if !target.exists() {
+        log::warn!("launcher: context menu skipped, file is gone: {path}");
         return Err("文件已经不在了".to_string());
     }
     let (x, y) = hexbench_core::sys::cursor_position();
@@ -3802,10 +3958,50 @@ fn cache_clear(app: AppHandle) -> Result<u64, String> {
     let _ = app.emit("launcher-changed", ());
     Ok(freed)
 }
+/// 使用频率表：第一次用到时从盘上读，之后常驻内存。
+static USAGE: Mutex<Option<hexbench_core::usage::UsageData>> = Mutex::new(None);
+
+/// 拿使用频率表做点什么（读计数 / 记一次打开）。第一次调用时才读盘。
+fn with_usage<R>(app: &AppHandle, work: impl FnOnce(&mut hexbench_core::usage::UsageData) -> R) -> R {
+    let path = hexbench_core::usage::file_of(&app.state::<AppState>().config_path);
+    let mut guard = USAGE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let data = guard.get_or_insert_with(|| hexbench_core::usage::load(&path));
+    work(data)
+}
+
+/// 打开成功后记一次：面板里「使用频率」排序就是按它来的。
+fn record_use(app: &AppHandle, path: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let file = hexbench_core::usage::file_of(&app.state::<AppState>().config_path);
+    let result = with_usage(app, |data| {
+        data.record(path, now);
+        data.trim();
+        hexbench_core::usage::save(&file, data)
+    });
+    if let Err(error) = result {
+        log::warn!("usage: 写不进 {}（{error}）", file.display());
+    }
+}
+
+/// 面板要的「每个文件打开过几次」，路径和列表里的写法一致。
+#[tauri::command]
+fn launcher_usage(app: AppHandle) -> std::collections::HashMap<String, u32> {
+    with_usage(&app, |data| {
+        data.items
+            .iter()
+            .map(|(path, usage)| (path.clone(), usage.count))
+            .collect()
+    })
+}
 /// 面板里双击：交给系统默认程序。
 #[tauri::command]
-fn launcher_open(path: String) -> Result<(), String> {
-    hexbench_core::sys::open_path(PathBuf::from(path).as_path())
+fn launcher_open(path: String, app: AppHandle) -> Result<(), String> {
+    hexbench_core::sys::open_path(PathBuf::from(&path).as_path())?;
+    record_use(&app, &path);
+    Ok(())
 }
 /// 选一个文件夹作为面板的文件区。
 /// 选文件夹。`target` 为 `"root"` 时设置启动器根目录，否则设置文件区。
@@ -4270,22 +4466,27 @@ fn selftest_launcher_files(app: &AppHandle) -> String {
     );
 
     let icon_path = cut_dest.join("b.txt").to_string_lossy().to_string();
+    // 命令只把**缓存命中**的随返回值给出，没命中的在后台线程里抽、抽好发事件。
+    // 所以这里叫一次，然后看后台有没有把图真的写进缓存（面板靠这个落盘的
+    // PNG 走 hbicon:// 取图）。
+    let _ = tauri::async_runtime::block_on(launcher_icons(
+        app.clone(),
+        vec![icon_path.clone()],
+        None,
+    ));
     let mut icon_ok = false;
-    for _ in 0..5 {
-        let icons = tauri::async_runtime::block_on(launcher_icons(vec![icon_path.clone()]));
-        // 现在回的是缓存键：文件真落盘了才算拿到，面板才能用 hbicon:// 取到。
-        if icons
-            .first()
-            .and_then(|(_, key)| key.as_ref())
-            .is_some_and(|key| {
-                hexbench_core::icons::cache_file(key)
-                    .is_some_and(|file| file.metadata().map(|meta| meta.len() > 0).unwrap_or(false))
-            })
+    for _ in 0..20 {
+        if let Some(Some(key)) =
+            hexbench_core::icons::cached_icon_key(std::path::Path::new(&icon_path))
         {
-            icon_ok = true;
-            break;
+            if hexbench_core::icons::cache_file(&key)
+                .is_some_and(|file| file.metadata().map(|meta| meta.len() > 0).unwrap_or(false))
+            {
+                icon_ok = true;
+                break;
+            }
         }
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(150));
     }
     check!("icon", icon_ok, "文本文件应能从 Shell 拿到图标并写进缓存");
 
@@ -4699,6 +4900,7 @@ pub fn run() {
             launcher_save_location,
             launcher_icons,
             launcher_save_view,
+            launcher_usage,
             launcher_move_into,
             cache_stats,
             cache_clear,
