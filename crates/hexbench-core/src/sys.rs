@@ -16,8 +16,8 @@ use std::time::Duration;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
-    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, ScreenToClient, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, DESKTOP_READOBJECTS,
@@ -1129,6 +1129,24 @@ pub fn cursor_position() -> (i32, i32) {
             (point.x, point.y)
         } else {
             (0, 0)
+        }
+    }
+}
+
+/// 屏幕坐标 → 窗口客户区坐标（都是物理像素）。
+///
+/// 界面里判断「光标压在哪个格子 / 哪一行」用的是页面自己的客户区坐标。
+/// 面板每次呼出都会挪到鼠标旁边，而页面里的 `window.screenX/screenY`
+/// 在窗口被挪动后并不更新（实测停在第一次摆放的位置），前端拿它做减法
+/// 会整体偏掉，拖着文件指哪都不亮。所以坐标在交给界面之前就换算好。
+pub fn screen_to_client(hwnd: isize, x: i32, y: i32) -> (i32, i32) {
+    // SAFETY: ScreenToClient 只写一个 POINT；失败时原样返回。
+    unsafe {
+        let mut point = POINT { x, y };
+        if ScreenToClient(hwnd as *mut c_void, &mut point) != 0 {
+            (point.x, point.y)
+        } else {
+            (x, y)
         }
     }
 }

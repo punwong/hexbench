@@ -6,14 +6,15 @@
 //! 送给下面的主窗口（表现就是「拖不进面板」）。
 //!
 //! 这里手写一个最小的 `IDropTarget`（只认 `CF_HDROP` 路径列表），把
-//! enter / over / leave / drop 连同屏幕坐标交给上层。
+//! enter / over / leave / drop 连同**客户区**坐标交给上层（OLE 给的是屏幕
+//! 坐标，这里换算成窗口客户区坐标，界面直接拿去点到元素）。
 
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// 拖到窗口上的四个时刻。坐标是屏幕物理像素。
+/// 拖到窗口上的四个时刻。坐标是窗口客户区的物理像素。
 pub enum DropEvent {
     Enter { paths: Vec<PathBuf>, x: i32, y: i32 },
     Over { x: i32, y: i32 },
@@ -114,6 +115,8 @@ struct TargetVtbl {
 struct Target {
     vtbl: *const TargetVtbl,
     refs: AtomicU32,
+    /// 挂在这个窗口上：OLE 给的屏幕坐标要按它换算成客户区坐标。
+    hwnd: isize,
 }
 
 unsafe extern "system" fn query_interface(
@@ -155,6 +158,12 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
 }
 
+/// OLE 的 `POINTL` 是屏幕坐标：换成这个窗口的客户区坐标再交出去。
+unsafe fn client_point(this: *mut c_void, point: PointL) -> (i32, i32) {
+    let target = unsafe { &*(this as *const Target) };
+    crate::sys::screen_to_client(target.hwnd, point.x, point.y)
+}
+
 unsafe fn dispatch(event: DropEvent) {
     if let Some(lock) = HANDLER.get() {
         if let Ok(guard) = lock.lock() {
@@ -164,7 +173,7 @@ unsafe fn dispatch(event: DropEvent) {
 }
 
 unsafe extern "system" fn drag_enter(
-    _this: *mut c_void,
+    this: *mut c_void,
     data: *mut c_void,
     _keys: u32,
     point: PointL,
@@ -179,7 +188,7 @@ unsafe extern "system" fn drag_enter(
             return S_OK;
         }
         let paths = paths_from(data);
-        let (x, y) = (point.x, point.y);
+        let (x, y) = client_point(this, point);
         dispatch(DropEvent::Enter { paths, x, y });
         if !effect.is_null() {
             *effect = DROPEFFECT_COPY;
@@ -189,7 +198,7 @@ unsafe extern "system" fn drag_enter(
 }
 
 unsafe extern "system" fn drag_over(
-    _this: *mut c_void,
+    this: *mut c_void,
     _keys: u32,
     point: PointL,
     effect: *mut u32,
@@ -201,10 +210,8 @@ unsafe extern "system" fn drag_over(
             }
             return S_OK;
         }
-        dispatch(DropEvent::Over {
-            x: point.x,
-            y: point.y,
-        });
+        let (x, y) = client_point(this, point);
+        dispatch(DropEvent::Over { x, y });
         if !effect.is_null() {
             *effect = DROPEFFECT_COPY;
         }
@@ -220,7 +227,7 @@ unsafe extern "system" fn drag_leave(_this: *mut c_void) -> i32 {
 }
 
 unsafe extern "system" fn drop_item(
-    _this: *mut c_void,
+    this: *mut c_void,
     data: *mut c_void,
     _keys: u32,
     point: PointL,
@@ -233,12 +240,9 @@ unsafe extern "system" fn drop_item(
             }
             return S_OK;
         }
+        let (x, y) = client_point(this, point);
         let paths = paths_from(data);
-        dispatch(DropEvent::Drop {
-            paths,
-            x: point.x,
-            y: point.y,
-        });
+        dispatch(DropEvent::Drop { paths, x, y });
         if !effect.is_null() {
             *effect = DROPEFFECT_COPY;
         }
@@ -336,6 +340,7 @@ fn register_one(hwnd: isize) -> Result<(), String> {
     let target = Box::new(Target {
         vtbl: &VTBL,
         refs: AtomicU32::new(1),
+        hwnd,
     });
     let raw = Box::into_raw(target);
     let mut result = unsafe { RegisterDragDrop(hwnd as *mut c_void, raw as *mut c_void) };

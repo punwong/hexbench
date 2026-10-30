@@ -558,10 +558,14 @@ function Launcher() {
         else disposers.push(fn);
       });
     };
-    // 面板自己的拖放目标收不到 OLE 事件，光标位置由后端轮询发过来。
+    // 面板自己的拖放目标收不到 OLE 事件，光标位置由后端发过来。
+    // 后端给的是**客户区**坐标（物理像素），除以缩放就是页面里 elementFromPoint
+    // 要的坐标。千万别在这里减 window.screenX/screenY：面板每次呼出都会挪到
+    // 鼠标旁边，页面里的 screenX/screenY 挪完不更新，减出来整体偏掉，
+    // 拖着文件指哪都不亮。
     const toClient = (x: number, y: number) => {
       const ratio = window.devicePixelRatio || 1;
-      return { x: x / ratio - window.screenX, y: y / ratio - window.screenY };
+      return { x: x / ratio, y: y / ratio };
     };
     const folderAtClient = (x: number, y: number) => {
       const node = document.elementFromPoint(x, y);
@@ -1424,8 +1428,6 @@ function Launcher() {
     return () => document.removeEventListener("keydown", onKey);
   }, [reload]);
 
-  // 侧边栏是「悬停即切换」，但鼠标划过整列时会一路触发，
-  // 列表跟着重排，看起来就是分类和常用文件夹来回亮、来回跳。
   // 主题跟随设置（不只是系统）：面板要跟设置窗口一致
   useEffect(() => {
     const apply = () =>
@@ -1443,6 +1445,8 @@ function Launcher() {
     return () => query.removeEventListener("change", onChange);
   }, []);
 
+  // 侧边栏是「悬停即切换」，但鼠标划过整列时会一路触发，
+  // 列表跟着重排，看起来就是分类和常用文件夹来回亮、来回跳。
   // 高亮由 CSS :hover 立刻响应，这里只控制"切换内容"的时机。
   const hoverTimer = useRef<number | null>(null);
   const hoverOpen = (action: () => void) => {
@@ -1525,6 +1529,8 @@ function Launcher() {
   const sidebarRef = useRef<HTMLElement | null>(null);
   const sideHlRef = useRef<HTMLElement | null>(null);
   const sideHlPlaced = useRef(false);
+  const sideHlTop = useRef<number | null>(null);
+  const sideHlAt = useRef(0);
   useLayoutEffect(() => {
     const rail = sidebarRef.current;
     const pill = sideHlRef.current;
@@ -1535,10 +1541,21 @@ function Launcher() {
       return;
     }
     pill.style.opacity = "1";
+    const top = active.offsetTop;
+    const previous = sideHlTop.current;
+    const now = performance.now();
+    // 一下跳了好几行、或者连着切（鼠标快速划过整列）：直接换位置，别滑。
+    // 滑块是追着跑的，240ms 的滑动在快速扫动时只会拖在后面显得慢。
+    const jumped = previous !== null && Math.abs(top - previous) > active.offsetHeight * 1.5;
+    const rapid = previous !== null && previous !== top && now - sideHlAt.current < 260;
+    if (previous !== top) {
+      sideHlTop.current = top;
+      sideHlAt.current = now;
+    }
     pill.style.height = `${active.offsetHeight}px`;
-    pill.style.transform = `translateY(${active.offsetTop}px)`;
-    if (!sideHlPlaced.current) {
-      // 第一次出现时别从顶上滑下来。
+    pill.style.transform = `translateY(${top}px)`;
+    if (!sideHlPlaced.current || jumped || rapid) {
+      // 第一次出现时也别从顶上滑下来。
       sideHlPlaced.current = true;
       pill.classList.add("still");
       requestAnimationFrame(() => pill.classList.remove("still"));

@@ -1719,18 +1719,33 @@ fn open_main_now(app: &AppHandle) {
 /// 懒创建、之后常驻隐藏：呼出要的是「按一下就出」，重建 WebView2 要几百毫秒，
 /// 手感立刻垮掉。第一次呼出慢一点，之后只是一次 show。
 /// 拖拽一开始就把文件列表记下来：光标进入面板后 OLE 就不再发事件了，
-/// 只能自己盯着光标，松手时若还在面板里就当成落在这里。
+/// 只能自己盯着光标，松手时若还在面板里就当成落在这里（光标拖出去再拖回来也一样）。
 static DRAG_WATCHING: AtomicBool = AtomicBool::new(false);
 
+/// 外部拖拽期间盯光标：自己每 25ms 看一次光标在哪，不靠系统的拖放事件。
+///
+/// 系统只在光标进出窗口时各发一次事件，光标拖出面板再拖回来时这条路上
+/// 不一定齐全；从面板自己的拖放目标收到「拖进来了」就开始盯，直到松手，
+/// 界面才能一直跟着光标切换、也才落得准。
 fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
-    if paths.is_empty() || DRAG_WATCHING.swap(true, Ordering::SeqCst) {
+    if DRAG_WATCHING.swap(true, Ordering::SeqCst) {
         return;
     }
+    // 和面板内部的拖拽一样，交给界面的坐标用客户区坐标。
+    let hwnd = app
+        .get_webview_window("launcher")
+        .and_then(|window| window.hwnd().ok())
+        .map(|handle| handle.0 as isize);
     thread::spawn(move || {
         let mut last_inside = false;
         loop {
-            thread::sleep(Duration::from_millis(60));
+            // 25ms 一次：拖拽时界面靠它判断指着哪一行，慢了看着就像「跟不上手」。
+            thread::sleep(Duration::from_millis(25));
             let (x, y) = hexbench_core::sys::cursor_position();
+            let (client_x, client_y) = match hwnd {
+                Some(hwnd) => hexbench_core::sys::screen_to_client(hwnd, x, y),
+                None => (x, y),
+            };
             let frame = app.get_webview_window("launcher").and_then(|window| {
                 if !window.is_visible().unwrap_or(false) {
                     return None;
@@ -1753,19 +1768,26 @@ fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
             if inside != last_inside {
                 last_inside = inside;
                 let _ = if inside {
-                    app.emit("launcher-drag-pos", serde_json::json!({ "x": x, "y": y }))
+                    app.emit(
+                        "launcher-drag-pos",
+                        serde_json::json!({ "x": client_x, "y": client_y }),
+                    )
                 } else {
                     app.emit("launcher-drag-leave", ())
                 };
             } else if inside {
-                let _ = app.emit("launcher-drag-pos", serde_json::json!({ "x": x, "y": y }));
+                let _ = app.emit(
+                    "launcher-drag-pos",
+                    serde_json::json!({ "x": client_x, "y": client_y }),
+                );
             }
             if !hexbench_core::sys::left_button_down() {
-                // 松手：还在面板里就是落在这里了。
-                if inside {
+                // 松手：还在面板里就是落在这里了（没有文件列表（拖的不是文件）
+                // 就只收起落点提示）。
+                if inside && !paths.is_empty() {
                     let _ = app.emit(
                         "launcher-dropped",
-                        serde_json::json!({ "x": x, "y": y, "paths": paths }),
+                        serde_json::json!({ "x": client_x, "y": client_y, "paths": paths }),
                     );
                 } else {
                     let _ = app.emit("launcher-drag-leave", ());
@@ -1819,7 +1841,22 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
                     Box::new(move |event| {
                         use hexbench_core::drop_target::DropEvent;
                         match event {
-                            DropEvent::Enter { x, y, .. } | DropEvent::Over { x, y } => {
+                            DropEvent::Enter { paths, x, y } => {
+                                // 拖拽期间自己盯光标，不靠系统的进出事件：光标拖出面板
+                                // 再拖回来，这条路上事件不一定齐全（离开发了、回来没发），
+                                // 界面就会一直停在上一次的位置。进了面板就开始盯，
+                                // 松手时它自己收尾。
+                                let list: Vec<String> = paths
+                                    .iter()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .collect();
+                                watch_external_drag(app.clone(), list);
+                                let _ = app.emit(
+                                    "launcher-drag-pos",
+                                    serde_json::json!({ "x": x, "y": y }),
+                                );
+                            }
+                            DropEvent::Over { x, y } => {
                                 let _ = app.emit(
                                     "launcher-drag-pos",
                                     serde_json::json!({ "x": x, "y": y }),
@@ -3542,6 +3579,12 @@ fn run_file_drag(app: &AppHandle, targets: &[PathBuf]) -> Result<u32, String> {
     });
 
     // 拖拽期间轮询光标：面板自己的拖放目标收不到 OLE 事件，只能自己看光标在哪。
+    // 坐标要换成面板的客户区坐标——页面里的 `window.screenX/screenY` 在窗口
+    // 挪过位置以后不更新，交给前端去减会整体偏掉（拖着文件指哪都不亮）。
+    let hwnd = app
+        .get_webview_window("launcher")
+        .and_then(|window| window.hwnd().ok())
+        .map(|handle| handle.0 as isize);
     let stop = Arc::new(AtomicBool::new(false));
     let poller = {
         let app = app.clone();
@@ -3549,11 +3592,15 @@ fn run_file_drag(app: &AppHandle, targets: &[PathBuf]) -> Result<u32, String> {
         thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 let (x, y) = hexbench_core::sys::cursor_position();
+                let (x, y) = match hwnd {
+                    Some(hwnd) => hexbench_core::sys::screen_to_client(hwnd, x, y),
+                    None => (x, y),
+                };
                 let _ = app.emit(
                     "launcher-drag-pos",
                     serde_json::json!({ "x": x, "y": y }),
                 );
-                thread::sleep(Duration::from_millis(60));
+                thread::sleep(Duration::from_millis(25));
             }
         })
     };
@@ -3571,6 +3618,10 @@ fn run_file_drag(app: &AppHandle, targets: &[PathBuf]) -> Result<u32, String> {
         if let Some((left, top, width, height)) = frame {
             let (x, y) = hexbench_core::sys::cursor_position();
             if x >= left && y >= top && x < left + width && y < top + height {
+                let (x, y) = match hwnd {
+                    Some(hwnd) => hexbench_core::sys::screen_to_client(hwnd, x, y),
+                    None => (x, y),
+                };
                 let list: Vec<String> = targets
                     .iter()
                     .map(|path| path.to_string_lossy().to_string())
@@ -5056,12 +5107,24 @@ pub fn run() {
                                 && cursor_x < position.x + size.width as i32
                                 && cursor_y < position.y + size.height as i32;
                             if inside {
+                                // 界面按客户区坐标找元素。
+                                let (client_x, client_y) = launcher
+                                    .hwnd()
+                                    .ok()
+                                    .map(|handle| {
+                                        hexbench_core::sys::screen_to_client(
+                                            handle.0 as isize,
+                                            cursor_x,
+                                            cursor_y,
+                                        )
+                                    })
+                                    .unwrap_or((cursor_x, cursor_y));
                                 match drop {
                                     tauri::DragDropEvent::Enter { .. }
                                     | tauri::DragDropEvent::Over { .. } => {
                                         let _ = app.emit(
                                             "launcher-drag-pos",
-                                            serde_json::json!({ "x": cursor_x, "y": cursor_y }),
+                                            serde_json::json!({ "x": client_x, "y": client_y }),
                                         );
                                     }
                                     tauri::DragDropEvent::Drop { paths, .. } => {
@@ -5072,8 +5135,8 @@ pub fn run() {
                                         let _ = app.emit(
                                             "launcher-dropped",
                                             serde_json::json!({
-                                                "x": cursor_x,
-                                                "y": cursor_y,
+                                                "x": client_x,
+                                                "y": client_y,
                                                 "paths": list,
                                             }),
                                         );
