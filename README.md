@@ -429,7 +429,7 @@ Tauri 2 的窗口列表留空——**启动后只有托盘图标，不创建任�
 | `monitors.overrides` | map | `{}` | — | 每屏开关，按 EDID 作键，**仅本地** |
 | `launcher.root` | string | `""` | — | 启动器根目录，每个子文件夹是一个分类 |
 | `launcher.folders` | string[] | `[]` | — | 快速访问：钉在侧边栏的文件夹 |
-| `launcher.widthPercent` / `launcher.heightPercent` | u32 | `50` / `50` | 25–80 | 呼出面板占工作区百分比 |
+| `launcher.widthPercent` / `launcher.heightPercent` | u32 | `60` / `60` | 25–80 | 呼出面板占工作区百分比 |
 | `launcher.followCursor` | bool | `true` | — | 呼出时贴着鼠标 |
 | `launcher.panelRememberSize` | bool | `true` | — | 记住拖出来的面板大小 |
 | `launcher.webEnabled` | bool | `true` | — | 内置网页总开关 |

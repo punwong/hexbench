@@ -262,15 +262,15 @@ impl Default for LauncherSettings {
             site_pct_w: 0,
             site_pct_h: 0,
             legacy_folder: String::new(),
-            // 默认就是「贴着鼠标 + 面板占一半」，和产品设定一致。
+            // 默认就是「贴着鼠标 + 面板占六成」，和产品设定一致。
             follow_cursor: true,
-            width_percent: 50,
+            width_percent: 60,
             panel_remember_size: true,
             panel_w: 0,
             panel_h: 0,
             panel_pct_w: 0,
             panel_pct_h: 0,
-            height_percent: 50,
+            height_percent: 60,
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,

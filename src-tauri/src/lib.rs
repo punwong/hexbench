@@ -1694,9 +1694,18 @@ fn open_main_now(app: &AppHandle) {
             return;
     }
 
+    // 设置窗口和呼出面板同一套比例：默认占所在屏幕工作区的六成。
+    let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
+    let (width, height) = match hexbench_core::sys::work_area_at(cursor_x, cursor_y) {
+        Some((left, top, right, bottom)) => (
+            ((right - left) * 60 / 100).max(840) as f64,
+            ((bottom - top) * 60 / 100).max(560) as f64,
+        ),
+        None => (980.0, 660.0),
+    };
     let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("HexBench")
-        .inner_size(980.0, 660.0)
+        .inner_size(width, height)
         .min_inner_size(840.0, 560.0)
         // The app draws its own title bar and window buttons.
         .decorations(false)
