@@ -405,3 +405,8 @@ export async function siteTitle(url: string): Promise<string> {
   if (!isTauri || !url.trim()) return "";
   return invoke<string>("site_title", { url });
 }
+/// 面板里点「设置」时主窗口不在：目标页由后端存着，页面挂载后来取。
+export async function takePendingPage(): Promise<[string, string | null] | null> {
+  if (!isTauri) return null;
+  return invoke<[string, string | null] | null>("take_pending_page");
+}

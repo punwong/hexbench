@@ -713,7 +713,10 @@
       }
       /* 侧边栏右键菜单 */
   .ctx-menu {
-    position: absolute;
+    /* 相对窗口定位，和右键时的 clientX/clientY 同一个坐标系。放在侧边栏
+       （relative + 可滚动）里面用 absolute 的话，菜单会跟着滚动位置上下偏，
+       贴着底边时还会被滚出可视区。 */
+    position: fixed;
     z-index: 40;
     min-width: 132px;
     padding: 5px;

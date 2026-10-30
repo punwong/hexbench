@@ -27,6 +27,7 @@ import {
   setAutostart,
   setTestMode,
   showTriggerOverlay,
+  takePendingPage,
 } from "./api";
 import type { Config, Snapshot } from "./types";
 import {
@@ -63,21 +64,41 @@ const TITLES: Record<Page, { title: string; subtitle: string }> = {
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
   const [launcherTab, setLauncherTab] = useState<"items" | "folders" | "sites">("items");
+  const applyNavigate = useCallback((payload: { page: string; tab: string | null } | null) => {
+    const target = payload?.page ?? "overview";
+    const tab = payload?.tab ?? null;
+    if (target === "launcher" && (tab === "items" || tab === "folders" || tab === "sites")) {
+      setLauncherTab(tab as "items" | "folders" | "sites");
+    }
+    setPage(target as Page);
+  }, []);
+
   // 面板里点「去设置」：切到指定页面（可带 tab）。
   useEffect(() => {
+    let alive = true;
     let dispose: (() => void) | undefined;
     void listen<{ page: string; tab: string | null } | null>("navigate", (event) => {
-      const target = event.payload?.page ?? "overview";
-      const tab = event.payload?.tab ?? null;
-      if (target === "launcher" && (tab === "items" || tab === "folders" || tab === "sites")) {
-        setLauncherTab(tab as "items" | "folders" | "sites");
-      }
-      setPage(target as Page);
+      applyNavigate(event.payload);
     }).then((fn) => {
-      dispose = fn;
+      // 监听是异步拿到的：effect 可能已经拆掉（开发模式下还会连跑两遍），
+      // 这时候再挂上就永远没人注销了。
+      if (alive) dispose = fn;
+      else fn();
     });
-    return () => dispose?.();
-  }, []);
+    return () => {
+      alive = false;
+      dispose?.();
+    };
+  }, [applyNavigate]);
+  // 这次窗口是「点设置」临时建出来的：真正要打开的那一页存在后端，
+  // 挂载时来取一次——之前主窗口不在时那个事件发给空气，点了没反应。
+  useEffect(() => {
+    void takePendingPage()
+      .then((pending) => {
+        if (pending) applyNavigate({ page: pending[0], tab: pending[1] });
+      })
+      .catch(() => {});
+  }, [applyNavigate]);
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -88,22 +109,34 @@ export default function App() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
+  // 再查一次的时候要不要保留当前进度：包已经下好（ready）或正在下的时候
+  // 一律不回到 checking —— 否则查完又变成 available，会重新下载一遍，
+  // 「更新并重启」也跟着消失。
+  const updatePhaseRef = useRef<UpdatePhase>("idle");
+  useEffect(() => {
+    updatePhaseRef.current = updatePhase;
+  }, [updatePhase]);
+
   const runCheck = useCallback(async (silent: boolean) => {
-    setUpdatePhase("checking");
+    const stable =
+      updatePhaseRef.current === "downloading" || updatePhaseRef.current === "ready";
+    if (!stable) setUpdatePhase("checking");
     setUpdateError(null);
     try {
       const info = await checkUpdate();
       if (!info) {
-        setUpdateVersion(null);
-        setUpdatePhase("idle");
+        if (!stable) {
+          setUpdateVersion(null);
+          setUpdatePhase("idle");
+        }
         return;
       }
       setUpdateVersion(info.version);
-      setUpdatePhase("available");
+      if (!stable) setUpdatePhase("available");
     } catch (reason) {
       setUpdateError(String(reason));
       // A failed automatic check should stay quiet; a manual one should not.
-      setUpdatePhase(silent ? "idle" : "error");
+      if (!stable) setUpdatePhase(silent ? "idle" : "error");
     }
   }, []);
 
@@ -192,7 +225,9 @@ export default function App() {
       } catch (reason) {
         if (alive) setError(String(reason));
       }
-      // The layout diagram polls the cursor on its own; this only refreshes\n        // config/stats, so it can be slow.\n        if (alive) timer = window.setTimeout(poll, 500);
+      // The layout diagram polls the cursor on its own; this only refreshes
+      // config/stats, so it can be slow.
+      if (alive) timer = window.setTimeout(poll, 500);
     };
 
     void poll();
@@ -204,9 +239,40 @@ export default function App() {
 
 
 
-  const update = useCallback((patch: Patch) => {
+  // 后端有些命令会绕过前端直接改配置（同步设置、常用语、面板折叠）。
+  // 收到通知就重读一份，否则这边手里那份旧配置在下次保存时会把刚改的
+  // 字段整份盖回去——比如填好的 WebDAV 地址、刚编辑的话术。
+  useEffect(() => {
+    let alive = true;
+    let dispose: (() => void) | undefined;
+    void listen("config-changed", () => {
+      // 自己刚改的还没落盘：等这笔存完再说，别把正在输入的盖掉。
+      if (saveTimer.current !== undefined) return;
+      void getSnapshot()
+        .then((next) => {
+          if (!alive) return;
+          setSnap(next);
+          configRef.current = next.config;
+          setConfig(next.config);
+        })
+        .catch(() => {});
+    }).then((fn) => {
+      if (alive) dispose = fn;
+      else fn();
+    });
+    return () => {
+      alive = false;
+      dispose?.();
+    };
+  }, []);
+
+  const update = useCallback((input: Patch | ((current: Config) => Patch | null)) => {
     const current = configRef.current;
     if (!current) return;
+    // 也接受「按最新配置算补丁」的写法：网络请求之类的异步回调里，
+    // 闭包拿到的列表可能已经过时，整份写回去会把中间做过的改动冲掉。
+    const patch = typeof input === "function" ? input(current) : input;
+    if (!patch) return;
     const next: Config = {
       ...current,
       ...patch,
@@ -222,6 +288,7 @@ export default function App() {
     setConfig(next);
     window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
+      saveTimer.current = undefined;
       void saveConfig(next)
         .then(() => setError(null))
         .catch((reason) => setError(String(reason)));
@@ -245,8 +312,15 @@ export default function App() {
 
   // Snapshot refreshes twice a second; the switch must react on click.
   const [testModeLocal, setTestModeLocal] = useState<boolean | null>(null);
+  // 刚点下的值：快照要半秒才追上，这期间别拿旧值把开关盖回去。
+  const testModeWant = useRef<boolean | null>(null);
   useEffect(() => {
-    if (snap) setTestModeLocal(snap.testMode);
+    if (!snap) return;
+    if (testModeWant.current !== null) {
+      if (snap.testMode !== testModeWant.current) return;
+      testModeWant.current = null;
+    }
+    setTestModeLocal(snap.testMode);
   }, [snap?.testMode]);
   const testMode = testModeLocal ?? snap?.testMode ?? false;
 
@@ -386,8 +460,13 @@ export default function App() {
             monitors={snap.monitors}
             testMode={testMode}
             onTest={(value) => {
+              testModeWant.current = value;
               setTestModeLocal(value);
-              void setTestMode(value);
+              void setTestMode(value).catch((reason) => {
+                testModeWant.current = null;
+                setTestModeLocal(null);
+                setError(String(reason));
+              });
             }}
             onPreview={() => {
               void showTriggerOverlay().catch((reason) => setError(String(reason)));

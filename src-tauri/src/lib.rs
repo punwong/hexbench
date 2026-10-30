@@ -144,6 +144,10 @@ struct AppState {
     /// Panel is open on `panel_desktop_id`; a desktop switch hides it.
     panel_open: AtomicBool,
     panel_desktop_id: Mutex<Option<Vec<u8>>>,
+    /// 面板里点了「设置」但主窗口这会儿不在：记下要去哪一页，
+    /// 等窗口（和页面）起来之后由前端来取。主窗口关掉一阵子会被销毁，
+    /// 直接 emit 会发给一个还不存在的页面，用户看到的就是「点齿轮没反应」。
+    pending_page: Mutex<Option<(String, Option<String>)>>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -310,6 +314,29 @@ fn save_config(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
+    // 设置窗口发回来的是它手里那份整份配置，可能已经旧了：面板尺寸、网页
+    // 窗口几何、上次停留的位置、同步时间戳只有后端在写（面板收起时记、
+    // 拖动时记），拿旧快照覆盖就会把这些刚记下的值冲回旧值——表现就是
+    // 「设置里改了一处，面板又回到上次的位置/尺寸」。这些字段以内存为准。
+    let mut config = config;
+    {
+        let shared = state.shared.lock().unwrap();
+        let live = &shared.config.launcher;
+        let launcher = &mut config.launcher;
+        launcher.panel_w = live.panel_w;
+        launcher.panel_h = live.panel_h;
+        launcher.panel_pct_w = live.panel_pct_w;
+        launcher.panel_pct_h = live.panel_pct_h;
+        launcher.site_x = live.site_x;
+        launcher.site_y = live.site_y;
+        launcher.site_w = live.site_w;
+        launcher.site_h = live.site_h;
+        launcher.site_pct_w = live.site_pct_w;
+        launcher.site_pct_h = live.site_pct_h;
+        launcher.last_location = live.last_location.clone();
+        config.sync.last_push = shared.config.sync.last_push;
+        config.sync.last_pull = shared.config.sync.last_pull;
+    }
     config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
     {
         let mut shared = state.shared.lock().unwrap();
@@ -638,13 +665,21 @@ fn open_overlay(app: &AppHandle) -> Result<(), String> {
         return Err(error.to_string());
     }
     log::info!("overlay: shown at {origin_x},{origin_y} {width}x{height} ({} bands, {} zones)", payload.bands.len(), payload.zones.len());
-    overlay
-        .emit("overlay-zones", payload)
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = overlay.emit("overlay-zones", payload) {
+        // 交不过去就别把它晾在屏幕上。
+        let _ = overlay.hide();
+        return Err(error.to_string());
+    }
 
+    // 每次预览一个编号：5 秒内又点了一次，让后一次自己收尾，前一次的定时器
+    // 不能把刚显示的预览关掉。
+    let generation = OVERLAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let handle = overlay.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(5000));
+        if OVERLAY_GEN.load(Ordering::SeqCst) != generation {
+            return;
+        }
         let _ = handle.hide();
     });
 
@@ -693,19 +728,28 @@ fn phrase_items(state: State<'_, AppState>) -> Vec<PhraseDto> {
 
 /// Persist the phrase list edited inside the panel.
 #[tauri::command]
-fn phrase_save(items: Vec<PhraseDto>, state: State<'_, AppState>) -> Result<(), String> {
-    let mut shared = state.shared.lock().unwrap();
-    let mut config = shared.config.clone();
-    config.phrases.items = items
-        .into_iter()
-        .map(|dto| hexbench_core::config::Phrase {
-            id: dto.id,
-            title: dto.title,
-            text: dto.text,
-        })
-        .collect();
-    config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
-    shared.config = config;
+fn phrase_save(
+    app: AppHandle,
+    items: Vec<PhraseDto>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut shared = state.shared.lock().unwrap();
+        let mut config = shared.config.clone();
+        config.phrases.items = items
+            .into_iter()
+            .map(|dto| hexbench_core::config::Phrase {
+                id: dto.id,
+                title: dto.title,
+                text: dto.text,
+            })
+            .collect();
+        config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
+        shared.config = config;
+    }
+    // 设置窗口里也有一份配置：这里改了要说一声，否则它下次保存会拿旧值
+    // 把刚改的常用语整份盖回去。
+    let _ = app.emit("config-changed", ());
     Ok(())
 }
 
@@ -790,13 +834,19 @@ fn panel_close(app: AppHandle) {
 
 /// Persist the panel's "click to send" toggle.
 #[tauri::command]
-fn phrase_send_mode(send: bool, state: State<'_, AppState>) -> Result<(), String> {
+fn phrase_send_mode(
+    send: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let config = {
         let mut shared = state.shared.lock().unwrap();
         shared.config.phrases.send_on_click = send;
         shared.config.clone()
     };
-    config::save(&state.config_path, &config).map_err(|error| error.to_string())
+    config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
+    let _ = app.emit("config-changed", ());
+    Ok(())
 }
 
 /// Collapse the panel into a small icon, or expand it again.
@@ -835,7 +885,11 @@ fn panel_collapse(collapsed: bool, app: AppHandle) {
         shared.config.clone()
     };
     let _ = config::save(&state.config_path, &config);
+    let _ = app.emit("config-changed", ());
 }
+
+/// 进编辑前的前台窗口（聊天应用）：编辑结束时把焦点还给它。
+static PREV_FOREGROUND: Mutex<Option<isize>> = Mutex::new(None);
 
 /// Editing inside the panel needs keyboard focus, so the window is made
 /// activatable while the edit mode is on.
@@ -844,9 +898,27 @@ fn panel_editing(editing: bool, app: AppHandle) {
     if let Some(window) = app.get_webview_window("phrases") {
         if let Ok(hwnd) = window.hwnd() {
             hexbench_core::sys::set_no_activate(hwnd.0 as isize, !editing);
+            let hwnd = hwnd.0 as isize;
+            if editing {
+                // 借焦点之前记下原来是谁在前台。退出编辑只恢复「不抢焦点」
+                // 这个样式，前台窗口还留在面板上——接着点一条常用语，
+                // SendInput 就打进了面板自己，聊天框一个字都没有。
+                let previous = hexbench_core::sys::foreground_hwnd().filter(|held| *held != hwnd);
+                if let Ok(mut slot) = PREV_FOREGROUND.lock() {
+                    *slot = previous;
+                }
+            }
         }
         if editing {
             let _ = window.set_focus();
+        } else {
+            // 焦点还给聊天窗口（已经关掉 / 换了前台就不管）。
+            let previous = PREV_FOREGROUND.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(previous) = previous {
+                if hexbench_core::sys::window_visible(previous) {
+                    hexbench_core::sys::force_foreground(previous);
+                }
+            }
         }
     }
 }
@@ -886,7 +958,7 @@ fn sync_client(state: &AppState) -> Result<hexbench_core::sync::WebDav, String> 
     Ok(hexbench_core::sync::WebDav::new(&url, &username, &password))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_test(
     url: String,
     username: String,
@@ -909,6 +981,7 @@ fn sync_save(
     username: String,
     password: String,
     enabled: bool,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let config = {
@@ -922,10 +995,13 @@ fn sync_save(
         settings.enabled = enabled;
         shared.config.clone()
     };
-    config::save(&state.config_path, &config).map_err(|error| error.to_string())
+    config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
+    // 这些字段是后端直接写的：告诉设置窗口，别让它下次保存时用旧值盖回去。
+    let _ = app.emit("config-changed", ());
+    Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_push(state: State<'_, AppState>) -> Result<String, String> {
     let client = sync_client(state.inner())?;
     let mut config = state.shared.lock().unwrap().config.clone();
@@ -943,8 +1019,8 @@ fn sync_push(state: State<'_, AppState>) -> Result<String, String> {
     Ok("已上传".to_string())
 }
 
-#[tauri::command]
-fn sync_pull(state: State<'_, AppState>) -> Result<String, String> {
+#[tauri::command(async)]
+fn sync_pull(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let client = sync_client(state.inner())?;
     let Some(text) = client.get(SYNC_FILE)? else {
         return Err("远程还没有配置文件，先上传一次".to_string());
@@ -963,6 +1039,7 @@ fn sync_pull(state: State<'_, AppState>) -> Result<String, String> {
         config::save(&state.config_path, &remote).map_err(|error| error.to_string())?;
         shared.config = remote;
     }
+    let _ = app.emit("config-changed", ());
     Ok("已拉取并应用".to_string())
 }
 
@@ -1455,6 +1532,18 @@ fn open_phrases_panel_now(app: &AppHandle) {
         } else {
             place_panel(app, &window);
             let _ = window.show();
+            // show() 会让 Tauri 重新应用窗口样式，把构建时设的「不抢焦点」
+            // 冲掉；不补回来，点面板就会从聊天窗口抢走焦点，常用语打不出去。
+            // 正在编辑时例外：那会儿就是要焦点。
+            let editing = PREV_FOREGROUND
+                .lock()
+                .map(|slot| slot.is_some())
+                .unwrap_or(false);
+            if !editing {
+                if let Ok(hwnd) = window.hwnd() {
+                    hexbench_core::sys::set_no_activate(hwnd.0 as isize, true);
+                }
+            }
             set_panel_open(app, true);
         }
         return;
@@ -1685,6 +1774,20 @@ fn check_update_if_stale(app: &AppHandle) {
     });
 }
 
+/// 光标所在显示器的缩放比例（物理像素 ÷ 逻辑像素）。
+///
+/// `work_area_at` 返回的是**物理**像素，而窗口的尺寸 / 位置接口按**逻辑**值
+/// 使用；两边不换算，125% / 150% 缩放下算出来的位置会跑到屏幕外，或者面板
+/// 一次比一次小。
+fn scale_at_cursor(app: &AppHandle) -> f64 {
+    let (x, y) = hexbench_core::sys::cursor_position();
+    app.monitor_from_point(x as f64, y as f64)
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0)
+}
+
 fn open_main_now(app: &AppHandle) {
     check_update_if_stale(app);
     if let Some(window) = app.get_webview_window("main") {
@@ -1695,11 +1798,13 @@ fn open_main_now(app: &AppHandle) {
     }
 
     // 设置窗口和呼出面板同一套比例：默认占所在屏幕工作区的六成。
+    // 工作区是物理像素，窗口尺寸要逻辑值，先按这块屏的缩放换算。
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
+    let scale = scale_at_cursor(app);
     let (width, height) = match hexbench_core::sys::work_area_at(cursor_x, cursor_y) {
         Some((left, top, right, bottom)) => (
-            ((right - left) * 60 / 100).max(840) as f64,
-            ((bottom - top) * 60 / 100).max(560) as f64,
+            (((right - left) * 60 / 100) as f64 / scale).max(840.0),
+            (((bottom - top) * 60 / 100) as f64 / scale).max(560.0),
         ),
         None => (980.0, 660.0),
     };
@@ -1721,6 +1826,28 @@ fn open_main_now(app: &AppHandle) {
 /// 拖拽一开始就把文件列表记下来：光标进入面板后 OLE 就不再发事件了，
 /// 只能自己盯着光标，松手时若还在面板里就当成落在这里（光标拖出去再拖回来也一样）。
 static DRAG_WATCHING: AtomicBool = AtomicBool::new(false);
+/// 拖拽被取消过（按 Esc）：系统会在光标**还在面板里**的时候发一次 DragLeave。
+/// 不记下来的话，接着松开左键会被盯光标的线程当成有效落点，文件在用户已经
+/// 取消的情况下真的被移走。
+static DRAG_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// 光标此刻是否落在可见的面板里（物理像素比较）。
+fn cursor_inside_launcher(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("launcher") else {
+        return false;
+    };
+    if !panel_visible(&window).unwrap_or(false) {
+        return false;
+    }
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
+        return false;
+    };
+    let (x, y) = hexbench_core::sys::cursor_position();
+    x >= position.x
+        && y >= position.y
+        && x < position.x + size.width as i32
+        && y < position.y + size.height as i32
+}
 
 /// 外部拖拽期间盯光标：自己每 25ms 看一次光标在哪，不靠系统的拖放事件。
 ///
@@ -1731,6 +1858,7 @@ fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
     if DRAG_WATCHING.swap(true, Ordering::SeqCst) {
         return;
     }
+    DRAG_CANCELLED.store(false, Ordering::SeqCst);
     // 和面板内部的拖拽一样，交给界面的坐标用客户区坐标。
     let hwnd = app
         .get_webview_window("launcher")
@@ -1783,8 +1911,11 @@ fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
             }
             if !hexbench_core::sys::left_button_down() {
                 // 松手：还在面板里就是落在这里了（没有文件列表（拖的不是文件）
-                // 就只收起落点提示）。
-                if inside && !paths.is_empty() {
+                // 就只收起落点提示）。取消过的拖拽（Esc）不算落点——那时系统
+                // 已经发过 DragLeave、光标却还在面板里，再照常落下去就是把
+                // 用户取消掉的文件移走。
+                let cancelled = DRAG_CANCELLED.swap(false, Ordering::SeqCst);
+                if inside && !paths.is_empty() && !cancelled {
                     let _ = app.emit(
                         "launcher-dropped",
                         serde_json::json!({ "x": client_x, "y": client_y, "paths": paths }),
@@ -1863,6 +1994,10 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
                                 );
                             }
                             DropEvent::Leave => {
+                                // 光标还在面板里就收到 Leave：按 Esc 取消了拖拽。
+                                if cursor_inside_launcher(&app) {
+                                    DRAG_CANCELLED.store(true, Ordering::SeqCst);
+                                }
                                 let _ = app.emit("launcher-drag-leave", ());
                             }
                             DropEvent::Drop { paths, x, y } => {
@@ -1958,7 +2093,16 @@ fn place_launcher(window: &tauri::WebviewWindow, follow_cursor: bool, size_perce
 
     // 尺寸按工作区的百分比算，换显示器也不会一下子占满或小得没法用。
     let (width, height) = match saved_size {
-        Some((saved_w, saved_h)) => (saved_w as i32, saved_h as i32),
+        // 记下来的尺寸是逻辑像素（store_panel_size 里除过缩放）；下面是
+        // PhysicalSize，先乘回这块屏的缩放。以前直接当物理值用，125% / 150%
+        // 下每呼出一次就小一圈，最后缩到最小尺寸。
+        Some((saved_w, saved_h)) => {
+            let scale = scale_at_cursor(window.app_handle());
+            (
+                (saved_w as f64 * scale).round() as i32,
+                (saved_h as f64 * scale).round() as i32,
+            )
+        }
         None => match area {
         Some((left, top, right, bottom)) => {
             let width = ((right - left) * size_percent.0 as i32 / 100).clamp(520, 1400);
@@ -1997,6 +2141,8 @@ static LAUNCHER_SHOWN_AT: AtomicU64 = AtomicU64::new(0);
 
 /// 右键菜单弹出时面板会短暂失去焦点，那期间不能自动收起。
 static LAUNCHER_MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// 触发区预览（overlay）的编号：只有最新一次预览的定时器有权收起它。
+static OVERLAY_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// 面板现在浏览到哪个文件夹：中转站可以进子目录，拖进来的文件就放进这里。
 static LAUNCHER_DROP_TARGET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -2337,7 +2483,9 @@ fn ensure_web_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
     let (_x, _y, _w, area_h) =
         hexbench_core::sys::work_area_at(cursor_x, cursor_y).unwrap_or((0, 0, 1920, 1080));
-    let height = (area_h as f64 * 0.85).max(320.0);
+    // 工作区高度是物理像素，inner_size 要逻辑值。
+    let area_h = area_h as f64 / scale_at_cursor(app);
+    let height = (area_h * 0.85).max(320.0);
     let built = tauri::WebviewWindowBuilder::new(
         app,
         WEB_PANEL,
@@ -2401,8 +2549,16 @@ fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
     let (area_x, area_y, area_w, area_h) =
         hexbench_core::sys::work_area_at(cursor_x, cursor_y).unwrap_or((0, 0, 1920, 1080));
-    let pct_width = (area_w as f64 * width_percent as f64 / 100.0).max(240.0);
-    let pct_height = (area_h as f64 * height_percent as f64 / 100.0).max(240.0);
+    // 工作区是物理像素；下面算出的宽高 / 位置都交给 LogicalSize / LogicalPosition，
+    // 所以先按光标所在屏幕的缩放换成逻辑值。不换算的话 150% 下右边贴边放出来的
+    // 网页窗口左边缘会落到屏幕外，整个窗口看不见。
+    let scale = scale_at_cursor(app);
+    let area_x = area_x as f64 / scale;
+    let area_y = area_y as f64 / scale;
+    let area_w = area_w as f64 / scale;
+    let area_h = area_h as f64 / scale;
+    let pct_width = (area_w * width_percent as f64 / 100.0).max(240.0);
+    let pct_height = (area_h * height_percent as f64 / 100.0).max(240.0);
 
     // 优先级：跟随面板 > 记住的拖动结果 > 固定贴一侧
     let (width, height, left, top) = if follow {
@@ -2414,10 +2570,10 @@ fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
                         (position.x as f64 / scale + size.width as f64 / scale + 8.0).round(),
                         (position.y as f64 / scale).round(),
                     ),
-                    _ => (area_x as f64, area_y as f64),
+                    _ => (area_x, area_y),
                 }
             }
-            None => (area_x as f64, area_y as f64),
+            None => (area_x, area_y),
         };
         (pct_width, pct_height, left, top)
     } else if let Some((saved_x, saved_y, saved_w, saved_h)) = saved {
@@ -2427,15 +2583,15 @@ fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
         (
             pct_width,
             pct_height,
-            area_x as f64,
-            area_y as f64 + (area_h as f64 - pct_height) / 2.0,
+            area_x,
+            area_y + (area_h - pct_height) / 2.0,
         )
     } else {
         (
             pct_width,
             pct_height,
-            area_x as f64 + area_w as f64 - pct_width,
-            area_y as f64 + (area_h as f64 - pct_height) / 2.0,
+            area_x + area_w - pct_width,
+            area_y + (area_h - pct_height) / 2.0,
         )
     };
 
@@ -3260,8 +3416,27 @@ fn open_settings(page: String, tab: Option<String>, app: AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        let _ = app.emit("navigate", serde_json::json!({ "page": page, "tab": tab }));
+        return;
     }
-    let _ = app.emit("navigate", serde_json::json!({ "page": page, "tab": tab }));
+    // 主窗口被销毁了（关掉一阵子会自动销毁），或者开机自启时根本没建过：
+    // 这时 emit 没有页面接。记下目标页，等窗口建好、页面挂载时自己来取
+    // （见 `take_pending_page`）。建窗口要走工作线程，不能在命令里直接建。
+    if let Ok(mut pending) = app.state::<AppState>().pending_page.lock() {
+        *pending = Some((page, tab));
+    }
+    let handle = app.clone();
+    thread::spawn(move || open_main_now(&handle));
+}
+
+/// 主窗口页面挂载时来取「本来要去的那一页」；没有就返回 null。
+#[tauri::command]
+fn take_pending_page(app: AppHandle) -> Option<(String, Option<String>)> {
+    app.state::<AppState>()
+        .pending_page
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
 }
 /// 记住面板的视图和排序方式。`pinned` 表示这份是「快速访问」那一组的，
 /// 和「快速启动」（分类）各记各的。
@@ -3295,7 +3470,7 @@ fn launcher_save_view(
     hexbench_core::config::save(&state.config_path, &config).map_err(|error| error.to_string())
 }
 /// 把文件移进某个文件夹（面板内部拖拽用）。
-#[tauri::command]
+#[tauri::command(async)]
 fn launcher_move_into(dest: String, paths: Vec<String>, app: AppHandle) -> Result<usize, String> {
     let dir = PathBuf::from(&dest);
     if !dir.is_dir() {
@@ -3310,14 +3485,23 @@ fn launcher_move_into(dest: String, paths: Vec<String>, app: AppHandle) -> Resul
         log::warn!("launcher: nothing to move, sources are gone: {paths:?}");
         return Err("文件已经不在了".to_string());
     }
-    let moved = move_paths_into(&dir, &sources);
-    // 记下「新位置 ← 旧位置」，撤销时搬回去
-    let pairs: Vec<(PathBuf, PathBuf)> = sources
+    // 移动前先看目标目录里有没有同名文件：重名时系统会自己改名
+    // （「xxx - 副本.txt」），我们不知道它最终叫什么。拿不准的那一项就不记
+    // 撤销——总比 Ctrl+Z 把目录里本来就有、同名的那个文件搬回源位置强。
+    let expected: Vec<(PathBuf, PathBuf)> = sources
         .iter()
         .filter_map(|source| {
             let name = source.file_name()?;
-            Some((dir.join(name), source.clone()))
+            let target = dir.join(name);
+            (!target.exists()).then(|| (target, source.clone()))
         })
+        .collect();
+    let moved = move_paths_into(&dir, &sources);
+    // 记下「新位置 ← 旧位置」，撤销时搬回去。只记真正移动成功、
+    // 而且目标名没有被系统改过的。
+    let pairs: Vec<(PathBuf, PathBuf)> = expected
+        .into_iter()
+        .filter(|(target, source)| target.exists() && !source.exists())
         .collect();
     if !pairs.is_empty() {
         push_undo(UndoOp::Move(pairs));
@@ -3670,7 +3854,7 @@ fn push_undo(op: UndoOp) {
 }
 
 /// Ctrl+Z：撤销上一步。
-#[tauri::command]
+#[tauri::command(async)]
 fn launcher_undo(app: AppHandle) -> Result<String, String> {
     let op = UNDO_STACK.lock().ok().and_then(|mut stack| stack.pop());
     let Some(op) = op else {
@@ -3721,13 +3905,15 @@ fn launcher_undo(app: AppHandle) -> Result<String, String> {
     Ok(message)
 }
 /// 删除到回收站（系统会弹确认框）。
-#[tauri::command]
-fn launcher_trash(paths: Vec<String>) -> Result<usize, String> {
+#[tauri::command(async)]
+fn launcher_trash(paths: Vec<String>, app: AppHandle) -> Result<usize, String> {
     log::info!("trash: {} items", paths.len());
     let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     let removed = hexbench_core::shell_ops::trash(&targets)?;
     if removed > 0 {
         push_undo(UndoOp::Trash(targets));
+        // 别的窗口 / 面板的钉住文件夹列表也要知道目录变了。
+        let _ = app.emit("launcher-changed", ());
     }
     Ok(removed)
 }
@@ -3741,10 +3927,14 @@ fn launcher_clipboard_copy(paths: Vec<String>, cut: bool) -> Result<(), String> 
 }
 
 /// 粘贴剪贴板里的文件到目标目录。
-#[tauri::command]
-fn launcher_paste(dest: String) -> Result<usize, String> {
+#[tauri::command(async)]
+fn launcher_paste(dest: String, app: AppHandle) -> Result<usize, String> {
     log::info!("clipboard: paste into {dest}");
-    hexbench_core::shell_ops::paste_into(&PathBuf::from(dest))
+    let pasted = hexbench_core::shell_ops::paste_into(&PathBuf::from(dest))?;
+    if pasted > 0 {
+        let _ = app.emit("launcher-changed", ());
+    }
+    Ok(pasted)
 }
 /// 面板菜单里调起的 Shell 命令（压缩、复制、发送到…）跑完之前，别因为前台被
 /// 它的进度窗口拿走就收起面板。
@@ -3963,7 +4153,7 @@ fn launcher_context_menu(path: String, app: AppHandle) -> Result<Option<String>,
 }
 
 /// 在面板里给文件改名（同一目录内）。
-#[tauri::command]
+#[tauri::command(async)]
 fn launcher_rename(path: String, name: String, app: AppHandle) -> Result<String, String> {
     log::info!("launcher: rename {path} -> {name}");
     let target = PathBuf::from(&path);
@@ -4495,7 +4685,7 @@ fn selftest_launcher_files(app: &AppHandle) -> String {
     check!("undo-move", b.exists() && !sub_b.exists(), "应搬回原处");
 
     let _ = launcher_clipboard_copy(vec![b.to_string_lossy().to_string()], false);
-    let pasted = launcher_paste(sub_s.clone());
+    let pasted = launcher_paste(sub_s.clone(), app.clone());
     check!(
         "copy-paste",
         pasted.as_ref().is_ok_and(|count| *count == 1) && b.exists() && sub_b.exists(),
@@ -4511,7 +4701,7 @@ fn selftest_launcher_files(app: &AppHandle) -> String {
             .as_ref()
             .map(|(paths, cut)| (paths.len(), *cut))
     );
-    let cut = launcher_paste(cut_s.clone());
+    let cut = launcher_paste(cut_s.clone(), app.clone());
     check!(
         "cut-paste",
         cut.as_ref().is_ok_and(|count| *count == 1)
@@ -4871,6 +5061,7 @@ pub fn run() {
             update_status: Mutex::new(UpdateStatus::default()),
             panel_open: AtomicBool::new(false),
             panel_desktop_id: Mutex::new(None),
+            pending_page: Mutex::new(None),
         })
         // 图标直接从磁盘给 WebView：`http://hbicon.localhost/<缓存键>`。
         // 走协议比把 base64 塞进 IPC 省得多——解码和缓存都交给引擎。
@@ -4931,6 +5122,7 @@ pub fn run() {
     launcher_paste,
             launcher_rename,
             open_settings,
+            take_pending_page,
             launcher_set_drop_target,
             launcher_new_folder,
     launcher_create_dir,
@@ -5142,6 +5334,10 @@ pub fn run() {
                                         );
                                     }
                                     tauri::DragDropEvent::Leave => {
+                                        // 光标还在面板里却收到 Leave：Esc 取消了拖拽。
+                                        if cursor_inside_launcher(app) {
+                                            DRAG_CANCELLED.store(true, Ordering::SeqCst);
+                                        }
                                         let _ = app.emit("launcher-drag-leave", ());
                                     }
                                     _ => {}
@@ -5181,6 +5377,9 @@ pub fn run() {
                         }
                         tauri::DragDropEvent::Leave => {
                             log::info!("launcher: drag left");
+                            if cursor_inside_launcher(app) {
+                                DRAG_CANCELLED.store(true, Ordering::SeqCst);
+                            }
                             let _ = app.emit("launcher-drag-leave", ());
                         }
                         _ => {}

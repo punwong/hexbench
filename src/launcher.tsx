@@ -227,6 +227,7 @@ function extensionOf(name: string): string {
  */
 function Launcher() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const ctxMenuRef = useRef<HTMLDivElement | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
 
   // 数据
@@ -606,11 +607,23 @@ function Launcher() {
         crumbAtClient(point.x, point.y) || side?.path || folder?.path || currentDirRef.current;
       if (!dest) return;
       void invoke("launcher_move_into", { dest, paths })
-        .then(() => refreshRef.current())
+        .then(() => {
+          // 移走的文件不在这个目录了：选中集合里的旧路径要去掉，
+          // 否则接着按 Delete / 复制会拿已经不存在的位置去操作。
+          setPicked((previous) => {
+            if (!paths.some((path) => previous.has(path))) return previous;
+            const next = new Set(previous);
+            for (const path of paths) next.delete(path);
+            return next;
+          });
+          refreshRef.current();
+        })
         .catch((error) => showToastRef.current(String(error)));
     };
     on<{ x: number; y: number }>("launcher-drag-pos", (event) => {
-      dragActiveRef.current = true;
+      // 松手之后轮询线程还可能补送一帧坐标，那已经不是拖拽了。
+      // 再画一次落点高亮，刚清掉的目标会闪回来。
+      if (Date.now() - lastDropRef.current.at < 400) return;
       dragSeenAt.current = Date.now();
       const point = toClient(event.payload.x, event.payload.y);
       setDropTarget(folderAtClient(point.x, point.y)?.path ?? null);
@@ -723,7 +736,14 @@ function Launcher() {
       channel.onmessage = (page) => {
         if (!alive || token !== viewToken.current) return;
         if (page.items.length) {
-          setItems((previous) => [...previous, ...page.items]);
+          setItems((previous) => {
+            // 分页只该往后接；同一批文件已经在列表里就跳过这一条。
+            // 刷新（整份重读）和分页偶尔会前后脚各写一次，叠起来就是双份，
+            // 界面上闪一下「文件变多了」再回落。
+            const known = new Set(previous.map((item) => item.path));
+            const fresh = page.items.filter((item) => !known.has(item.path));
+            return fresh.length ? [...previous, ...fresh] : previous;
+          });
         }
         if (page.done) setLoading(false);
       };
@@ -769,20 +789,22 @@ function Launcher() {
   }, [query, root.categories, allCache]);
 
   // 站点图标：每个地址抓一次，抓不到就退化成一个字。
+  // 「问过哪些地址」记在 ref 里，不用 state 做去重：用 state 的话每出一个图标
+  // 都会重跑这个 effect，而旧一轮还没落地的请求会在清理时被丢掉，最后总有几
+  // 个站点一直没图标。
+  const siteIconAsked = useRef(new Set<string>());
   useEffect(() => {
-    let alive = true;
     for (const entry of root.sites) {
-      if (!entry.url || siteIcons[entry.url]) continue;
-      void invoke<string>("site_icon", { url: entry.url })
+      const url = entry.url;
+      if (!url || siteIcons[url] || siteIconAsked.current.has(url)) continue;
+      siteIconAsked.current.add(url);
+      void invoke<string>("site_icon", { url })
         .then((icon) => {
-          if (!alive || !icon) return;
-          setSiteIcons((previous) => ({ ...previous, [entry.url]: icon }));
+          if (!icon) return;
+          setSiteIcons((previous) => (previous[url] ? previous : { ...previous, [url]: icon }));
         })
         .catch(() => {});
     }
-    return () => {
-      alive = false;
-    };
   }, [root.sites, siteIcons]);
 
   // 空白处右键：弹资源管理器的「文件夹背景菜单」（新建 / 粘贴 / 属性 / 刷新）。
@@ -809,13 +831,29 @@ function Launcher() {
 
   // 文件夹变化 / 面板重新呼出：刷新。
   useEffect(() => {
+    let disposed = false;
     const disposers: Array<() => void> = [];
+    // listen 是异步拿到的：effect 先拆掉时再挂上就没人注销了。
+    const bind = <T,>(name: string, handler: (event: { payload: T }) => void) => {
+      void listen<T>(name, handler).then((fn) => {
+        if (disposed) fn();
+        else disposers.push(fn);
+      });
+    };
     // 目录内容变了：缓存里钉住的文件夹也要作废（见 reload 的注释）。
-    void listen("launcher-changed", () => void reload(true)).then((fn) => disposers.push(fn));
-    void listen("launcher-shown", () => {
+    bind("launcher-changed", () => void reload(true));
+    // 后端呼出时会连发两次（摆好窗口一次、网页窗口也摆好再一次）。这里只认
+    // 紧挨着的那一次：两次都跑就是整份重读两遍，还会连着还原两次位置。
+    let shownAt = 0;
+    bind("launcher-shown", () => {
+      const now = Date.now();
+      if (now - shownAt < 150) return;
+      shownAt = now;
       // 每次呼出都以后端为准，避免「第一次收了、第二次就变不回来」。
       void invoke<boolean>("web_side_state")
-        .then((open) => document.body.classList.toggle("web-open", open))
+        .then((open) => {
+          if (!disposed) document.body.classList.toggle("web-open", open);
+        })
         .catch(() => {});
       setQuery("");
       setSelected(-1);
@@ -825,9 +863,23 @@ function Launcher() {
       setForwardStack([]);
       hoverArmed.current = false;
       void reload().then(restore);
-    }).then((fn) => disposers.push(fn));
-    return () => disposers.forEach((fn) => fn());
-  }, [reload]);
+    });
+    return () => {
+      disposed = true;
+      disposers.forEach((fn) => fn());
+    };
+  }, [reload, restore]);
+
+  // 侧边栏右键菜单贴在光标处，靠近下边缘 / 右边缘时往里挪，别被面板裁掉。
+  useLayoutEffect(() => {
+    const node = ctxMenuRef.current;
+    if (!node || !sideMenu) return;
+    const rect = node.getBoundingClientRect();
+    const left = Math.min(sideMenu.x, Math.max(4, window.innerWidth - rect.width - 4));
+    const top = Math.min(sideMenu.y, Math.max(4, window.innerHeight - rect.height - 4));
+    node.style.left = `${left}px`;
+    node.style.top = `${top}px`;
+  }, [sideMenu]);
 
   // 排序菜单：点别处就关掉。
   useEffect(() => {
@@ -1145,14 +1197,12 @@ function Launcher() {
   // ---------- 操作 ----------
 
   const refreshAll = useCallback(async () => {
+    // 列表交给上面那个读取 effect 重读：这里再整体 setItems 一次，会和它
+    // 正在跑的分页流前后脚各写一遍，同一批文件并成双份（松手后闪一下
+    // 「变多了」再回落，就是拖放后那个残影）。
     await reload(true);
-    if (scope.kind === "folder") {
-      const target = path || scope.base;
-      if (target) {
-        setItems(await invoke<LauncherItem[]>("launcher_items", { path: target, withIcons: false }));
-      }
-    }
-  }, [reload, scope, path]);
+    setLoadTick((tick) => tick + 1);
+  }, [reload]);
 
   const [warmTick, setWarmTick] = useState(0);
 
@@ -1237,6 +1287,13 @@ function Launcher() {
       if (!draft || draft === item.name) return;
       try {
         await invoke("launcher_rename", { path: item.path, name: draft });
+        // 名字变了，选中集合里还是旧路径：留着的话下一次 Delete / 复制会落空。
+        setPicked((previous) => {
+          if (!previous.has(item.path)) return previous;
+          const next = new Set(previous);
+          next.delete(item.path);
+          return next;
+        });
       } catch (error) {
         showToast(String(error));
       } finally {
@@ -1278,7 +1335,19 @@ function Launcher() {
       if (Math.abs(next.clientX - startX) + Math.abs(next.clientY - startY) < 5) return;
       started = true;
       stop();
-      void invoke("launcher_begin_drag", { paths }).catch((error) => showToast(String(error)));
+      // 从这一刻到 DoDragDrop 返回，主线程被它占着：这期间别发读目录的命令。
+      dragActiveRef.current = true;
+      dragSeenAt.current = Date.now();
+      void invoke("launcher_begin_drag", { paths })
+        .catch((error) => showToast(String(error)))
+        .finally(() => {
+          // 拖拽真正结束了（不论在哪儿松手）。以前这个状态只由坐标事件置位，
+          // 拖到面板外松手收不到坐标，它会一直挂着，接下来的重读就一直往后推。
+          dragActiveRef.current = false;
+          // 拖到面板外松手（移进资源管理器 / 桌面）不会有拖放回调，
+          // 列表还停在拖之前；补一次重读。落在面板里的拖放自己会刷新。
+          if (Date.now() - lastDropRef.current.at > 800) refreshRef.current();
+        });
     };
 
     window.addEventListener("pointermove", move);
@@ -1345,7 +1414,19 @@ function Launcher() {
     requestAnimationFrame(() => inputRef.current?.focus());
   };
 
+  // 删 / 粘贴 / 撤销之后：选中的路径多半已经不在了，先清掉——不然接着按
+  // Delete 会拿旧路径去删，弹一句「文件已经不在了」。刷新用 refreshAll：
+  // 钉住的「快速访问」文件夹不在分类里，普通 reload 不会重读它们。
+  const afterFileChange = useCallback(() => {
+    setPicked(new Set());
+    setSelected(-1);
+    anchor.current = -1;
+    void refreshAll();
+  }, [refreshAll]);
+
   const onInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    // 拼音还没上屏时的回车 / 方向键是输入法的，不是我们的。
+    if (event.nativeEvent.isComposing) return;
     if (fileShortcuts(event)) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -1374,15 +1455,22 @@ function Launcher() {
     const renaming = target.tagName === "TEXTAREA";
     const ctrl = event.ctrlKey || event.metaKey;
     const key = event.key.toLowerCase();
-    if (event.key === "Delete" && picked.size > 0) {
+    // 一次按键只能执行一次：这里 stopPropagation，根的 keydown 和 document 上的
+    // Ctrl+Z 就不会再把同一个动作跑一遍（以前 Delete / Ctrl+V / Ctrl+Z 会做两次，
+    // 第二次找不到源文件就弹「文件已经不在了」）。
+    const take = () => {
       event.preventDefault();
+      event.stopPropagation();
+    };
+    if (event.key === "Delete" && picked.size > 0 && !renaming) {
+      take();
       void invoke<number>("launcher_trash", { paths: [...picked] })
-        .then(() => void reload())
+        .then(() => afterFileChange())
         .catch((error) => showToastRef.current(String(error)));
       return true;
     }
     if (ctrl && (key === "c" || key === "x") && picked.size > 0 && !renaming) {
-      event.preventDefault();
+      take();
       void invoke("launcher_clipboard_copy", { paths: [...picked], cut: key === "x" }).catch(
         (error) => showToastRef.current(String(error)),
       );
@@ -1390,10 +1478,10 @@ function Launcher() {
     }
     // Ctrl+Z：撤销上一步（删进回收站 / 重命名 / 移动 / 新建文件夹）
     if (ctrl && key === "z" && !renaming) {
-      event.preventDefault();
+      take();
       void invoke<string>("launcher_undo")
         .then((message) => {
-          void reload();
+          afterFileChange();
           showToastRef.current(message);
         })
         .catch((error) => showToastRef.current(String(error)));
@@ -1403,30 +1491,34 @@ function Launcher() {
     if (ctrl && key === "v" && !renaming) {
       const dir = currentDir || root.root;
       if (!dir) return false;
-      event.preventDefault();
+      take();
       void invoke<number>("launcher_paste", { dest: dir })
-        .then(() => void reload())
+        .then(() => afterFileChange())
         .catch((error) => showToastRef.current(String(error)));
       return true;
     }
     return false;
   };
 
-  // Ctrl+Z 用 document 级监听兜底：焦点在搜索框/改名框时 React 处理器不一定收到。
+  // Ctrl+Z 用 document 级监听兜底：焦点落在没有自己的按键处理的地方时也能撤销。
+  // 输入框里除外——那里 Ctrl+Z 该撤销打的字，不是撤销文件操作。
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z") return;
+      if (event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
       event.preventDefault();
       void invoke<string>("launcher_undo")
         .then((message) => {
-          void reload();
+          afterFileChange();
           showToastRef.current(message);
         })
         .catch((error) => showToastRef.current(String(error)));
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [reload]);
+  }, [afterFileChange]);
 
   // 主题跟随设置（不只是系统）：面板要跟设置窗口一致
   useEffect(() => {
@@ -1464,6 +1556,10 @@ function Launcher() {
   };
 
   const onRootKeyDown = (event: React.KeyboardEvent) => {
+    // 输入法组字中的按键交给输入法，别拿它去关面板 / 退层。
+    if (event.nativeEvent.isComposing) return;
+    // 删除 / 复制 / 剪切 / 粘贴都在这里统一处理；根节点自己不再各写一份，
+    // 否则同一次按键会走两遍。
     if (fileShortcuts(event)) return;
     const target = event.target as HTMLElement;
     // 改名时 Ctrl+A 应该选中名字本身，而不是全选文件。
@@ -1471,35 +1567,6 @@ function Launcher() {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && !renaming) {
       event.preventDefault();
       setPicked(new Set(shown.map((item) => item.path)));
-      return;
-    }
-    // 删除到回收站（系统会弹确认框）
-    if (event.key === "Delete" && picked.size > 0) {
-      event.preventDefault();
-      void invoke<number>("launcher_trash", { paths: [...picked] })
-        .then(() => void reload())
-        .catch((error) => showToastRef.current(String(error)));
-      return;
-    }
-
-    const ctrl = event.ctrlKey || event.metaKey;
-    const key = event.key.toLowerCase();
-    // 复制 / 剪切：写进系统剪贴板，资源管理器也能粘
-    if (ctrl && (key === "c" || key === "x") && picked.size > 0 && !renaming) {
-      event.preventDefault();
-      void invoke("launcher_clipboard_copy", { paths: [...picked], cut: key === "x" }).catch(
-        (error) => showToastRef.current(String(error)),
-      );
-      return;
-    }
-    // 粘贴到当前目录
-    if (ctrl && key === "v" && !renaming) {
-      const dir = currentDir || root.root;
-      if (!dir) return;
-      event.preventDefault();
-      void invoke<number>("launcher_paste", { dest: dir })
-        .then(() => void reload())
-        .catch((error) => showToastRef.current(String(error)));
       return;
     }
 
@@ -1620,6 +1687,8 @@ function Launcher() {
               onChange={(event) => setSideInput({ ...sideInput, value: event.target.value })}
               onKeyDown={(event) => {
                 event.stopPropagation();
+                // 组字中的回车是输入法在选词，别当成「确定」。
+                if (event.nativeEvent.isComposing) return;
                 if (event.key === "Enter" || event.keyCode === 13) void commitSideInput();
                 if (event.key === "Escape") setSideInput(null);
               }}
@@ -1704,6 +1773,7 @@ function Launcher() {
         {sideMenu && (
           <div
             className="ctx-menu"
+            ref={ctxMenuRef}
             style={{ left: sideMenu.x, top: sideMenu.y }}
             onMouseDown={(event) => event.stopPropagation()}
             onContextMenu={(event) => event.preventDefault()}

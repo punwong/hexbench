@@ -39,11 +39,11 @@ export function TitleBar() {
       });
     };
     sync();
-    void win
-      .onResized(sync)
-      .then((fn) => {
-        dispose = fn;
-      });
+    void win.onResized(sync).then((fn) => {
+      // 监听是异步拿到的：effect 可能已经拆掉，这时候再挂上就没人注销了。
+      if (alive) dispose = fn;
+      else fn();
+    });
     return () => {
       alive = false;
       dispose?.();

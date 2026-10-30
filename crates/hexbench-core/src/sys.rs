@@ -657,6 +657,19 @@ pub fn window_under_cursor() -> Option<WindowInfo> {
     }
 }
 
+/// 前台窗口的句柄：借走焦点的地方（常用语编辑框）退出时还回去。
+pub fn foreground_hwnd() -> Option<isize> {
+    // SAFETY: plain query on a system handle.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            None
+        } else {
+            Some(hwnd as isize)
+        }
+    }
+}
+
 /// Same data for the foreground window, used to match a configured target.
 pub fn foreground_window_info() -> Option<WindowInfo> {
     // SAFETY: plain query.

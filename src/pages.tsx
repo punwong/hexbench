@@ -49,7 +49,9 @@ export type Patch = {
   ui?: Partial<UiSettings>;
 };
 
-export type UpdateConfig = (patch: Patch) => void;
+export type UpdateConfig = (
+  patch: Patch | ((current: Config) => Patch | null),
+) => void;
 
 function ToolRow({
   icon,
@@ -1238,11 +1240,21 @@ function SortableRows({
       setOver(null);
     };
 
+    // 把行拖出窗口再松手，mouseup 收不到：窗口一失焦就当作取消，
+    // 否则这一行会一直挂着拖动高亮，下一次点击还会带着旧位置误排序。
+    const onBlur = () => {
+      stateRef.current = { from: null, to: null };
+      setDragging(null);
+      setOver(null);
+    };
+
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
+    window.addEventListener("blur", onBlur);
     return () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      window.removeEventListener("blur", onBlur);
     };
   }, [dragging, onReorder]);
 
@@ -1423,7 +1435,9 @@ export function LauncherPage({
                   }}
                   trailing={(index) => (
                     <EyeButton
-                      hidden={categories[index].hidden}
+                      // 用配置里的 hidden 列表，不用分类快照：快照只在根目录变化时
+                      // 重读，点了眼睛之后它还是旧值，图标会一直不更新。
+                      hidden={hidden.includes(categories[index].name)}
                       onClick={() => toggleHidden(categories[index].name)}
                     />
                   )}
@@ -1591,12 +1605,21 @@ export function LauncherPage({
                   if (entry.name.trim()) return;
                   void siteTitle(normalized).then((title) => {
                     if (!title) return;
-                    update({
-                      launcher: {
-                        sites: patched.map((item, i) =>
-                          i === index && !item.name.trim() ? { ...item, name: title } : item,
-                        ),
-                      },
+                    // 按地址找这一行，别拿发请求时的旧数组整份写回去：
+                    // 抓标题这一两秒里，别的行可能已经增删、改名、换顺序。
+                    update((current) => {
+                      const sites = current.launcher.sites ?? [];
+                      const target = sites.findIndex(
+                        (item) => item.url === normalized && !item.name.trim(),
+                      );
+                      if (target < 0) return null;
+                      return {
+                        launcher: {
+                          sites: sites.map((item, i) =>
+                            i === target ? { ...item, name: title } : item,
+                          ),
+                        },
+                      };
                     });
                   });
                 }}
