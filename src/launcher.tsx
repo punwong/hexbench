@@ -463,6 +463,9 @@ function Launcher() {
   // 拖拽被系统取消），只看布尔值会让面板一直不刷新，所以要能自己过期。
   const dragSeenAt = useRef(0);
   const sidesRef = useRef<Record<string, () => void>>({});
+  // 面板开着的时候，每一组（分类 / 快速访问里钉住的文件夹）各自记住走到哪一层：
+  // 进了子文件夹，切到别的组再切回来，还停在原来那一层，不会退回顶级。
+  const folderMemory = useRef<Record<string, string>>({});
   // 刚处理过的落点：同一次拖放可能被两条路径报回来两次，只认第一次。
   const lastDropRef = useRef({ key: "", at: 0 });
   const base = scope.kind === "folder" ? scope.base : "";
@@ -861,6 +864,8 @@ function Launcher() {
       anchor.current = -1;
       setBackStack([]);
       setForwardStack([]);
+      // 每次呼出都是新的一轮：各组「上次待的那一层」从当前位置重新记。
+      folderMemory.current = {};
       hoverArmed.current = false;
       void reload().then(restore);
     });
@@ -1016,11 +1021,32 @@ function Launcher() {
     [go, scope, root.categories, root.folders],
   );
 
-  const openCategory = useCallback(
-    (category: Category) => {
-      go({ scope: { kind: "folder", base: category.path, label: category.name }, path: category.path });
+  /**
+   * 切到某一组（分类 / 快速访问里的文件夹）。
+   *
+   * 这一组本来就开着：点它就是回到它的顶级。从别的组切过来：回到这一组
+   * 上次待的那一层（进了子文件夹再切走、切回来，不用一层层点回去）。
+   */
+  const goGroup = useCallback(
+    (scope: Scope, rootPath: string) => {
+      const key = `${scope.kind === "folder" && scope.pinned ? "pin" : "cat"}:${rootPath}`;
+      const remembered = activeIdRef.current === key ? "" : folderMemory.current[key] || "";
+      go({
+        scope,
+        path: remembered && isInside(remembered, rootPath) ? remembered : rootPath,
+      });
     },
     [go],
+  );
+
+  const openCategory = useCallback(
+    (category: Category) => {
+      goGroup(
+        { kind: "folder", base: category.path, label: category.name },
+        category.path,
+      );
+    },
+    [goGroup],
   );
 
   const openAll = useCallback(() => go({ scope: { kind: "all" }, path: "" }), [go]);
@@ -1028,12 +1054,12 @@ function Launcher() {
 
   const openPinned = useCallback(
     (folder: string) => {
-      go({
-        scope: { kind: "folder", base: folder, label: folderLabel(folder), pinned: true },
-        path: folder,
-      });
+      goGroup(
+        { kind: "folder", base: folder, label: folderLabel(folder), pinned: true },
+        folder,
+      );
     },
-    [go],
+    [goGroup],
   );
 
   /** 侧边栏的「新建分类 / 重命名」都走这里。 */
@@ -1060,6 +1086,13 @@ function Launcher() {
     activeIdRef.current =
       scope.kind === "all" ? "__all__" : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
   }, [scope]);
+
+  // 走到哪儿就记到那一组名下。
+  useEffect(() => {
+    if (scope.kind !== "folder" || !scope.base) return;
+    const key = `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
+    folderMemory.current[key] = path || scope.base;
+  }, [scope, path]);
 
   useEffect(() => {
     const map: Record<string, () => void> = { __all__: openAll };
