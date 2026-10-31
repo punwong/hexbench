@@ -53,6 +53,7 @@ const demoConfig: Config = {
     heightPercent: 50,
       rememberLocation: true,
       lastLocation: { kind: "", base: "", label: "", path: "" },
+      gestures: { enabled: true, invertDirection: false, triggerDistance: 80, showTrail: true },
     },
   phrases: {
     enabled: true,

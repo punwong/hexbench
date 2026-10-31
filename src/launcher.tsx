@@ -83,7 +83,58 @@ type LauncherRoot = {
   lastPath: string;
   /** 上次停在「快速访问」那一行 */
   lastPinned: boolean;
+  /** 文件区右键滑动的手势设置 */
+  gestures: GestureSettings;
 };
+
+/// 文件区的鼠标手势：按住右键左右划 = 后退 / 前进。
+type GestureSettings = {
+  enabled: boolean;
+  invertDirection: boolean;
+  triggerDistance: number;
+  showTrail: boolean;
+};
+
+/// 手势进行中的状态。全放在 ref 里：pointermove 每帧都要读，走 React 状态会重渲染整张列表。
+type GestureRuntime = {
+  active: boolean;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  /** 已经判定为横向手势（超过起步距离且横向占优） */
+  recognized: boolean;
+  direction: "back" | "forward" | null;
+  points: Array<{ x: number; y: number }>;
+  /** contextmenu 抑制截止时间（performance.now()） */
+  suppressUntil: number;
+  line: string;
+  glow: string;
+  raf: number;
+  hideTimer: number;
+};
+
+const GESTURE_START = 8;
+/// 手势结束后还要按住右键菜单一小会儿：WebView2 的 contextmenu 在松开之后才来。
+const GESTURE_SUPPRESS_MS = 600;
+const GESTURE_DEFAULT: GestureSettings = {
+  enabled: true,
+  invertDirection: false,
+  triggerDistance: 80,
+  showTrail: true,
+};
+
+/** 横向位移决定动作；默认向左后退，开了「左右互换」就反过来。 */
+function gestureAction(dx: number, invert: boolean): "back" | "forward" {
+  if (dx < 0) return invert ? "forward" : "back";
+  return invert ? "back" : "forward";
+}
+
+/** 配置文件被手改坏也不至于滑半天不动：夹到 20–400px。 */
+function gestureDistance(value: number): number {
+  return Number.isFinite(value) ? Math.min(400, Math.max(20, value)) : 80;
+}
 
 type SortKey = "name" | "modified" | "size" | "type" | "frequent";
 
@@ -117,13 +168,16 @@ function sortItems(
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
       return collator.compare(a.name, b.name);
     }
+    // 按修改时间排：文件夹和文件一起排。文件夹也有修改时间，如果还让它
+    // 永远压在顶上，「按时间排序」看的就是两段各自排好的列表，不是真在按时间。
+    // 时间相同（文件夹常常是同一秒建的）再按名字，免得顺序每刷新一次就变。
+    if (order.key === "modified") {
+      return (a.modified - b.modified) * order.dir || collator.compare(a.name, b.name);
+    }
     // 其余情况文件夹在前，和资源管理器一致。
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
     let result = 0;
     switch (order.key) {
-      case "modified":
-        result = a.modified - b.modified;
-        break;
       case "size":
         result = a.size - b.size;
         break;
@@ -251,6 +305,7 @@ function Launcher() {
     lastLabel: "",
     lastPath: "",
     lastPinned: false,
+    gestures: GESTURE_DEFAULT,
   });
   const [allCache, setAllCache] = useState<Record<string, LauncherItem[]>>({});
   const [items, setItems] = useState<LauncherItem[]>([]);
@@ -468,6 +523,31 @@ function Launcher() {
   const folderMemory = useRef<Record<string, string>>({});
   // 刚处理过的落点：同一次拖放可能被两条路径报回来两次，只认第一次。
   const lastDropRef = useRef({ key: "", at: 0 });
+  // 右键手势：状态、叠层和「历史里还能不能退」都放 ref，窗口级监听只装一次也能读到最新值。
+  const gestureRef = useRef<GestureRuntime>({
+    active: false,
+    pointerId: -1,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    lastY: 0,
+    recognized: false,
+    direction: null,
+    points: [],
+    suppressUntil: 0,
+    line: "rgba(0, 0, 0, 0.45)",
+    glow: "rgba(0, 0, 0, 0.10)",
+    raf: 0,
+    hideTimer: 0,
+  });
+  const gestureLayerRef = useRef<HTMLDivElement | null>(null);
+  const gestureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const gestureLabelRef = useRef<HTMLDivElement | null>(null);
+  const gesturesRef = useRef<GestureSettings>(GESTURE_DEFAULT);
+  const goBackRef = useRef<() => void>(() => {});
+  const goForwardRef = useRef<() => void>(() => {});
+  const historyRef = useRef({ back: 0, forward: 0 });
+  const resetGestureRef = useRef<() => void>(() => {});
   const base = scope.kind === "folder" ? scope.base : "";
   const currentDir = scope.kind === "folder" ? path || scope.base : root.root;
 
@@ -864,6 +944,7 @@ function Launcher() {
       anchor.current = -1;
       setBackStack([]);
       setForwardStack([]);
+      resetGestureRef.current();
       // 每次呼出都是新的一轮：各组「上次待的那一层」从当前位置重新记。
       folderMemory.current = {};
       hoverArmed.current = false;
@@ -989,6 +1070,279 @@ function Launcher() {
     applyView(target.scope);
     resetView();
   }, [forwardStack, scope, path, resetView, applyView]);
+
+  // ---- 右键手势：按住右键左滑 = 后退、右滑 = 前进 ----
+  // 窗口级监听只装一次，所以历史栈和回调都经由 ref 读最新值。
+  useEffect(() => {
+    goBackRef.current = goBack;
+    goForwardRef.current = goForward;
+    historyRef.current = { back: backStack.length, forward: forwardStack.length };
+  }, [goBack, goForward, backStack.length, forwardStack.length]);
+
+  useEffect(() => {
+    gesturesRef.current = root.gestures ?? GESTURE_DEFAULT;
+  }, [root.gestures]);
+
+  /** 按需重设 canvas 的背板尺寸（换屏幕 / 缩放变了也要跟上）。 */
+  const gestureCtx = () => {
+    const canvas = gestureCanvasRef.current;
+    if (!canvas) return null;
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.round(window.innerWidth * dpr);
+    const height = Math.round(window.innerHeight * dpr);
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return ctx;
+  };
+
+  const drawGesture = useCallback(() => {
+    const ctx = gestureCtx();
+    if (!ctx) return;
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    const points = gestureRef.current.points;
+    if (points.length === 0) return;
+    const stroke = (width: number, color: string) => {
+      ctx.lineWidth = width;
+      ctx.strokeStyle = color;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      if (points.length === 1) {
+        ctx.moveTo(points[0].x, points[0].y);
+        ctx.lineTo(points[0].x + 0.01, points[0].y);
+      } else {
+        ctx.moveTo(points[0].x, points[0].y);
+        // 经过每个点的中点画二次曲线：采样点再密，线也不会一段一段的。
+        for (let index = 1; index < points.length - 1; index += 1) {
+          const midX = (points[index].x + points[index + 1].x) / 2;
+          const midY = (points[index].y + points[index + 1].y) / 2;
+          ctx.quadraticCurveTo(points[index].x, points[index].y, midX, midY);
+        }
+        const last = points[points.length - 1];
+        ctx.lineTo(last.x, last.y);
+      }
+      ctx.stroke();
+    };
+    stroke(9, gestureRef.current.glow);
+    stroke(3, gestureRef.current.line);
+  }, []);
+
+  const scheduleGestureDraw = useCallback(() => {
+    const g = gestureRef.current;
+    if (g.raf) return;
+    g.raf = window.requestAnimationFrame(() => {
+      g.raf = 0;
+      drawGesture();
+    });
+  }, [drawGesture]);
+
+  const updateGestureLabel = useCallback((x: number, y: number) => {
+    const label = gestureLabelRef.current;
+    const g = gestureRef.current;
+    if (!label || !g.direction) return;
+    const back = g.direction === "back";
+    const available = back ? historyRef.current.back > 0 : historyRef.current.forward > 0;
+    const text = back ? "← 后退" : "→ 前进";
+    if (label.textContent !== text) label.textContent = text;
+    label.classList.toggle("dim", !available);
+    label.hidden = false;
+    const left = Math.min(Math.max(x + 18, 8), window.innerWidth - label.offsetWidth - 8);
+    const top = Math.min(Math.max(y + 16, 8), window.innerHeight - label.offsetHeight - 8);
+    label.style.transform = `translate3d(${left}px, ${top}px, 0)`;
+  }, []);
+
+  const showGestureLayer = useCallback(
+    (x: number, y: number) => {
+      const layer = gestureLayerRef.current;
+      if (!layer) return;
+      const g = gestureRef.current;
+      const style = getComputedStyle(document.documentElement);
+      g.line = style.getPropertyValue("--gesture-line").trim() || "rgba(0, 0, 0, 0.45)";
+      g.glow = style.getPropertyValue("--gesture-glow").trim() || "rgba(0, 0, 0, 0.10)";
+      g.points = [{ x, y }];
+      window.clearTimeout(g.hideTimer);
+      layer.hidden = false;
+      // 先落地一帧再挂 .on，透明度才会从 0 过渡出来。
+      void layer.offsetWidth;
+      layer.classList.add("on");
+      updateGestureLabel(x, y);
+    },
+    [updateGestureLabel],
+  );
+
+  const hideGestureLayer = useCallback(() => {
+    const layer = gestureLayerRef.current;
+    const g = gestureRef.current;
+    if (!layer || layer.hidden) return;
+    layer.classList.remove("on");
+    const clear = () => {
+      const ctx = gestureCtx();
+      ctx?.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      layer.hidden = true;
+    };
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      clear();
+      return;
+    }
+    window.clearTimeout(g.hideTimer);
+    g.hideTimer = window.setTimeout(clear, 180);
+  }, []);
+
+  /** 结束（或取消）当前手势。commit=false 用于 Esc / 失焦 / 呼出重置。 */
+  const finishGesture = useCallback(
+    (commit: boolean) => {
+      const g = gestureRef.current;
+      if (!g.active) return;
+      const recognized = g.recognized;
+      const direction = g.direction;
+      const dx = g.lastX - g.startX;
+      g.active = false;
+      g.pointerId = -1;
+      if (g.raf) {
+        window.cancelAnimationFrame(g.raf);
+        g.raf = 0;
+      }
+      if (!recognized) return;
+      // WebView2 的 contextmenu 在右键松开之后才发：抑制要多留一会儿。
+      g.suppressUntil = performance.now() + GESTURE_SUPPRESS_MS;
+      hideGestureLayer();
+      g.points = [];
+      if (!commit || !direction) return;
+      if (Math.abs(dx) < gestureDistance(gesturesRef.current.triggerDistance)) return;
+      const available = direction === "back" ? historyRef.current.back : historyRef.current.forward;
+      if (available <= 0) {
+        showToastRef.current(direction === "back" ? "已经是最早的位置" : "已经是最新的位置");
+        return;
+      }
+      if (direction === "back") goBackRef.current();
+      else goForwardRef.current();
+    },
+    [hideGestureLayer],
+  );
+
+  const cancelGesture = useCallback(() => {
+    const g = gestureRef.current;
+    if (g.raf) {
+      window.cancelAnimationFrame(g.raf);
+      g.raf = 0;
+    }
+    g.active = false;
+    g.pointerId = -1;
+    g.recognized = false;
+    g.direction = null;
+    g.points = [];
+    g.suppressUntil = 0;
+    hideGestureLayer();
+  }, [hideGestureLayer]);
+
+  useEffect(() => {
+    resetGestureRef.current = cancelGesture;
+  }, [cancelGesture]);
+
+  /** 文件区按下右键：只记起点，不动菜单——不划动时右键菜单照常弹。 */
+  const beginGesture = (event: React.PointerEvent) => {
+    if (event.button !== 2 || event.pointerType !== "mouse") return;
+    if (!gesturesRef.current.enabled) return;
+    const g = gestureRef.current;
+    if (g.active) return;
+    g.suppressUntil = 0;
+    g.active = true;
+    g.pointerId = event.pointerId;
+    g.startX = event.clientX;
+    g.startY = event.clientY;
+    g.lastX = event.clientX;
+    g.lastY = event.clientY;
+    g.recognized = false;
+    g.direction = null;
+    g.points = [];
+  };
+
+  useEffect(() => {
+    const g = gestureRef.current;
+    const down = () => {
+      // 新的按下：上一次手势留下的菜单抑制立刻作废，普通右键不能被永久吞掉。
+      if (!g.active) g.suppressUntil = 0;
+    };
+    const move = (event: PointerEvent) => {
+      if (!g.active || event.pointerId !== g.pointerId) return;
+      if ((event.buttons & 2) === 0) {
+        // 松开事件丢了（拖到窗口外松手）：按已经划到的位置收尾。
+        finishGesture(true);
+        return;
+      }
+      const settings = gesturesRef.current;
+      g.lastX = event.clientX;
+      g.lastY = event.clientY;
+      const dx = g.lastX - g.startX;
+      const dy = g.lastY - g.startY;
+      if (!g.recognized) {
+        if (Math.hypot(dx, dy) < GESTURE_START) return;
+        // 竖着划不算：右键上下拖更像是在选一行，不把人导航走。
+        if (Math.abs(dx) < Math.abs(dy) * 1.2) return;
+        g.recognized = true;
+        g.suppressUntil = performance.now() + 1500;
+        if (settings.showTrail) showGestureLayer(g.startX, g.startY);
+      }
+      g.direction = gestureAction(dx, settings.invertDirection);
+      if (settings.showTrail) {
+        const last = g.points[g.points.length - 1];
+        if (!last || Math.hypot(g.lastX - last.x, g.lastY - last.y) >= 2.5) {
+          g.points.push({ x: g.lastX, y: g.lastY });
+          // 划得再长也只留一段尾巴，别一直涨内存。
+          if (g.points.length > 600) g.points.splice(1, 1);
+        }
+        updateGestureLabel(g.lastX, g.lastY);
+        scheduleGestureDraw();
+      }
+    };
+    const up = (event: PointerEvent) => {
+      if (!g.active || event.pointerId !== g.pointerId) return;
+      g.lastX = event.clientX;
+      g.lastY = event.clientY;
+      finishGesture(true);
+    };
+    const cancel = () => finishGesture(false);
+    const key = (event: KeyboardEvent) => {
+      if (!g.active || event.key !== "Escape") return;
+      // 手势里的 Esc 只是取消手势，不能顺带退一层 / 收起面板。
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      finishGesture(false);
+    };
+    const menu = (event: MouseEvent) => {
+      // 空白处的菜单监听在 document 上，且不查 defaultPrevented：
+      // 必须在 window 的捕获阶段就把事件拦死，tile 上的 React 菜单也到不了。
+      if ((g.active && g.recognized) || performance.now() < g.suppressUntil) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+      }
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", cancel, true);
+    window.addEventListener("keydown", key, true);
+    window.addEventListener("contextmenu", menu, true);
+    window.addEventListener("blur", cancel);
+    document.addEventListener("visibilitychange", cancel);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", cancel, true);
+      window.removeEventListener("keydown", key, true);
+      window.removeEventListener("contextmenu", menu, true);
+      window.removeEventListener("blur", cancel);
+      document.removeEventListener("visibilitychange", cancel);
+    };
+  }, [finishGesture, scheduleGestureDraw, showGestureLayer, updateGestureLabel]);
 
   const canUp = scope.kind === "folder" && !!path && path !== base;
 
@@ -1996,11 +2350,16 @@ function Launcher() {
                 : { ...previous, scrollTop: element.scrollTop },
             );
           }}
-          onPointerDown={beginMarquee}
+          onPointerDown={(event) => {
+            beginGesture(event);
+            beginMarquee(event);
+          }}
           onPointerMove={moveMarquee}
           onPointerUp={endMarquee}
           onPointerCancel={endMarquee}
           onMouseMove={(event) => {
+            // 按住右键划手势时别顺手改键盘光标：高亮会一路跟着鼠标跑。
+            if ((event.buttons & 2) !== 0) return;
             hoverArmed.current = true;
             const tile = (event.target as HTMLElement).closest<HTMLElement>("[data-index]");
             if (!tile) return;
@@ -2221,6 +2580,12 @@ function Launcher() {
         </div>
 
         {toast && <div className="toast">{toast}</div>}
+
+        {/* 右键手势的轨迹层：fixed 铺满窗口，永远不吃鼠标事件。 */}
+        <div className="gesture-layer" ref={gestureLayerRef} hidden aria-hidden="true">
+          <canvas className="gesture-canvas" ref={gestureCanvasRef} />
+          <div className="gesture-label" ref={gestureLabelRef} hidden />
+        </div>
 
         <div className="foot">
           {/* 一搜索就跨所有分类找，这里跟着说清楚范围。 */}

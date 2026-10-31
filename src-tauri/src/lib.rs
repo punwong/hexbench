@@ -3200,6 +3200,8 @@ struct LauncherRoot {
     last_path: String,
     /// 上次停在「快速访问」那一行（而不是启动分类）。
     last_pinned: bool,
+    /// 文件区右键滑动的手势设置。
+    gestures: hexbench_core::config::GestureSettings,
 }
 /// 扫一个目录，把子文件夹当成分类；排序按配置里的顺序，其余按名字。
 fn scan_categories(root: &str, order: &[String], hidden: &[String]) -> Vec<LauncherCategory> {
@@ -3290,6 +3292,7 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             last_label: String::new(),
             last_path: String::new(),
             last_pinned: false,
+            gestures: hexbench_core::config::GestureSettings::default(),
         })
 }
 
@@ -3321,6 +3324,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
     };
     let pinned_view_set = !shared.config.launcher.pinned_view.is_empty();
     let web_enabled = shared.config.launcher.web_enabled;
+    let gestures = shared.config.launcher.gestures.clone();
     drop(shared);
     let all_visible = !hidden.iter().any(|entry| entry == "__all__");
     let empty = |root: String| LauncherRoot {
@@ -3343,6 +3347,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         last_label: location.label.clone(),
         last_path: location.path.clone(),
         last_pinned: location.pinned,
+        gestures: gestures.clone(),
     };
     if root.trim().is_empty() {
         return empty(root);
@@ -3371,6 +3376,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         last_label: location.label,
         last_path: location.path,
         last_pinned: location.pinned,
+        gestures,
     }
 }
 

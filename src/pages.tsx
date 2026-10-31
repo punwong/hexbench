@@ -5,6 +5,7 @@ import { Crosshair, Eye, EyeOff, MessageSquare, Rocket } from "lucide-react";
 import type { CacheInfo, LauncherCategoryInfo } from "./api";
 import type {
   Config,
+  GestureSettings,
   GuardSettings,
   HotkeySettings,
   LauncherSettings,
@@ -1736,6 +1737,55 @@ export function LauncherPage({
     </div>
   );
 }
+/// 设置页里的「手势」：快捷面板文件区的右键滑动。
+export function GesturePage({ config, update }: { config: Config; update: UpdateConfig }) {
+  const g: GestureSettings = config.launcher.gestures ?? {
+    enabled: true,
+    invertDirection: false,
+    triggerDistance: 80,
+    showTrail: true,
+  };
+  const set = (patch: Partial<GestureSettings>) =>
+    update({ launcher: { gestures: { ...g, ...patch } } });
+
+  return (
+    <div className="stack">
+      <Card title="鼠标手势">
+        <p className="sub" style={{ marginTop: 0 }}>
+          在快捷面板的文件区按住右键横着划：默认向左后退、向右前进，松手后执行，不弹右键菜单。
+          只在文件区生效，用右键慢慢点开菜单不受影响。
+        </p>
+        <Row label="启用手势">
+          <Toggle checked={g.enabled} onChange={(value) => set({ enabled: value })} />
+        </Row>
+        <Row label="方向" hint="向左滑动对应哪个动作">
+          <Segmented
+            value={g.invertDirection ? "leftForward" : "leftBack"}
+            options={[
+              { value: "leftBack", label: "左 = 后退" },
+              { value: "leftForward", label: "左 = 前进" },
+            ]}
+            onChange={(value) => set({ invertDirection: value === "leftForward" })}
+          />
+        </Row>
+        <Row label="触发距离" hint="横向滑动超过这个距离才执行">
+          <Slider
+            value={g.triggerDistance}
+            min={20}
+            max={200}
+            step={5}
+            onChange={(value) => set({ triggerDistance: value })}
+            format={(value) => `${value} px`}
+          />
+        </Row>
+        <Row label="显示轨迹" hint="按住右键滑动时画出轨迹线，并在光标旁显示方向">
+          <Toggle checked={g.showTrail} onChange={(value) => set({ showTrail: value })} />
+        </Row>
+      </Card>
+    </div>
+  );
+}
+
 /// 设置页里的「缓存」：目前只有缩略图，以后别的工具也能挂在这里。
 export function CachePage() {
   const [items, setItems] = useState<CacheInfo[]>([]);

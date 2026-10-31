@@ -166,6 +166,32 @@ pub struct LauncherLocation {
     /// 同一个文件夹可能两边都有，回落时要能分出来是哪一行。
     pub pinned: bool,
 }
+/// 面板文件区的鼠标手势：按住右键左右滑动 = 后退 / 前进。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GestureSettings {
+    /// 手势总开关。
+    pub enabled: bool,
+    /// 左右互换：true 时向左是前进、向右是后退。
+    pub invert_direction: bool,
+    /// 横向滑多远才执行（逻辑像素）。
+    pub trigger_distance: u32,
+    /// 拖动时是否画轨迹线、在光标旁显示方向。
+    pub show_trail: bool,
+}
+
+impl Default for GestureSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            invert_direction: false,
+            // 80px 大约是小半个面板宽：够区分「手滑了一下」和真的在划。
+            trigger_distance: 80,
+            show_trail: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LauncherSettings {
@@ -236,6 +262,8 @@ pub struct LauncherSettings {
     pub remember_location: bool,
     /// 上次浏览的位置（`remember_location` 关掉时忽略）。
     pub last_location: LauncherLocation,
+    /// 文件区右键滑动的手势设置。
+    pub gestures: GestureSettings,
 }
 
 impl Default for LauncherSettings {
@@ -279,6 +307,7 @@ impl Default for LauncherSettings {
             pinned_sort_dir: 0,
             remember_location: true,
             last_location: LauncherLocation::default(),
+            gestures: GestureSettings::default(),
         }
     }
 }

@@ -73,6 +73,18 @@ export interface Phrase {
   text: string;
 }
 
+/** 面板文件区的右键滑动手势。 */
+export interface GestureSettings {
+  /** 手势总开关 */
+  enabled: boolean;
+  /** 左右互换：true 时向左是前进 */
+  invertDirection: boolean;
+  /** 横向滑多远才执行（逻辑像素） */
+  triggerDistance: number;
+  /** 拖动时画轨迹线、显示方向 */
+  showTrail: boolean;
+}
+
 export interface LauncherSettings {
   enabled: boolean;
   /** 常用文件夹：面板左侧直接列出来，数组顺序就是显示顺序 */
@@ -111,6 +123,8 @@ export interface LauncherSettings {
   rememberLocation: boolean;
   /** 上次停留的位置 */
   lastLocation: { kind: string; base: string; label: string; path: string };
+  /** 文件区右键滑动手势 */
+  gestures: GestureSettings;
 }
 
 export interface PhraseSettings {
