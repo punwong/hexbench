@@ -334,6 +334,16 @@ fn save_config(
         launcher.site_pct_w = live.site_pct_w;
         launcher.site_pct_h = live.site_pct_h;
         launcher.last_location = live.last_location.clone();
+        // 视图 / 排序 / 缩放也是面板直接写的：设置窗口拿着打开时的旧快照保存，
+        // 会把刚滚出来的缩放冲回去。
+        launcher.view = live.view.clone();
+        launcher.sort_key = live.sort_key.clone();
+        launcher.sort_dir = live.sort_dir;
+        launcher.pinned_view = live.pinned_view.clone();
+        launcher.pinned_sort_key = live.pinned_sort_key.clone();
+        launcher.pinned_sort_dir = live.pinned_sort_dir;
+        launcher.view_zoom = live.view_zoom;
+        launcher.pinned_view_zoom = live.pinned_view_zoom;
         config.sync.last_push = shared.config.sync.last_push;
         config.sync.last_pull = shared.config.sync.last_pull;
     }
@@ -3190,6 +3200,9 @@ struct LauncherRoot {
     pinned_view: String,
     pinned_sort_key: String,
     pinned_sort_dir: i32,
+    /// 文件区排版缩放的百分比；快速访问那套没单独设过时就是分类那套。
+    view_zoom: u32,
+    pinned_view_zoom: u32,
     /// 快速访问是否已经单独设过（没设过就跟着分类那套走）。
     pinned_view_set: bool,
     /// 下次呼出要不要回到上次的位置。
@@ -3285,6 +3298,8 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             pinned_view: "grid".to_string(),
             pinned_sort_key: "name".to_string(),
             pinned_sort_dir: 1,
+            view_zoom: 100,
+            pinned_view_zoom: 100,
             pinned_view_set: false,
             remember_location: false,
             last_kind: String::new(),
@@ -3294,6 +3309,16 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             last_pinned: false,
             gestures: hexbench_core::config::GestureSettings::default(),
         })
+}
+
+/// 100 是默认也是最小，最多放到 150；越界（旧配置没有这个字段时是 0、
+/// 以前存过更小的值）当作 100，界面拿到的永远是能直接用的值。
+fn clamp_zoom(value: u32) -> u32 {
+    if (100..=150).contains(&value) {
+        value
+    } else {
+        100
+    }
 }
 
 fn launcher_root(app: &AppHandle) -> LauncherRoot {
@@ -3322,6 +3347,11 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         0 => sort_dir,
         other => other,
     };
+    let view_zoom = clamp_zoom(shared.config.launcher.view_zoom);
+    let pinned_view_zoom = match shared.config.launcher.pinned_view_zoom {
+        0 => view_zoom,
+        other => clamp_zoom(other),
+    };
     let pinned_view_set = !shared.config.launcher.pinned_view.is_empty();
     let web_enabled = shared.config.launcher.web_enabled;
     let gestures = shared.config.launcher.gestures.clone();
@@ -3340,6 +3370,8 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         pinned_view: pinned_view.clone(),
         pinned_sort_key: pinned_sort_key.clone(),
         pinned_sort_dir,
+        view_zoom,
+        pinned_view_zoom,
         pinned_view_set,
         remember_location,
         last_kind: location.kind.clone(),
@@ -3369,6 +3401,8 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         pinned_view,
         pinned_sort_key,
         pinned_sort_dir,
+        view_zoom,
+        pinned_view_zoom,
         pinned_view_set,
         remember_location,
         last_kind: location.kind,
@@ -3451,26 +3485,35 @@ fn launcher_save_view(
     view: String,
     sort_key: String,
     sort_dir: i32,
+    zoom: u32,
     pinned: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut shared = state.shared.lock().unwrap();
     let launcher = &mut shared.config.launcher;
-    let (slot_view, slot_key, slot_dir) = if pinned {
+    let (slot_view, slot_key, slot_dir, slot_zoom) = if pinned {
         (
             &mut launcher.pinned_view,
             &mut launcher.pinned_sort_key,
             &mut launcher.pinned_sort_dir,
+            &mut launcher.pinned_view_zoom,
         )
     } else {
-        (&mut launcher.view, &mut launcher.sort_key, &mut launcher.sort_dir)
+        (
+            &mut launcher.view,
+            &mut launcher.sort_key,
+            &mut launcher.sort_dir,
+            &mut launcher.view_zoom,
+        )
     };
-    if *slot_view == view && *slot_key == sort_key && *slot_dir == sort_dir {
+    let zoom = clamp_zoom(zoom);
+    if *slot_view == view && *slot_key == sort_key && *slot_dir == sort_dir && *slot_zoom == zoom {
         return Ok(());
     }
     *slot_view = view;
     *slot_key = sort_key;
     *slot_dir = sort_dir;
+    *slot_zoom = zoom;
     let config = shared.config.clone();
     drop(shared);
     hexbench_core::config::save(&state.config_path, &config).map_err(|error| error.to_string())

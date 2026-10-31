@@ -48,6 +48,9 @@ const GRID_PAD = 22;
 const LIST_ROW_H = 36;
 const LIST_GAP = 10;
 const LIST_PAD = 10;
+/// 文件区排版缩放（Alt+滚轮）的几档：100% 是默认大小，也是最小，只能往大了放。
+const ZOOM_STEPS = [100, 110, 120, 130, 140, 150];
+const ZOOM_DEFAULT = 100;
 /// 图标走 Tauri 自定义协议：Windows 上地址是 `http://<scheme>.localhost`。
 const ICON_BASE = "http://hbicon.localhost/";
 /// 除了屏幕上可见的，再多要一屏多的图标：滚下去的时候已经准备好了。
@@ -74,6 +77,9 @@ type LauncherRoot = {
   pinnedView: string;
   pinnedSortKey: string;
   pinnedSortDir: number;
+  /** 文件区排版缩放的百分比（100 默认 / 最小，最多 150） */
+  viewZoom: number;
+  pinnedViewZoom: number;
   /** 快速访问是否已经单独设过；没设过就跟着分类那套走 */
   pinnedViewSet: boolean;
   rememberLocation: boolean;
@@ -134,6 +140,23 @@ function gestureAction(dx: number, invert: boolean): "back" | "forward" {
 /** 配置文件被手改坏也不至于滑半天不动：夹到 20–400px。 */
 function gestureDistance(value: number): number {
   return Number.isFinite(value) ? Math.min(400, Math.max(20, value)) : 80;
+}
+
+/// 把任意百分比吸附到最近的一档；比默认还小 / 非法的值一律按 100 算。
+function clampZoom(value: number): number {
+  if (!Number.isFinite(value) || value <= ZOOM_DEFAULT) return ZOOM_DEFAULT;
+  let best = ZOOM_STEPS[0];
+  for (const step of ZOOM_STEPS) {
+    if (Math.abs(step - value) < Math.abs(best - value)) best = step;
+  }
+  return best;
+}
+
+/// 沿档位表滚一格，到头就不动。
+function stepZoom(current: number, direction: 1 | -1): number {
+  const index = ZOOM_STEPS.indexOf(clampZoom(current));
+  const next = Math.min(ZOOM_STEPS.length - 1, Math.max(0, index + direction));
+  return ZOOM_STEPS[next];
 }
 
 type SortKey = "name" | "modified" | "size" | "type" | "frequent";
@@ -215,16 +238,21 @@ function folderLabel(path: string): string {
 type Snapshot = { scope: Scope; path: string };
 
 /** 面板的显示方式。快速启动（分类）和快速访问（钉住的文件夹）各记一套。 */
-type ViewPref = { view: "grid" | "list"; sort: { key: SortKey; dir: 1 | -1 } };
+type ViewPref = {
+  view: "grid" | "list";
+  sort: { key: SortKey; dir: 1 | -1 };
+  zoom: number;
+};
 
 const SORT_KEYS: SortKey[] = ["name", "modified", "size", "type", "frequent"];
 
 /** 把后端存的字符串读成一套能直接用的显示方式（不认识的字段退回默认）。 */
-function readPref(view: string, sortKey: string, sortDir: number): ViewPref {
+function readPref(view: string, sortKey: string, sortDir: number, zoom: number): ViewPref {
   const key = SORT_KEYS.find((entry) => entry === sortKey) ?? "name";
   return {
     view: view === "list" ? "list" : "grid",
     sort: { key, dir: sortDir === -1 ? -1 : 1 },
+    zoom: clampZoom(zoom),
   };
 }
 
@@ -298,6 +326,8 @@ function Launcher() {
     pinnedView: "grid",
     pinnedSortKey: "name",
     pinnedSortDir: 1,
+    viewZoom: ZOOM_DEFAULT,
+    pinnedViewZoom: ZOOM_DEFAULT,
     pinnedViewSet: false,
     rememberLocation: false,
     lastKind: "",
@@ -466,15 +496,25 @@ function Launcher() {
   const marqueeRef = useRef<{ x: number; y: number; base: Set<string> } | null>(null);
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "name", dir: 1 });
   const [view, setView] = useState<"grid" | "list">("grid");
+  // 文件区排版缩放（百分比）。滚轮监听挂在原生事件上，经 zoomRef 读最新值。
+  const [zoom, setZoomState] = useState(ZOOM_DEFAULT);
+  const zoomRef = useRef(ZOOM_DEFAULT);
+  const setZoom = useCallback((value: number) => {
+    const next = clampZoom(value);
+    zoomRef.current = next;
+    setZoomState(next);
+  }, []);
   // 每个文件在面板里被打开过几次，「使用频率」排序按它来。
   const [usage, setUsage] = useState<Record<string, number>>({});
   // 两份显示方式：切到哪一组就套哪一份，改的时候也只记回自己那份。
   const viewPrefs = useRef<{ plain: ViewPref; pinned: ViewPref }>({
-    plain: { view: "grid", sort: { key: "name", dir: 1 } },
-    pinned: { view: "grid", sort: { key: "name", dir: 1 } },
+    plain: { view: "grid", sort: { key: "name", dir: 1 }, zoom: ZOOM_DEFAULT },
+    pinned: { view: "grid", sort: { key: "name", dir: 1 }, zoom: ZOOM_DEFAULT },
   });
   // 快速访问那套是不是已经单独设过：没设过就先跟着分类走。
   const pinnedViewSet = useRef(false);
+  // 后端那套显示方式读进来之前不保存：否则开 panel 时的默认 100% 会把存着的缩放盖掉。
+  const restoredRef = useRef(false);
   const [sortMenu, setSortMenu] = useState(false);
 
   // 视口尺寸变化（切网格/列表、窗口拉大、滚动条出现）都要重新算可视范围。
@@ -582,10 +622,15 @@ function Launcher() {
         (listing?.categories.some((category) => category.path === base) ||
           (listing?.folders ?? []).includes(base));
       if (listing) {
-        const plain = readPref(listing.view, listing.sortKey, listing.sortDir);
+        const plain = readPref(listing.view, listing.sortKey, listing.sortDir, listing.viewZoom);
         viewPrefs.current = {
           plain,
-          pinned: readPref(listing.pinnedView, listing.pinnedSortKey, listing.pinnedSortDir),
+          pinned: readPref(
+            listing.pinnedView,
+            listing.pinnedSortKey,
+            listing.pinnedSortDir,
+            listing.pinnedViewZoom,
+          ),
         };
         pinnedViewSet.current = listing.pinnedViewSet;
         // 上次停在快速访问里就套那一套，否则用分类的。
@@ -599,6 +644,8 @@ function Launcher() {
           pinnedRestore && pinnedViewSet.current ? viewPrefs.current.pinned : plain;
         setView(pref.view);
         setSort(pref.sort);
+        setZoom(pref.zoom);
+        restoredRef.current = true;
       }
       if (listing?.rememberLocation && listing.lastKind === "folder" && known) {
         // 同一个文件夹可能既是分类又是快速访问：按上次停在哪一行还原，
@@ -741,18 +788,20 @@ function Launcher() {
   // 视图 / 排序变化也记下来，只记回当前这一组：快速启动和快速访问分开记。
   const pinnedScope = scope.kind === "folder" && !!scope.pinned;
   useEffect(() => {
-    viewPrefs.current[pinnedScope ? "pinned" : "plain"] = { view, sort };
+    viewPrefs.current[pinnedScope ? "pinned" : "plain"] = { view, sort, zoom };
     if (pinnedScope) pinnedViewSet.current = true;
+    if (!restoredRef.current) return;
     const timer = window.setTimeout(() => {
       void invoke("launcher_save_view", {
         view,
         sortKey: sort.key,
         sortDir: sort.dir,
+        zoom,
         pinned: pinnedScope,
       }).catch(() => {});
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [view, sort.key, sort.dir, pinnedScope]);
+  }, [view, sort.key, sort.dir, zoom, pinnedScope]);
 
   // 位置变化就记下来（防抖，避免每次点击都写盘）。
   useEffect(() => {
@@ -1034,7 +1083,8 @@ function Launcher() {
       pinned && pinnedViewSet.current ? viewPrefs.current.pinned : viewPrefs.current.plain;
     setView(pref.view);
     setSort(pref.sort);
-  }, []);
+    setZoom(pref.zoom);
+  }, [setZoom]);
 
   const go = useCallback(
     (next: Snapshot) => {
@@ -1495,44 +1545,139 @@ function Launcher() {
 
   const shown = useMemo(() => sortItems(filtered, sort, usage), [filtered, sort, usage]);
 
+  // 缩放后的基准尺寸：格子、行、间距、内边距都按同一系数走，和 CSS 里的
+  // `calc(... * var(--zoom))` 对得上。格子的高取整，免得名字最后一行被半像素裁掉。
+  const metrics = useMemo(() => {
+    const factor = zoom / 100;
+    return {
+      factor,
+      cellW: GRID_CELL_W * factor,
+      tileH: Math.ceil(GRID_TILE_H * factor),
+      gridGap: GRID_GAP * factor,
+      gridPad: GRID_PAD * factor,
+      rowH: Math.ceil(LIST_ROW_H * factor),
+      listGap: LIST_GAP * factor,
+      listPad: LIST_PAD * factor,
+    };
+  }, [zoom]);
+
   // 虚拟滚动的几何：列数、行高、总高度、当前要渲染的区间。
   const layout = useMemo(() => {
     const width = Math.max(0, viewport.width);
     const height = Math.max(0, viewport.height);
     if (view === "grid") {
-      const inner = Math.max(width - GRID_PAD * 2, GRID_CELL_W);
-      const cols = Math.max(1, Math.floor((inner + GRID_GAP) / (GRID_CELL_W + GRID_GAP)));
-      const pitch = GRID_TILE_H + GRID_GAP;
+      const inner = Math.max(width - metrics.gridPad * 2, metrics.cellW);
+      const cols = Math.max(1, Math.floor((inner + metrics.gridGap) / (metrics.cellW + metrics.gridGap)));
+      const pitch = metrics.tileH + metrics.gridGap;
       const rows = Math.ceil(shown.length / cols);
-      const total = GRID_PAD * 2 + Math.max(0, rows * pitch - GRID_GAP);
+      const total = metrics.gridPad * 2 + Math.max(0, rows * pitch - metrics.gridGap);
       // 上下各多渲染两行，滚动时不会出现空白。
-      const first = Math.max(0, Math.floor((viewport.scrollTop - GRID_PAD) / pitch) - 2);
-      const last = Math.min(rows, Math.ceil((viewport.scrollTop + height - GRID_PAD) / pitch) + 2);
+      const first = Math.max(0, Math.floor((viewport.scrollTop - metrics.gridPad) / pitch) - 2);
+      const last = Math.min(
+        rows,
+        Math.ceil((viewport.scrollTop + height - metrics.gridPad) / pitch) + 2,
+      );
       return {
         start: first * cols,
         end: Math.min(shown.length, Math.max(last, first + 1) * cols),
         total,
-        topOf: (index: number) => GRID_PAD + Math.floor(index / cols) * pitch,
-        leftOf: (index: number) => GRID_PAD + (index % cols) * (GRID_CELL_W + GRID_GAP),
-        itemHeight: GRID_TILE_H,
-        pad: GRID_PAD,
+        topOf: (index: number) => metrics.gridPad + Math.floor(index / cols) * pitch,
+        leftOf: (index: number) =>
+          metrics.gridPad + (index % cols) * (metrics.cellW + metrics.gridGap),
+        itemHeight: metrics.tileH,
+        pad: metrics.gridPad,
+        cols,
+        pitch,
       };
     }
-    const pitch = LIST_ROW_H + LIST_GAP;
+    const pitch = metrics.rowH + metrics.listGap;
     const rows = shown.length;
-    const total = LIST_PAD * 2 + Math.max(0, rows * pitch - LIST_GAP);
-    const first = Math.max(0, Math.floor((viewport.scrollTop - LIST_PAD) / pitch) - 3);
-    const last = Math.min(rows, Math.ceil((viewport.scrollTop + height - LIST_PAD) / pitch) + 3);
+    const total = metrics.listPad * 2 + Math.max(0, rows * pitch - metrics.listGap);
+    const first = Math.max(0, Math.floor((viewport.scrollTop - metrics.listPad) / pitch) - 3);
+    const last = Math.min(
+      rows,
+      Math.ceil((viewport.scrollTop + height - metrics.listPad) / pitch) + 3,
+    );
     return {
       start: first,
       end: Math.min(rows, Math.max(last, first + 1)),
       total,
-      topOf: (index: number) => LIST_PAD + index * pitch,
-      leftOf: () => LIST_PAD,
-      itemHeight: LIST_ROW_H,
-      pad: LIST_PAD,
+      topOf: (index: number) => metrics.listPad + index * pitch,
+      leftOf: () => metrics.listPad,
+      itemHeight: metrics.rowH,
+      pad: metrics.listPad,
+      cols: 1,
+      pitch,
     };
-  }, [view, viewport.width, viewport.height, viewport.scrollTop, shown.length]);
+  }, [view, viewport.width, viewport.height, viewport.scrollTop, shown.length, metrics]);
+
+  // Alt+滚轮缩放。原生 wheel 监听只装一次（容器节点不变），几何和缩放经 ref 读最新值。
+  // React 的 onWheel 是被动的，preventDefault 不生效，压不住页面缩放/滚动。
+  const layoutRef = useRef(layout);
+  useLayoutEffect(() => {
+    layoutRef.current = layout;
+  });
+  /** 缩放前光标压着的那一项（项内纵向比例 + 视口内的 y），缩放后把它留在原处。 */
+  const pendingAnchor = useRef<{ index: number; fraction: number; y: number } | null>(null);
+
+  useEffect(() => {
+    const element = gridRef.current;
+    if (!element) return;
+    const onWheel = (event: WheelEvent) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (!event.deltaY) return;
+      const current = zoomRef.current;
+      const next = stepZoom(current, event.deltaY < 0 ? 1 : -1);
+      // 已经到头（默认大小 / 最大）就不拦：让滚轮照常滚列表。
+      if (next === current) return;
+      event.preventDefault();
+      const rect = element.getBoundingClientRect();
+      const y = event.clientY - rect.top;
+      const tile = document
+        .elementFromPoint(event.clientX, event.clientY)
+        ?.closest<HTMLElement>("[data-index]");
+      let index = -1;
+      let fraction = 0.5;
+      if (tile && element.contains(tile)) {
+        index = Number(tile.dataset.index);
+        const box = tile.getBoundingClientRect();
+        fraction = Math.min(1, Math.max(0, (event.clientY - box.top) / Math.max(1, box.height)));
+      } else {
+        // 指在格子之间的空隙 / 空白处：按当前几何反算落在第几行。
+        const geometry = layoutRef.current;
+        const row = Math.floor((y + element.scrollTop - geometry.pad) / geometry.pitch);
+        const last = shownRef.current.length - 1;
+        if (row >= 0 && last >= 0) {
+          index = Math.min(last, row * geometry.cols);
+          fraction = 0.5;
+        }
+      }
+      pendingAnchor.current = index >= 0 ? { index, fraction, y } : null;
+      setZoom(next);
+    };
+    element.addEventListener("wheel", onWheel, { passive: false });
+    return () => element.removeEventListener("wheel", onWheel);
+  }, [setZoom]);
+
+  // 缩放后按新几何把锚定的那一项挪回光标下；列数变了只保证纵向。
+  useLayoutEffect(() => {
+    const element = gridRef.current;
+    const anchor = pendingAnchor.current;
+    if (!element || !anchor) return;
+    pendingAnchor.current = null;
+    const index = Math.min(anchor.index, Math.max(0, shownRef.current.length - 1));
+    const target = layout.topOf(index) + anchor.fraction * layout.itemHeight - anchor.y;
+    const max = Math.max(0, layout.total - element.clientHeight);
+    element.scrollTop = Math.min(max, Math.max(0, target));
+  }, [zoom, layout]);
+
+  // 内容变短（缩放 / 换目录）时别让 scrollTop 留在界外。
+  useLayoutEffect(() => {
+    const element = gridRef.current;
+    if (!element) return;
+    const max = Math.max(0, layout.total - element.clientHeight);
+    if (element.scrollTop > max) element.scrollTop = max;
+  }, [layout.total]);
 
   useEffect(() => {
     if (selected >= shown.length) setSelected(Math.max(shown.length - 1, -1));
@@ -1594,6 +1739,8 @@ function Launcher() {
   const [warmTick, setWarmTick] = useState(0);
 
   const warmPreview = useCallback(async () => {
+    // 缩小时一屏装得下更多项：拖拽预览用的预热也要跟着多备一些。
+    const warmCount = Math.min(160, Math.ceil(PREVIEW_WARM * (100 / zoom) ** 2));
     const folders: string[] = [];
     for (const category of root.categories) folders.push(category.path);
     for (const folder of root.folders) folders.push(folder);
@@ -1618,7 +1765,7 @@ function Launcher() {
         );
       }
       // 拖过去看到的就是头一屏，按当前排序取前几十个。
-      for (const item of sortItems(list, sort, usage).slice(0, PREVIEW_WARM)) {
+      for (const item of sortItems(list, sort, usage).slice(0, warmCount)) {
         if (warmPaths.current.has(item.path)) continue;
         warmPaths.current.add(item.path);
         wanted.push(item.path);
@@ -1627,7 +1774,7 @@ function Launcher() {
     }
     // 没抽过的交给后端的预取队列（排在可见区后面）。
     if (wanted.length) fillIcons([], wanted);
-  }, [root, allCache, sort, usage, fillIcons, warmIcon]);
+  }, [root, allCache, sort, usage, zoom, fillIcons, warmIcon]);
 
   useEffect(() => {
     // 呼出后稍等一下再备：眼前这一屏排在队首，预取本来就排后面。
@@ -2342,6 +2489,8 @@ function Launcher() {
         <div
           className={view === "grid" ? "grid" : "list"}
           ref={gridRef}
+          // 条目外框由 JS 按同一系数给尺寸，内部图标/字号由 CSS 的 --zoom 缩放。
+          style={{ "--zoom": metrics.factor } as React.CSSProperties}
           onScroll={(event) => {
             const element = event.currentTarget;
             setViewport((previous) =>
@@ -2429,15 +2578,15 @@ function Launcher() {
                       position: "absolute",
                       left: layout.leftOf(index),
                       top: layout.topOf(index),
-                      width: GRID_CELL_W,
-                      height: GRID_TILE_H,
+                      width: metrics.cellW,
+                      height: metrics.tileH,
                     }
                   : {
                       position: "absolute",
-                      left: LIST_PAD,
-                      right: LIST_PAD,
+                      left: metrics.listPad,
+                      right: metrics.listPad,
                       top: layout.topOf(index),
-                      height: LIST_ROW_H,
+                      height: metrics.rowH,
                     }
               }
               onPointerDown={(event) => {
@@ -2593,7 +2742,7 @@ function Launcher() {
           <span>·</span>
           <span>{shown.length} 项</span>
           <span>·</span>
-          <span>双击打开 · 拖动拖出 · 空白处或 Alt+拖动框选 · Ctrl+A 全选</span>
+          <span>双击打开 · 拖动拖出 · 空白处或 Alt+拖动框选 · Alt+滚轮缩放 · Ctrl+A 全选</span>
           <span>·</span>
           <span>
             <kbd>Esc</kbd> {canUp ? "上一层" : "关闭"}

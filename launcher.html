@@ -509,9 +509,9 @@
       .row {
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 7px 11px;
-        border-radius: 7px;
+        gap: calc(10px * var(--zoom, 1));
+        padding: calc(7px * var(--zoom, 1)) calc(11px * var(--zoom, 1));
+        border-radius: calc(7px * var(--zoom, 1));
         cursor: default;
         outline: none;
         box-sizing: border-box;
@@ -531,19 +531,19 @@
       }
 
       .row .tile-icon {
-        width: 22px;
-        height: 22px;
+        width: calc(22px * var(--zoom, 1));
+        height: calc(22px * var(--zoom, 1));
       }
 
       .row .tile-icon img {
-        width: 22px;
-        height: 22px;
+        width: calc(22px * var(--zoom, 1));
+        height: calc(22px * var(--zoom, 1));
         /* 缩略图保持原图比例（资源管理器就是这样），不要拉成方图。 */
         object-fit: contain;
       }
 
       .row .tile-glyph {
-        font-size: 15px;
+        font-size: calc(15px * var(--zoom, 1));
       }
 
       .row .tile-name {
@@ -554,7 +554,7 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        font-size: 12.5px;
+        font-size: calc(12.5px * var(--zoom, 1));
       }
 
       .row .tile-input {
@@ -564,14 +564,14 @@
 
       .row-meta {
         flex: 0 0 auto;
-        min-width: 62px;
+        min-width: calc(62px * var(--zoom, 1));
         text-align: right;
         color: var(--muted);
-        font-size: 11.5px;
+        font-size: calc(11.5px * var(--zoom, 1));
       }
 
       .row-meta.date {
-        min-width: 96px;
+        min-width: calc(96px * var(--zoom, 1));
       }
       .grid {
         position: relative;
@@ -585,13 +585,14 @@
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 6px;
-        padding: 10px 4px 8px;
+        gap: calc(6px * var(--zoom, 1));
+        padding: calc(10px * var(--zoom, 1)) calc(4px * var(--zoom, 1))
+          calc(8px * var(--zoom, 1));
         border: none;
         background: transparent;
         color: inherit;
         font: inherit;
-        border-radius: 10px;
+        border-radius: calc(10px * var(--zoom, 1));
         cursor: default;
         outline: none;
         /* 虚拟滚动给的是固定格子尺寸：宽度和高度都在内联样式里。 */
@@ -629,13 +630,13 @@
       .tile-icon {
         display: grid;
         place-items: center;
-        width: 48px;
-        height: 48px;
+        width: calc(48px * var(--zoom, 1));
+        height: calc(48px * var(--zoom, 1));
       }
 
       .tile-icon img {
-        width: 48px;
-        height: 48px;
+        width: calc(48px * var(--zoom, 1));
+        height: calc(48px * var(--zoom, 1));
         /* 同上：非方图按比例缩放在 48×48 的框里，四周留白。 */
         object-fit: contain;
         /* 图还没到之前不占位（下面有字形兜底）；解码完成才淡进来，
@@ -653,14 +654,14 @@
       }
 
       .tile-glyph {
-        font-size: 26px;
+        font-size: calc(26px * var(--zoom, 1));
         line-height: 1;
         color: var(--muted);
       }
 
       .tile-name {
         max-width: 100%;
-        font-size: 12px;
+        font-size: calc(12px * var(--zoom, 1));
         line-height: 1.35;
         text-align: center;
         overflow: hidden;
@@ -672,14 +673,14 @@
 
       .tile-input {
         width: 100%;
-        max-width: 100px;
-        padding: 3px 5px;
+        max-width: calc(100px * var(--zoom, 1));
+        padding: calc(3px * var(--zoom, 1)) calc(5px * var(--zoom, 1));
         border: 1px solid var(--line);
-        border-radius: 6px;
+        border-radius: calc(6px * var(--zoom, 1));
         background: var(--bg);
         color: var(--text);
         font: inherit;
-        font-size: 11.5px;
+        font-size: calc(11.5px * var(--zoom, 1));
         line-height: 1.35;
         text-align: center;
         resize: none;

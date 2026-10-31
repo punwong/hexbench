@@ -258,6 +258,10 @@ pub struct LauncherSettings {
     pub pinned_view: String,
     pub pinned_sort_key: String,
     pub pinned_sort_dir: i32,
+    /// 文件区的排版缩放百分比（Alt+滚轮）：100 是默认也是最小，最多放到 150。
+    pub view_zoom: u32,
+    /// 快速访问单独记的缩放；0 表示还没单独设过，跟着分类那一套走。
+    pub pinned_view_zoom: u32,
     /// 呼出时回到上次浏览的位置。
     pub remember_location: bool,
     /// 上次浏览的位置（`remember_location` 关掉时忽略）。
@@ -305,6 +309,8 @@ impl Default for LauncherSettings {
             pinned_view: String::new(),
             pinned_sort_key: String::new(),
             pinned_sort_dir: 0,
+            view_zoom: 100,
+            pinned_view_zoom: 0,
             remember_location: true,
             last_location: LauncherLocation::default(),
             gestures: GestureSettings::default(),
@@ -731,6 +737,20 @@ mod tests {
             LauncherSettings::default().width_percent,
             "缺的字段用默认值"
         );
+    }
+
+    #[test]
+    fn launcher_zoom_defaults_and_camel_case() {
+        let defaults = LauncherSettings::default();
+        assert_eq!(defaults.view_zoom, 100);
+        assert_eq!(defaults.pinned_view_zoom, 0, "0 = 跟着分类那一套");
+        let json = serde_json::to_string(&defaults).unwrap();
+        assert!(json.contains("\"viewZoom\":100"));
+        assert!(json.contains("\"pinnedViewZoom\":0"));
+        // 旧配置里没有这两个字段：读出来是默认值，不能把整份配置判坏。
+        let old: LauncherSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.view_zoom, 100);
+        assert_eq!(old.pinned_view_zoom, 0);
     }
 
     #[test]
