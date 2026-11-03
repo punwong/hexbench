@@ -27,7 +27,14 @@ use windows::Win32::UI::Shell::{
 };
 
 fn wide(path: &Path) -> HSTRING {
-    HSTRING::from(path.as_os_str())
+    // SHCreateItemFromParsingName 不吃 "D:/a/b.md" 这种正斜杠路径，会回
+    // E_INVALIDARG。收藏目录来自配置，路径里可能全是正斜杠，统一换成反斜杠。
+    let text = path.as_os_str().to_string_lossy();
+    if text.contains('/') {
+        HSTRING::from(text.replace('/', "\\"))
+    } else {
+        HSTRING::from(text.as_ref())
+    }
 }
 
 /// COM 按线程初始化，每个线程第一次用之前调一次。
@@ -135,6 +142,53 @@ pub fn trash(sources: &[PathBuf]) -> Result<usize, String> {
         // FOF_ALLOWUNDO：进回收站；不加 FOF_NOCONFIRMATION，让系统弹确认。
         operation
             .SetOperationFlags(windows::Win32::UI::Shell::FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING)
+            .map_err(|error| error.to_string())?;
+        let mut queued = 0usize;
+        for source in sources {
+            let item: IShellItem = SHCreateItemFromParsingName(&wide(source), None)
+                .map_err(|error| format!("{}: {error}", source.display()))?;
+            operation
+                .DeleteItem(&item, None)
+                .map_err(|error| error.to_string())?;
+            queued += 1;
+        }
+        if queued == 0 {
+            return Ok(0);
+        }
+        operation.PerformOperations().map_err(|error| error.to_string())?;
+        if operation
+            .GetAnyOperationsAborted()
+            .map(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Err("操作已取消".to_string());
+        }
+        Ok(queued)
+    }
+}
+
+/// 静默删除到回收站：收藏里的笔记 / 图片清理用，不弹确认框。
+///
+/// 仍然走回收站（`FOF_ALLOWUNDO`），误删还能找回来；只是不再让系统问一遍
+/// 「确定要删除吗」——面板里点删除时已经确认过了。
+pub fn trash_quiet(sources: &[PathBuf]) -> Result<usize, String> {
+    if sources.is_empty() {
+        return Ok(0);
+    }
+    ensure_com();
+    // SAFETY: 指针均为 Shell 所有，作用域内释放。
+    unsafe {
+        let operation: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
+            .map_err(|error| format!("IFileOperation: {error}"))?;
+        operation
+            .SetOperationFlags(
+                windows::Win32::UI::Shell::FOF_ALLOWUNDO
+                    | windows::Win32::UI::Shell::FOF_NOCONFIRMATION
+                    | windows::Win32::UI::Shell::FOF_SILENT
+                    | windows::Win32::UI::Shell::FOF_NOERRORUI
+                    | FOFX_ADDUNDORECORD
+                    | FOF_WANTNUKEWARNING,
+            )
             .map_err(|error| error.to_string())?;
         let mut queued = 0usize;
         for source in sources {
@@ -635,5 +689,17 @@ pub fn data_object_for(paths: &[PathBuf]) -> Option<*mut std::ffi::c_void> {
         let data: windows::Win32::System::Com::IDataObject =
             array.BindToHandler(None, &BHID_DataObject).ok()?;
         Some(data.into_raw())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_uses_backslashes_for_shell_paths() {
+        // 收藏目录的配置可能是 "D:/notes"；Shell 接口只认反斜杠。
+        assert_eq!(wide(Path::new("D:/notes/a.md")).to_string(), r"D:\notes\a.md");
+        assert_eq!(wide(Path::new(r"D:\notes\a.md")).to_string(), r"D:\notes\a.md");
     }
 }

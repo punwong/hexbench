@@ -1,28 +1,54 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Crosshair, Eye, EyeOff, MessageSquare, Rocket } from "lucide-react";
+import {
+  Crosshair,
+  Eye,
+  EyeOff,
+  FolderOpen,
+  Inbox,
+  LayoutGrid,
+  Plus,
+  Rocket,
+  SlidersHorizontal,
+  Trash2,
+} from "lucide-react";
 
 import type { CacheInfo, LauncherCategoryInfo } from "./api";
 import type {
   Config,
+  DesktopSettings,
+  FenceRule,
+  FenceSettings,
   GestureSettings,
   GuardSettings,
   HotkeySettings,
   LauncherSettings,
   MonitorDto,
-  Phrase,
-  PhraseSettings,
+  NotesSettings,
   RunningApp,
   Snapshot,
   TriggerSettings,
   UiSettings,
   UpdateSettings,
 } from "./types";
+import type { FenceBoxInfo, KnownFolders } from "./api";
 import {
   cacheClear,
   cacheStats,
   copyText,
+  fenceBoxInfo,
+  fenceCreate,
+  fenceCreateBox,
+  fenceDelete,
+  fenceKnownFolders,
+  fenceRulePreview,
+  fenceRuleRun,
+  fenceSetAppearance,
+  fenceUpdate,
   launcherCategoryList,
+  notesClearAll,
+  notesDefaultFolder,
+  notesOpenFolder,
   siteTitle,
   diagnostics,
   onAppPicked,
@@ -34,7 +60,6 @@ import {
   syncPush,
   syncSave,
   syncTest,
-  togglePhrasesPanel,
 } from "./api";
 import { TriggerPreview } from "./components/TriggerPreview";
 import { Card, Row, Segmented, Slider, Tabs, Toggle } from "./components/ui";
@@ -44,8 +69,9 @@ export type Patch = {
   trigger?: Partial<TriggerSettings>;
   guard?: Partial<GuardSettings>;
   hotkeys?: Partial<HotkeySettings>;
-  phrases?: Partial<PhraseSettings>;
   launcher?: Partial<LauncherSettings>;
+  notes?: Partial<NotesSettings>;
+  desktop?: Partial<DesktopSettings>;
   updates?: Partial<UpdateSettings>;
   ui?: Partial<UiSettings>;
 };
@@ -95,7 +121,7 @@ export function Overview({
   snap: Snapshot;
   config: Config;
   update: UpdateConfig;
-  onOpen: (page: "edge" | "phrases" | "launcher") => void;
+  onOpen: (page: "edge" | "launcher" | "desktop") => void;
 }) {
   const desktops = snap.desktopCount;
   return (
@@ -105,7 +131,7 @@ export function Overview({
           <ToolRow
             icon={<Rocket size={18} />}
             name="快捷面板"
-            hint="一个键呼出：按分类找文件、搬运文件"
+            hint="一个键呼出：按分类找文件、搬运文件，还能存收藏（便签和图片）"
             enabled={config.launcher.enabled}
             onToggle={(value) => update({ launcher: { enabled: value } })}
             onOpen={() => onOpen("launcher")}
@@ -124,12 +150,12 @@ export function Overview({
             onOpen={() => onOpen("edge")}
           />
           <ToolRow
-            icon={<MessageSquare size={18} />}
-            name="常用语"
-            hint="吸附在聊天应用旁边的话术面板，点一下就填进输入框"
-            enabled={config.phrases.enabled}
-            onToggle={(value) => update({ phrases: { enabled: value } })}
-            onOpen={() => onOpen("phrases")}
+            icon={<LayoutGrid size={18} />}
+            name="桌面格子"
+            hint="桌面上摆几个绑定文件夹的小组件，文件拖进去就算整理好"
+            enabled={config.desktop.enabled}
+            onToggle={(value) => update({ desktop: { enabled: value } })}
+            onOpen={() => onOpen("desktop")}
           />
         </div>
       </Card>
@@ -871,189 +897,15 @@ export function AboutPage({
   );
 }
 
-export function PhrasesPage({
-  config,
-  update,
-}: {
-  config: Config;
-  update: UpdateConfig;
-}) {
-  const phrases = config.phrases;
-  const [picking, setPicking] = useState(false);
-  const [tab, setTab] = useState<"settings" | "phrases">("settings");
-
-  const setItems = (items: Phrase[]) => update({ phrases: { items } });
-  const patch = (id: string, part: Partial<Phrase>) =>
-    setItems(phrases.items.map((item) => (item.id === id ? { ...item, ...part } : item)));
-
-  return (
-    <div className="stack">
-      <Tabs
-        value={tab}
-        options={[
-          { value: "settings", label: "设置" },
-          { value: "phrases", label: "话术" },
-        ]}
-        onChange={setTab}
-      />
-      {tab === "settings" ? (
-      <Card
-        title="吸附"
-        action={
-          <button
-            type="button"
-            className="btn"
-            onClick={() => setPicking(true)}
-          >
-            选择应用
-          </button>
-        }
-      >
-        <Row label="跟随应用" hint="它在前台时面板贴到窗口旁边；不选则面板固定不动">
-          <span className="sub">{phrases.target || "未选择"}</span>
-        </Row>
-        {phrases.targetClass && (
-          <Row label="窗口类名" hint="应用改名也不影响，比 exe 名更稳">
-            <span className="sub">{phrases.targetClass}</span>
-          </Row>
-        )}
-        <Row label="点击话术" hint="默认只填入输入框；选「填入并发送」会再按一次回车">
-          <Segmented
-            value={phrases.sendOnClick ? "send" : "fill"}
-            options={[
-              { value: "fill", label: "只填入" },
-              { value: "send", label: "填入并发送" },
-            ]}
-            onChange={(value) => update({ phrases: { sendOnClick: value === "send" } })}
-          />
-        </Row>
-        <Row label="发送按键" hint="有的聊天软件用 Ctrl+回车 才是发送">
-          <Segmented
-            value={phrases.sendKey}
-            options={[
-              { value: "enter", label: "回车" },
-              { value: "ctrlEnter", label: "Ctrl+回车" },
-            ]}
-            onChange={(value) =>
-              update({ phrases: { sendKey: value as "enter" | "ctrlEnter" } })
-            }
-          />
-        </Row>
-        <Row label="外侧 / 内侧" hint="内侧会叠在目标窗口上，从窗口边缘往里展开">
-          <Segmented
-            value={phrases.inside ? "inside" : "outside"}
-            options={[
-              { value: "outside", label: "外侧" },
-              { value: "inside", label: "内侧" },
-            ]}
-            onChange={(value) => update({ phrases: { inside: value === "inside" } })}
-          />
-        </Row>
-        <Row label="贴哪一侧">
-          <Segmented
-            value={phrases.side}
-            options={[
-              { value: "right", label: "右侧" },
-              { value: "left", label: "左侧" },
-            ]}
-            onChange={(side) => update({ phrases: { side } })}
-          />
-        </Row>
-        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-          <button type="button" className="btn primary" onClick={() => void togglePhrasesPanel()}>
-            显示面板
-          </button>
-          {phrases.target && (
-            <button
-              type="button"
-              className="btn"
-              onClick={() =>
-                update({ phrases: { target: "", targetClass: "", targetTitle: "" } })
-              }
-            >
-              取消吸附
-            </button>
-          )}
-        </div>
-      </Card>
-      ) : (
-      <Card
-        title="话术"
-        action={
-          <button
-            type="button"
-            className="btn"
-            onClick={() =>
-              setItems([
-                ...phrases.items,
-                { id: `p${Date.now()}`, title: "", text: "" },
-              ])
-            }
-          >
-            添加一条
-          </button>
-        }
-      >
-        {phrases.items.length === 0 && (
-          <p className="sub" style={{ margin: 0 }}>
-            还没有话术，点右上角添加。
-          </p>
-        )}
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {phrases.items.map((item) => (
-            <div className="phrase-row" key={item.id}>
-              <textarea
-                className="phrase-text"
-                rows={2}
-                value={item.text}
-                placeholder="输入话术内容"
-                onChange={(event) => patch(item.id, { text: event.target.value })}
-              />
-              <button
-                type="button"
-                className="btn"
-                onClick={() =>
-                  setItems(phrases.items.filter((entry) => entry.id !== item.id))
-                }
-              >
-                删除
-              </button>
-            </div>
-          ))}
-        </div>
-      </Card>
-      )}
-
-      {picking && (
-        <AppPicker
-          title="吸附到哪个应用"
-          hint="只在它处于前台时贴过去；也可以点「拾取窗口」直接点屏幕上的程序。"
-          onPick={(app) => {
-            update({
-              phrases: {
-                target: app.name,
-                targetClass: app.class ?? "",
-                targetTitle: app.title ?? "",
-              },
-            });
-            setPicking(false);
-          }}
-          onClose={() => setPicking(false)}
-        />
-      )}
-    </div>
-  );
-}
-
 /** 热键按工具分组：每个工具一组，工具页里不再重复配置。 */
 const HOTKEY_GROUPS: Array<{
   tool: string;
   hint: string;
-  rows: Array<{ key: "pause" | "phrasesPanel" | "launcher"; label: string; hint: string }>;
+  rows: Array<{ key: "pause" | "launcher"; label: string; hint: string }>;
 }> = [
   {
     tool: "快捷面板",
-    hint: "一个键呼出：文件分类 / 快速访问 / 内置网页",
+    hint: "一个键呼出：文件分类 / 快速访问 / 收藏 / 内置网页",
     rows: [
       { key: "launcher", label: "呼出面板", hint: "任何时候按一下就能呼出" },
     ],
@@ -1063,13 +915,6 @@ const HOTKEY_GROUPS: Array<{
     hint: "停掉边缘切换不用打开窗口",
     rows: [
       { key: "pause", label: "暂停 / 继续", hint: "随手停掉边缘切换，不用打开窗口" },
-    ],
-  },
-  {
-    tool: "常用语",
-    hint: "话术面板的显示与隐藏",
-    rows: [
-      { key: "phrasesPanel", label: "显示 / 隐藏面板", hint: "在聊天窗口旁边叫出话术面板" },
     ],
   },
 ];
@@ -1323,8 +1168,8 @@ export function LauncherPage({
 }: {
   config: Config;
   update: UpdateConfig;
-  tab: "items" | "folders" | "sites";
-  onTabChange: (tab: "items" | "folders" | "sites") => void;
+  tab: "items" | "folders" | "sites" | "notes";
+  onTabChange: (tab: "items" | "folders" | "sites" | "notes") => void;
 }) {
   const root = config.launcher.root;
   const folders = config.launcher.folders ?? [];
@@ -1361,15 +1206,64 @@ export function LauncherPage({
     update({ launcher: { folders: [...folders, picked] } });
   };
 
+  // ---- 收藏 ----
+  // 清空要点两下：第一下只是把按钮变成「确认清空」。
+  const [clearArmed, setClearArmed] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [notesNote, setNotesNote] = useState<string | null>(null);
+
+  // 配置留空时实际用的是默认目录。别在 folder 变化后回读后端解析的路径：
+  // 保存有 300 ms 防抖，回读常赶在落盘前，改完目录这一栏还显示旧的。自定义
+  // 目录直接显示配置值，只有留空时才需要这个与配置无关的默认目录。
+  const [defaultNotesPath, setDefaultNotesPath] = useState("");
+  useEffect(() => {
+    let alive = true;
+    void notesDefaultFolder()
+      .then((path) => {
+        if (alive) setDefaultNotesPath(path);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const notesPath = config.notes.folder || defaultNotesPath;
+
+  const chooseNotesFolder = async () => {
+    const picked = await pickFolder();
+    if (picked) update({ notes: { folder: picked } });
+  };
+
+  const clearNotes = async () => {
+    if (!clearArmed) {
+      setClearArmed(true);
+      window.setTimeout(() => setClearArmed(false), 3000);
+      return;
+    }
+    setClearArmed(false);
+    setClearing(true);
+    try {
+      const count = await notesClearAll();
+      setNotesNote(count ? `已把 ${count} 条收藏移到回收站` : "没有可清空的收藏");
+    } catch (error) {
+      setNotesNote(String(error));
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <div className="stack">
       <Tabs
         value={tab}
-        onChange={(value) => onTabChange(value as "items" | "folders" | "sites")}
+        onChange={(value) =>
+          onTabChange(value as "items" | "folders" | "sites" | "notes")
+        }
         options={[
           { value: "items", label: "快捷启动" },
           { value: "folders", label: "快速访问" },
           { value: "sites", label: "内置网页" },
+          { value: "notes", label: "收藏" },
         ]}
       />
 
@@ -1683,6 +1577,70 @@ export function LauncherPage({
             </button>
           </div>
         </Card>
+      ) : tab === "notes" ? (
+        <Card title="收藏">
+          <p className="sub" style={{ marginTop: 0 }}>
+            收藏是面板里的便签：写 Markdown 文字，也可以把图片拖进去。每个笔记都是一个
+            .md 文件，图片放在旁边的 images 文件夹里，整个目录可以直接用别的编辑器打开、
+            或者丢进同步盘。点「发送」会收起面板，把文字逐字输入到呼出前的窗口。
+          </p>
+          <Row label="启用收藏" hint="在呼出面板左侧显示「收藏」这一栏">
+            <Toggle
+              checked={config.notes.enabled !== false}
+              onChange={(value) => update({ notes: { enabled: value } })}
+            />
+          </Row>
+          <Row
+            label="保存位置"
+            hint="默认是「文档\HexBench 收藏」，也可以换成同步盘里的文件夹"
+          >
+            <div className="hotkey-cell">
+              <code title={notesPath}>{notesPath || "文档\\HexBench 收藏"}</code>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => void chooseNotesFolder()}
+              >
+                选择
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() =>
+                  void notesOpenFolder().catch((error) => setNotesNote(String(error)))
+                }
+              >
+                打开
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={!config.notes.folder}
+                title="改回默认目录"
+                onClick={() => update({ notes: { folder: "" } })}
+              >
+                默认
+              </button>
+            </div>
+          </Row>
+          <Row label="发送后自动回车" hint="适合聊天框、搜索框；往邮件正文里发时别开">
+            <Toggle
+              checked={config.notes.sendEnter}
+              onChange={(value) => update({ notes: { sendEnter: value } })}
+            />
+          </Row>
+          <Row label="清空全部收藏" hint="笔记和图片都会进回收站，之后还能从回收站找回">
+            <button
+              type="button"
+              className="btn"
+              disabled={clearing}
+              onClick={() => void clearNotes()}
+            >
+              {clearing ? "清空中…" : clearArmed ? "确认清空" : "清空…"}
+            </button>
+          </Row>
+          {notesNote && <div className="row-hint">{notesNote}</div>}
+        </Card>
       ) : (
         <Card title="快速访问">
           <p className="sub" style={{ marginTop: 0 }}>
@@ -1737,7 +1695,642 @@ export function LauncherPage({
     </div>
   );
 }
+/// 整理规则的编辑器：文字框失焦才保存，开关 / 增删立刻保存。
+/// 后端会给新规则补 id，回来的是同一份内容，所以直接按规则数组整份提交。
+function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
+  const [draft, setDraft] = useState<FenceRule[]>(fence.rules ?? []);
+  const [known, setKnown] = useState<KnownFolders | null>(null);
+  const [preview, setPreview] = useState<{ total: number; names: string[] } | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  // 上一次和后端对齐过的内容：别的设置触发的 config 刷新不该把正在敲的字冲掉。
+  const savedRef = useRef(JSON.stringify(fence.rules ?? []));
+
+  useEffect(() => {
+    const incoming = JSON.stringify(fence.rules ?? []);
+    if (incoming !== savedRef.current) {
+      savedRef.current = incoming;
+      setDraft(fence.rules ?? []);
+    }
+  }, [fence.rules]);
+
+  useEffect(() => {
+    void fenceKnownFolders().then(setKnown).catch(() => undefined);
+  }, []);
+
+  const save = (next: FenceRule[]) => {
+    setDraft(next);
+    setNote(null);
+    void fenceUpdate(fence.id, { rules: next }).catch((problem) => setNote(String(problem)));
+  };
+
+  const patch = (index: number, change: Partial<FenceRule>) => {
+    setDraft((current) =>
+      current.map((rule, at) => (at === index ? { ...rule, ...change } : rule)),
+    );
+  };
+
+  const without = (index: number) => draft.filter((_, at) => at !== index);
+
+  const addSource = (index: number, source: string | null | undefined) => {
+    const rule = draft[index];
+    if (!source || !rule || rule.sources.includes(source)) return;
+    save(
+      draft.map((item, at) =>
+        at === index ? { ...item, sources: [...item.sources, source] } : item,
+      ),
+    );
+  };
+
+  const pickSource = async (index: number) => {
+    const picked = await pickFolder();
+    addSource(index, picked);
+  };
+
+  const addRule = () => {
+    const rule: FenceRule = {
+      id: `r${Date.now().toString(36)}`,
+      name: "新规则",
+      enabled: true,
+      exts: [],
+      nameContains: "",
+      minMb: 0,
+      maxMb: 0,
+      olderThanDays: 0,
+      // 新规则先不挂来源：一条没有任何条件的规则配上下载目录，
+      // 下一次下载就会把整个目录扫进来。来源由用户明确加。
+      sources: [],
+      subdir: "",
+    };
+    save([...draft, rule]);
+  };
+
+  const runPreview = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const matches = await fenceRulePreview(fence.id);
+      setPreview({
+        total: matches.length,
+        names: matches.slice(0, 8).map((match) => match.name),
+      });
+    } catch (problem) {
+      setNote(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runNow = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const result = await fenceRuleRun(fence.id);
+      setPreview(null);
+      setNote(
+        result.moved > 0
+          ? `已收进 ${result.moved} 项（匹配 ${result.matched} 项）`
+          : "没有可整理的文件",
+      );
+    } catch (problem) {
+      setNote(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rule-editor">
+      <p className="sub" style={{ marginTop: 0 }}>
+        按规则把来源目录里的文件收进这个盒子。盒子自己和收纳目录永远不会被再收一次；
+        一次整理算一步撤销（Ctrl+Z 能退）。
+      </p>
+      <Row label="自动整理" hint="来源目录一有变化就按规则收；关掉只能手动点「立即整理」">
+        <Toggle
+          checked={fence.rulesAuto}
+          onChange={(value) => void fenceUpdate(fence.id, { rulesAuto: value })}
+        />
+      </Row>
+      {draft.length === 0 && (
+        <div className="row-hint">
+          还没有规则。没有规则时它就是普通收纳盒：拖什么进来收什么。
+        </div>
+      )}
+      {draft.map((rule, index) => (
+        <div className="rule-card" key={rule.id || index}>
+          <div className="rule-head">
+            <Toggle
+              checked={rule.enabled}
+              onChange={(value) =>
+                save(draft.map((item, at) => (at === index ? { ...item, enabled: value } : item)))
+              }
+            />
+            <input
+              className="side-input"
+              style={{ flex: 1 }}
+              value={rule.name}
+              placeholder="规则名（也是默认子目录名）"
+              onChange={(event) => patch(index, { name: event.target.value })}
+              onBlur={() => save(draft)}
+            />
+            <button
+              type="button"
+              className="icon-btn danger"
+              title="删除这条规则"
+              onClick={() => save(without(index))}
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
+          <div className="rule-grid">
+            <label>
+              后缀
+              <input
+                className="side-input"
+                value={rule.exts.join(", ")}
+                placeholder="png, jpg（空 = 不限）"
+                onChange={(event) =>
+                  patch(index, {
+                    exts: event.target.value
+                      .split(/[,，\s]+/)
+                      .map((ext) => ext.trim())
+                      .filter(Boolean),
+                  })
+                }
+                onBlur={() => save(draft)}
+              />
+            </label>
+            <label>
+              名称包含
+              <input
+                className="side-input"
+                value={rule.nameContains}
+                placeholder="可选"
+                onChange={(event) => patch(index, { nameContains: event.target.value })}
+                onBlur={() => save(draft)}
+              />
+            </label>
+            <label>
+              大于 MB
+              <input
+                className="side-input"
+                type="number"
+                min={0}
+                value={rule.minMb}
+                onChange={(event) => patch(index, { minMb: Number(event.target.value) || 0 })}
+                onBlur={() => save(draft)}
+              />
+            </label>
+            <label>
+              小于 MB
+              <input
+                className="side-input"
+                type="number"
+                min={0}
+                value={rule.maxMb}
+                onChange={(event) => patch(index, { maxMb: Number(event.target.value) || 0 })}
+                onBlur={() => save(draft)}
+              />
+            </label>
+            <label>
+              早于 N 天
+              <input
+                className="side-input"
+                type="number"
+                min={0}
+                value={rule.olderThanDays}
+                onChange={(event) =>
+                  patch(index, { olderThanDays: Number(event.target.value) || 0 })
+                }
+                onBlur={() => save(draft)}
+              />
+            </label>
+            <label>
+              收进子目录
+              <input
+                className="side-input"
+                value={rule.subdir}
+                placeholder="可选，例如 图片"
+                onChange={(event) => patch(index, { subdir: event.target.value })}
+                onBlur={() => save(draft)}
+              />
+            </label>
+          </div>
+          <div className="rule-sources">
+            <span className="row-label">来源</span>
+            {rule.sources.length === 0 && (
+              <span className="row-hint">还没有来源，这条规则不会收任何文件</span>
+            )}
+            {rule.sources.map((source) => (
+              <span className="chip" key={source} title={source}>
+                <span>{source}</span>
+                <button
+                  type="button"
+                  title="移除这个来源"
+                  onClick={() =>
+                    save(
+                      draft.map((item, at) =>
+                        at === index
+                          ? { ...item, sources: item.sources.filter((one) => one !== source) }
+                          : item,
+                      ),
+                    )
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {known?.desktop && !rule.sources.includes(known.desktop) && (
+              <button type="button" className="btn" onClick={() => addSource(index, known.desktop)}>
+                桌面
+              </button>
+            )}
+            {known?.downloads && !rule.sources.includes(known.downloads) && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => addSource(index, known.downloads)}
+              >
+                下载
+              </button>
+            )}
+            <button type="button" className="btn" onClick={() => void pickSource(index)}>
+              选文件夹…
+            </button>
+            {rule.sources.length > 0 &&
+              rule.exts.length === 0 &&
+              !rule.nameContains.trim() &&
+              rule.minMb === 0 &&
+              rule.maxMb === 0 &&
+              rule.olderThanDays === 0 && (
+                <span className="row-hint">
+                  没有条件：这些来源里的所有文件都会被收进来
+                </span>
+              )}
+          </div>
+        </div>
+      ))}
+      <div className="rule-actions">
+        <button type="button" className="btn" onClick={addRule}>
+          <Plus size={14} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+          添加规则
+        </button>
+        <button
+          type="button"
+          className="btn"
+          disabled={busy || draft.length === 0}
+          onClick={() => void runPreview()}
+        >
+          预览
+        </button>
+        <button
+          type="button"
+          className="btn primary"
+          disabled={busy || draft.length === 0}
+          onClick={() => void runNow()}
+        >
+          立即整理
+        </button>
+      </div>
+      {preview && (
+        <div className="row-hint">
+          匹配 {preview.total} 项
+          {preview.total > 0
+            ? `：${preview.names.join("、")}${preview.total > preview.names.length ? " …" : ""}`
+            : ""}
+        </div>
+      )}
+      {note && <div className="row-hint">{note}</div>}
+    </div>
+  );
+}
+
 /// 设置页里的「手势」：快捷面板文件区的右键滑动。
+/// 桌面格子：总开关 + 格子列表。增删改走专属命令，其余设置走 save_config。
+export function DesktopPage({ config, update }: { config: Config; update: UpdateConfig }) {
+  const desktop = config.desktop;
+  const fences = desktop.fences ?? [];
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // 哪一格的整理规则展开着（同一时间只开一个）。
+  const [openRules, setOpenRules] = useState<string | null>(null);
+  // 删除收纳盒前问文件怎么处理；普通格子直接确认删掉。
+  const [deleting, setDeleting] = useState<{
+    fence: FenceSettings;
+    info: FenceBoxInfo;
+  } | null>(null);
+
+  // 外观滑块要跟手：先改本地值，停手 220ms 再写配置、通知所有格子换色。
+  const [opacity, setOpacity] = useState(desktop.opacity);
+  const [frosted, setFrosted] = useState(desktop.frosted);
+  const pendingAppearance = useRef<{ opacity: number; frosted: boolean } | null>(null);
+  const appearanceTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    setOpacity(desktop.opacity);
+    setFrosted(desktop.frosted);
+  }, [desktop.opacity, desktop.frosted]);
+
+  const applyAppearance = (nextOpacity: number, nextFrosted: boolean) => {
+    // 设置页手里这份配置也立刻跟上：拖完滑块紧接着点别的开关时，保存的
+    // 不会还是旧的不透明度。
+    update({ desktop: { opacity: nextOpacity, frosted: nextFrosted } });
+    pendingAppearance.current = { opacity: nextOpacity, frosted: nextFrosted };
+    window.clearTimeout(appearanceTimer.current);
+    appearanceTimer.current = window.setTimeout(() => {
+      const pending = pendingAppearance.current;
+      pendingAppearance.current = null;
+      if (!pending) return;
+      void fenceSetAppearance(pending.opacity, pending.frosted).catch((problem) =>
+        setError(String(problem)),
+      );
+    }, 220);
+  };
+
+  // 页关掉时还有没落盘的改动：直接发出去，别让最后一格拖动白调。
+  useEffect(
+    () => () => {
+      window.clearTimeout(appearanceTimer.current);
+      const pending = pendingAppearance.current;
+      if (pending) {
+        void fenceSetAppearance(pending.opacity, pending.frosted).catch(() => undefined);
+      }
+    },
+    [],
+  );
+
+  const addFence = async () => {
+    const picked = await pickFolder();
+    if (!picked) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await fenceCreate(picked);
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /// 新建收纳盒：幕后目录由后端建，不用选文件夹。
+  const addBox = async () => {
+    const used = fences.filter((fence) => fence.kind === "bucket").length;
+    setBusy(true);
+    setError(null);
+    try {
+      await fenceCreateBox(`收纳盒 ${used + 1}`);
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /// 删除入口：收纳盒里有东西时先问文件怎么办，空的 / 普通格子直接删。
+  const askDelete = async (fence: FenceSettings) => {
+    setError(null);
+    if (fence.kind === "bucket") {
+      try {
+        const info = await fenceBoxInfo(fence.id);
+        if (info && info.items > 0) {
+          setDeleting({ fence, info });
+          return;
+        }
+      } catch (problem) {
+        setError(String(problem));
+        return;
+      }
+    }
+    if (!window.confirm(`删除「${fence.title || folderLabel(fence.path)}」这个格子？`)) return;
+    void fenceDelete(fence.id).catch((problem) => setError(String(problem)));
+  };
+
+  const finishDelete = (mode: "release" | "purge" | "keep") => {
+    const target = deleting;
+    setDeleting(null);
+    if (!target) return;
+    void fenceDelete(target.fence.id, mode).catch((problem) => setError(String(problem)));
+  };
+
+  return (
+    <div className="stack">
+      <Card title="桌面格子">
+        <p className="sub" style={{ marginTop: 0 }}>
+          在桌面上摆几个绑定文件夹的小组件：文件拖进去就算整理好，系统桌面图标照常使用。
+        </p>
+        <Row label="开启桌面格子" hint="关掉会销毁所有格子窗口，位置和设置保留">
+          <Toggle
+            checked={desktop.enabled}
+            onChange={(value) => update({ desktop: { enabled: value } })}
+          />
+        </Row>
+        <Row label="按 Win+D 时保持可见" hint="关掉就跟着系统桌面一起藏起来">
+          <Toggle
+            checked={desktop.keepOnShowDesktop}
+            onChange={(value) => update({ desktop: { keepOnShowDesktop: value } })}
+          />
+        </Row>
+        <Row label="移动时吸附" hint="按住 Alt 拖动可临时暂停；对齐时显示参考线">
+          <Toggle
+            checked={desktop.snap}
+            onChange={(value) => update({ desktop: { snap: value } })}
+          />
+        </Row>
+        <Row label="吸附到 8px 网格" hint="不贴边时也按网格对齐">
+          <Toggle
+            checked={desktop.snapGrid}
+            onChange={(value) => update({ desktop: { snapGrid: value } })}
+          />
+        </Row>
+        <Row
+          label="原生渲染（Beta）"
+          hint="内存约为 WebView 版的十分之一；拖放、右键菜单、边角缩放、跟随桌面隐藏都已支持，还差 Alt+滚轮缩放；关掉即切回"
+        >
+          <Toggle
+            checked={desktop.native}
+            onChange={(value) => update({ desktop: { native: value } })}
+          />
+        </Row>
+      </Card>
+
+      <Card title="外观">
+        <Row label="不透明度" hint="越低背后的壁纸 / 磨砂透得越多；太低字会和背景糊在一起">
+          <Slider
+            value={opacity}
+            min={30}
+            max={100}
+            step={1}
+            onChange={(value) => {
+              setOpacity(value);
+              applyAppearance(value, frosted);
+            }}
+            format={(value) => `${value}%`}
+          />
+        </Row>
+        <Row label="磨砂（模糊背景）" hint="关掉就是纯透明玻璃：壁纸原样透出来，不模糊">
+          <Toggle
+            checked={frosted}
+            onChange={(value) => {
+              setFrosted(value);
+              applyAppearance(opacity, value);
+            }}
+          />
+        </Row>
+        <p className="sub" style={{ marginBottom: 0 }}>
+          所有格子共用这一份外观，改完立刻生效。系统不支持磨砂时，卡片会自动变成近乎纯色。
+        </p>
+      </Card>
+
+      <Card
+        title="格子"
+        action={
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" className="btn" disabled={busy || fences.length >= 8} onClick={() => void addFence()}>
+              <FolderOpen size={14} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+              添加文件夹格子
+            </button>
+            <button
+              type="button"
+              className="btn primary"
+              disabled={busy || fences.length >= 8}
+              onClick={() => void addBox()}
+            >
+              <Inbox size={14} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+              新建收纳盒
+            </button>
+          </div>
+        }
+      >
+        {fences.length === 0 ? (
+          <div className="empty-inline">
+            <LayoutGrid size={20} />
+            <span>
+              还没有格子。绑一个文件夹，或者新建一个收纳盒：拖进去的文件真的会被收起来。
+            </span>
+          </div>
+        ) : (
+          <div className="fence-list">
+            {fences.map((fence) => {
+              const isBox = fence.kind === "bucket";
+              const ruleCount = fence.rules?.length ?? 0;
+              return (
+                <div className="fence-item" key={fence.id}>
+                  <div className="fence-row">
+                    <span className="fence-glyph" aria-hidden>
+                      {isBox ? <Inbox size={16} /> : <LayoutGrid size={16} />}
+                    </span>
+                    <span className="fence-text">
+                      <span className="fence-name">
+                        {fence.title || folderLabel(fence.path)}
+                        {isBox && (
+                          <span className="fence-badge">{ruleCount > 0 ? "整理盒" : "收纳盒"}</span>
+                        )}
+                        {fence.rolled ? "（卷起）" : ""}
+                      </span>
+                      <span className="fence-path mono" title={fence.path}>
+                        {isBox ? `收纳目录 · ${fence.path}` : fence.path || "没有绑定文件夹"}
+                      </span>
+                      <span className="row-hint">
+                        {fence.monitor || "主显示器"} ·{" "}
+                        {`${Math.round(fence.w * 100)}% × ${Math.round(fence.h * 100)}%`}
+                        {fence.zoom !== 100 ? ` · ${fence.zoom}% 排版` : ""}
+                        {isBox && ruleCount > 0
+                          ? ` · ${ruleCount} 条规则${fence.rulesAuto ? "（自动）" : "（手动）"}`
+                          : ""}
+                      </span>
+                    </span>
+                    <span className="fence-actions">
+                      <EyeButton
+                        hidden={!fence.visible}
+                        onClick={() =>
+                          void fenceUpdate(fence.id, { visible: !fence.visible }).catch(
+                            (problem) => setError(String(problem)),
+                          )
+                        }
+                      />
+                      {isBox && (
+                        <button
+                          type="button"
+                          className={`icon-btn${openRules === fence.id ? " active" : ""}`}
+                          title="整理规则"
+                          onClick={() =>
+                            setOpenRules((current) => (current === fence.id ? null : fence.id))
+                          }
+                        >
+                          <SlidersHorizontal size={15} />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title={isBox ? "打开收纳目录" : "在资源管理器中打开"}
+                        disabled={!fence.path}
+                        onClick={() => void openPath(fence.path)}
+                      >
+                        <FolderOpen size={15} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn danger"
+                        title="删除这个格子"
+                        onClick={() => void askDelete(fence)}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </span>
+                  </div>
+                  {isBox && openRules === fence.id && <FenceRulesEditor fence={fence} />}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div className="row-hint" style={{ marginTop: 10 }}>
+          桌面上：拖标题条移动，拖边缘 / 四角缩放，双击标题条卷起；右键文件用系统菜单；
+          双击文件夹进入，Alt+滚轮缩放排版。收纳盒里的文件拖出去也能放回桌面。
+        </div>
+        {error && <div className="row-error">{error}</div>}
+        {fences.length >= 8 && (
+          <div className="row-hint" style={{ marginTop: 8 }}>
+            每多一个格子就多一个 WebView，最多 8 个。
+          </div>
+        )}
+      </Card>
+
+      {deleting && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="删除收纳盒">
+          <div className="modal">
+            <h2>删除「{deleting.fence.title || "收纳盒"}」？</h2>
+            <p>
+              收纳盒里还有 {deleting.info.items} 个文件（{formatBytes(deleting.info.bytes)}）。
+              文件怎么处理？
+            </p>
+            <div className="modal-actions" style={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <button type="button" className="btn" onClick={() => setDeleting(null)}>
+                取消
+              </button>
+              <button type="button" className="btn" onClick={() => finishDelete("keep")}>
+                保留文件
+              </button>
+              <button type="button" className="btn" onClick={() => finishDelete("purge")}>
+                删到回收站
+              </button>
+              <button type="button" className="btn primary" onClick={() => finishDelete("release")}>
+                移到桌面
+              </button>
+            </div>
+            <p className="sub" style={{ marginBottom: 0 }}>
+              「保留文件」只删格子，文件继续留在收纳目录里；「移到桌面」会把它们都放到系统桌面。
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function GesturePage({ config, update }: { config: Config; update: UpdateConfig }) {
   const g: GestureSettings = config.launcher.gestures ?? {
     enabled: true,
@@ -1752,7 +2345,8 @@ export function GesturePage({ config, update }: { config: Config; update: Update
     <div className="stack">
       <Card title="鼠标手势">
         <p className="sub" style={{ marginTop: 0 }}>
-          在快捷面板的文件区按住右键横着划：默认向左后退、向右前进，松手后执行，不弹右键菜单。
+          在快捷面板的文件区、桌面格子的文件区按住右键横着划：默认向左后退、向右前进，
+          松手后执行，不弹右键菜单。格子里的后退 / 前进走的是你进出过的目录。
           只在文件区生效，用右键慢慢点开菜单不受影响。
         </p>
         <Row label="启用手势">

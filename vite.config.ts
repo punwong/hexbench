@@ -16,8 +16,9 @@ export default defineConfig({
       input: {
         main: "index.html",
         overlay: "overlay.html",
-        phrases: "phrases.html",
         launcher: "launcher.html",
+        fence: "fence.html",
+        "snap-guides": "snap-guides.html",
         web: "web.html",
       },
     },

@@ -13,6 +13,31 @@ import ReactDOM from "react-dom/client";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  GRID_CELL_W,
+  GRID_GAP,
+  GRID_PAD,
+  GRID_TILE_H,
+  ICON_BASE,
+  LIST_GAP,
+  LIST_PAD,
+  LIST_ROW_H,
+  SORT_KEYS,
+  SORT_LABELS,
+  ZOOM_DEFAULT,
+  clampZoom,
+  displayName,
+  folderLabel,
+  formatDate,
+  formatSize,
+  sortItems,
+  stepZoom,
+  type LauncherItem,
+  type LauncherPage,
+  type SortKey,
+} from "./fileview";
+import { watchTheme } from "./theme";
+import { GESTURE_DEFAULT, useMouseGestures, type GestureSettings } from "./gesture";
 
 /** "top:0;left:8px" → { top: "0", left: "8px" }，省得写 8 组 style 对象。 */
 function cssFrom(source: string): Record<string, string> {
@@ -27,32 +52,6 @@ function cssFrom(source: string): Record<string, string> {
   );
 }
 
-type LauncherItem = {
-  name: string;
-  path: string;
-  isDir: boolean;
-  size: number;
-  modified: number;
-  icon: string | null;
-};
-
-/// 流式列目录的一页（对应后端的 `LauncherPage`）。
-type LauncherPage = { items: LauncherItem[]; done: boolean };
-
-/// 虚拟滚动的尺寸参数，必须和 `launcher.html` 里的网格/列表样式一致。
-const GRID_CELL_W = 108;
-const GRID_GAP = 22;
-// 48(图标) + 6(间距) + 两行名字(约 32.4) + 上下内边距(18)，留一点余量。
-const GRID_TILE_H = 106;
-const GRID_PAD = 22;
-const LIST_ROW_H = 36;
-const LIST_GAP = 10;
-const LIST_PAD = 10;
-/// 文件区排版缩放（Alt+滚轮）的几档：100% 是默认大小，也是最小，只能往大了放。
-const ZOOM_STEPS = [100, 110, 120, 130, 140, 150];
-const ZOOM_DEFAULT = 100;
-/// 图标走 Tauri 自定义协议：Windows 上地址是 `http://<scheme>.localhost`。
-const ICON_BASE = "http://hbicon.localhost/";
 /// 除了屏幕上可见的，再多要一屏多的图标：滚下去的时候已经准备好了。
 const ICON_LOOKAHEAD = 96;
 /// 拖拽预览用的预热：侧边栏每个文件夹备头一屏的图标。
@@ -70,6 +69,8 @@ type LauncherRoot = {
   sites: Array<{ name: string; url: string }>;
   /** 设置里的「内置网页」开关：开着就默认展开右侧栏 */
   webEnabled: boolean;
+  /** 设置里的「收藏」开关：关掉就不显示收藏那一栏 */
+  notesEnabled: boolean;
   view: string;
   sortKey: string;
   sortDir: number;
@@ -93,147 +94,28 @@ type LauncherRoot = {
   gestures: GestureSettings;
 };
 
-/// 文件区的鼠标手势：按住右键左右划 = 后退 / 前进。
-type GestureSettings = {
-  enabled: boolean;
-  invertDirection: boolean;
-  triggerDistance: number;
-  showTrail: boolean;
-};
-
-/// 手势进行中的状态。全放在 ref 里：pointermove 每帧都要读，走 React 状态会重渲染整张列表。
-type GestureRuntime = {
-  active: boolean;
-  pointerId: number;
-  startX: number;
-  startY: number;
-  lastX: number;
-  lastY: number;
-  /** 已经判定为横向手势（超过起步距离且横向占优） */
-  recognized: boolean;
-  direction: "back" | "forward" | null;
-  points: Array<{ x: number; y: number }>;
-  /** contextmenu 抑制截止时间（performance.now()） */
-  suppressUntil: number;
-  line: string;
-  glow: string;
-  raf: number;
-  hideTimer: number;
-};
-
-const GESTURE_START = 8;
-/// 手势结束后还要按住右键菜单一小会儿：WebView2 的 contextmenu 在松开之后才来。
-const GESTURE_SUPPRESS_MS = 600;
-const GESTURE_DEFAULT: GestureSettings = {
-  enabled: true,
-  invertDirection: false,
-  triggerDistance: 80,
-  showTrail: true,
-};
-
-/** 横向位移决定动作；默认向左后退，开了「左右互换」就反过来。 */
-function gestureAction(dx: number, invert: boolean): "back" | "forward" {
-  if (dx < 0) return invert ? "forward" : "back";
-  return invert ? "back" : "forward";
-}
-
-/** 配置文件被手改坏也不至于滑半天不动：夹到 20–400px。 */
-function gestureDistance(value: number): number {
-  return Number.isFinite(value) ? Math.min(400, Math.max(20, value)) : 80;
-}
-
-/// 把任意百分比吸附到最近的一档；比默认还小 / 非法的值一律按 100 算。
-function clampZoom(value: number): number {
-  if (!Number.isFinite(value) || value <= ZOOM_DEFAULT) return ZOOM_DEFAULT;
-  let best = ZOOM_STEPS[0];
-  for (const step of ZOOM_STEPS) {
-    if (Math.abs(step - value) < Math.abs(best - value)) best = step;
-  }
-  return best;
-}
-
-/// 沿档位表滚一格，到头就不动。
-function stepZoom(current: number, direction: 1 | -1): number {
-  const index = ZOOM_STEPS.indexOf(clampZoom(current));
-  const next = Math.min(ZOOM_STEPS.length - 1, Math.max(0, index + direction));
-  return ZOOM_STEPS[next];
-}
-
-type SortKey = "name" | "modified" | "size" | "type" | "frequent";
-
-/// 和资源管理器一致的排序：数字按数值比（`图2 < 图10`）。
-/// 资源管理器用的是 Shell 的 StrCmpLogicalW，`numeric` 就是它的等价物。
-const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
-
-const SORT_LABELS: Record<SortKey, string> = {
-  name: "名称",
-  modified: "修改时间",
-  size: "大小",
-  type: "类型",
-  frequent: "使用频率",
-};
-
-/// 和资源管理器一致的排序：文件夹在前，数字按数值比（`图2 < 图10`）。
-/// 「使用频率」按面板里打开过的次数排，用得多（升序时用得少）的在前。
-function sortItems(
-  list: LauncherItem[],
-  order: { key: SortKey; dir: number },
-  usage: Record<string, number> = {},
-): LauncherItem[] {
-  const sorted = [...list];
-  sorted.sort((a, b) => {
-    // 使用次数不同的先按次数排：常打开的文件不该被没碰过的文件夹压下去。
-    if (order.key === "frequent") {
-      const delta = (usage[a.path] ?? 0) - (usage[b.path] ?? 0);
-      if (delta !== 0) return delta * order.dir;
-      // 次数一样（多数是一次都没打开过的）：文件夹在前、按名字升序。
-      // 这里不跟着升降序翻——方向说的是「常用在前 / 不常用在前」，不是名字。
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      return collator.compare(a.name, b.name);
-    }
-    // 按修改时间排：文件夹和文件一起排。文件夹也有修改时间，如果还让它
-    // 永远压在顶上，「按时间排序」看的就是两段各自排好的列表，不是真在按时间。
-    // 时间相同（文件夹常常是同一秒建的）再按名字，免得顺序每刷新一次就变。
-    if (order.key === "modified") {
-      return (a.modified - b.modified) * order.dir || collator.compare(a.name, b.name);
-    }
-    // 其余情况文件夹在前，和资源管理器一致。
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-    let result = 0;
-    switch (order.key) {
-      case "size":
-        result = a.size - b.size;
-        break;
-      case "type":
-        result =
-          collator.compare(extensionOf(a.name), extensionOf(b.name)) ||
-          collator.compare(a.name, b.name);
-        break;
-      default:
-        result = collator.compare(a.name, b.name);
-    }
-    return result * order.dir;
-  });
-  return sorted;
-}
-
 /** 面板现在浏览的是哪一片区域。 */
 type Scope =
   | { kind: "all" }
   /** 一棵真实的目录树：某个分类，或者一个常用文件夹。 */
-  | { kind: "folder"; base: string; label: string; pinned?: boolean };
+  | { kind: "folder"; base: string; label: string; pinned?: boolean }
+  /** 收藏：不经过文件系统浏览，直接列笔记。 */
+  | { kind: "notes" };
 
-/** 快捷方式不显示后缀，和资源管理器的观感一致。 */
-function displayName(name: string): string {
-  return name.replace(/\.(lnk|url)$/i, "");
-}
+/** 收藏的一条笔记（和后端 `NoteSummary` 对应）。 */
+type NoteImage = { name: string; path: string };
+type NoteSummary = {
+  id: string;
+  title: string;
+  preview: string;
+  images: NoteImage[];
+  modified: number;
+};
+type NoteFile = { id: string; title: string; body: string; modified: number };
+type ImportOutcome = { note: NoteSummary; imported: number; skipped: number };
 
-/** 路径的最后一段，用来当常用文件夹的名字。 */
-function folderLabel(path: string): string {
-  const trimmed = path.replace(/[\\/]+$/, "");
-  const index = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
-  return index >= 0 ? trimmed.slice(index + 1) : trimmed;
-}
+/** 正在编辑的笔记：`id` 为 null 表示还没落盘的新笔记。 */
+type NoteDraft = { id: string | null; title: string; body: string };
 
 type Snapshot = { scope: Scope; path: string };
 
@@ -243,8 +125,6 @@ type ViewPref = {
   sort: { key: SortKey; dir: 1 | -1 };
   zoom: number;
 };
-
-const SORT_KEYS: SortKey[] = ["name", "modified", "size", "type", "frequent"];
 
 /** 把后端存的字符串读成一套能直接用的显示方式（不认识的字段退回默认）。 */
 function readPref(view: string, sortKey: string, sortDir: number, zoom: number): ViewPref {
@@ -274,32 +154,6 @@ function parentOf(path: string): string {
   return trimmed.slice(0, cut);
 }
 
-function formatSize(bytes: number): string {
-  if (bytes <= 0) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
-}
-
-function formatDate(seconds: number): string {
-  if (!seconds) return "";
-  const date = new Date(seconds * 1000);
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
-    date.getHours(),
-  )}:${pad(date.getMinutes())}`;
-}
-
-function extensionOf(name: string): string {
-  const dot = name.lastIndexOf(".");
-  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
-}
-
 /**
  * 呼出面板。
  *
@@ -320,6 +174,7 @@ function Launcher() {
     folders: [],
     sites: [],
     webEnabled: false,
+    notesEnabled: false,
     view: "grid",
     sortKey: "name",
     sortDir: 1,
@@ -476,6 +331,33 @@ function Launcher() {
     path: string;
     value: string;
   } | null>(null);
+
+  // ---------- 收藏 ----------
+  const [notes, setNotes] = useState<NoteSummary[]>([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  // 正在编辑的笔记；null = 编辑器关着。
+  const [draft, setDraft] = useState<NoteDraft | null>(null);
+  // 编辑器是什么时候打开的：单击卡片就编辑，双击的第二下会落到刚出来的遮罩上，
+  // 刚打开的这一小会儿不认「点外面关闭」，不然一双击编辑器就闪没了。
+  const draftOpenedAt = useRef(0);
+  const [savingNote, setSavingNote] = useState(false);
+  // 发送中的笔记 id：按钮上转圈，避免连点发两遍。
+  const [sendingNote, setSendingNote] = useState<string | null>(null);
+  // 拖着图片悬在哪张卡片上；null = 空白处（新建）。
+  const [noteDrop, setNoteDrop] = useState<string | null>(null);
+  // 删除要点两下：第一下变成「确认删除」。
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const notesToken = useRef(0);
+  // 面板收起时草稿还开着（点到了别的窗口）：下次呼出要留在收藏里，
+  // 不能把位置还原成某个文件目录，否则编辑器会浮在一个不相干的列表上。
+  const draftRef = useRef<NoteDraft | null>(null);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+  // 拖放回调在挂载时注册，读不到最新状态：把「现在是不是收藏视图」和
+  // 「把图放进收藏」放进来。
+  const noteDropRef = useRef<(x: number, y: number, paths: string[]) => boolean>(() => false);
+  const noteHoverRef = useRef<(x: number, y: number) => boolean>(() => false);
   // 搬完文件逼加载器重跑一次：目录内容已经变了。
   const [loadTick, setLoadTick] = useState(0);
   // 顶部飘一句提示：改名/移动失败时得让人看见原因。
@@ -563,33 +445,12 @@ function Launcher() {
   const folderMemory = useRef<Record<string, string>>({});
   // 刚处理过的落点：同一次拖放可能被两条路径报回来两次，只认第一次。
   const lastDropRef = useRef({ key: "", at: 0 });
-  // 右键手势：状态、叠层和「历史里还能不能退」都放 ref，窗口级监听只装一次也能读到最新值。
-  const gestureRef = useRef<GestureRuntime>({
-    active: false,
-    pointerId: -1,
-    startX: 0,
-    startY: 0,
-    lastX: 0,
-    lastY: 0,
-    recognized: false,
-    direction: null,
-    points: [],
-    suppressUntil: 0,
-    line: "rgba(0, 0, 0, 0.45)",
-    glow: "rgba(0, 0, 0, 0.10)",
-    raf: 0,
-    hideTimer: 0,
-  });
-  const gestureLayerRef = useRef<HTMLDivElement | null>(null);
-  const gestureCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const gestureLabelRef = useRef<HTMLDivElement | null>(null);
-  const gesturesRef = useRef<GestureSettings>(GESTURE_DEFAULT);
-  const goBackRef = useRef<() => void>(() => {});
-  const goForwardRef = useRef<() => void>(() => {});
-  const historyRef = useRef({ back: 0, forward: 0 });
+  // 每次呼出面板都要把没结束的手势丢掉；钩子定义在下面，这里只留个槽位。
   const resetGestureRef = useRef<() => void>(() => {});
   const base = scope.kind === "folder" ? scope.base : "";
-  const currentDir = scope.kind === "folder" ? path || scope.base : root.root;
+  // 收藏不是目录：这里留空，拖放就不会误把文件移进某个文件夹。
+  const currentDir =
+    scope.kind === "folder" ? path || scope.base : scope.kind === "all" ? root.root : "";
 
   const reload = useCallback(async (dropStale = false): Promise<LauncherRoot | null> => {
     const listing = await invoke<LauncherRoot>("launcher_categories");
@@ -730,6 +591,12 @@ function Launcher() {
       setDropTarget(null);
       setDropCrumb(null);
       const point = toClient(x, y);
+      // 收藏视图里拖进来的是图片：落到卡片上就追加，落到空白就新建一条。
+      // 绝不能走下面的 launcher_move_into——浏览器的临时文件会被搬走。
+      if (noteDropRef.current(point.x, point.y, paths)) {
+        setNoteDrop(null);
+        return;
+      }
       const folder = folderAtClient(point.x, point.y);
       const side = sideAtClient(point.x, point.y);
       // 面包屑优先：拖到「上一级」那一段上松手，就移进那一层。
@@ -756,6 +623,12 @@ function Launcher() {
       if (Date.now() - lastDropRef.current.at < 400) return;
       dragSeenAt.current = Date.now();
       const point = toClient(event.payload.x, event.payload.y);
+      // 收藏视图：只在卡片之间亮落点，不切侧边栏，也不把临时文件移进目录。
+      if (noteHoverRef.current(point.x, point.y)) {
+        setDropTarget(null);
+        setDropCrumb(null);
+        return;
+      }
       setDropTarget(folderAtClient(point.x, point.y)?.path ?? null);
       setDropCrumb(crumbAtClient(point.x, point.y));
       // 拖着东西悬到分类上：切过去，这样才落得进去。
@@ -775,6 +648,7 @@ function Launcher() {
       setLoadTick((tick) => tick + 1);
       setDropTarget(null);
       setDropCrumb(null);
+      setNoteDrop(null);
     });
     on<{ x: number; y: number; paths: string[] }>("launcher-dropped", (event) =>
       dropInto(event.payload.x, event.payload.y, event.payload.paths),
@@ -805,7 +679,8 @@ function Launcher() {
 
   // 位置变化就记下来（防抖，避免每次点击都写盘）。
   useEffect(() => {
-    if (!root.rememberLocation) return;
+    // 收藏不是目录，别把「上次停在收藏」当成一个能还原的文件夹位置。
+    if (!root.rememberLocation || scope.kind === "notes") return;
     const timer = window.setTimeout(() => {
       void invoke("launcher_save_location", {
         kind: scope.kind,
@@ -944,7 +819,8 @@ function Launcher() {
     const handler = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
       if (!target || !target.closest(".content")) return;
-      if (target.closest(".tile, .row")) return;
+      // 收藏视图没有「当前目录」，空白处不弹资源管理器菜单。
+      if (target.closest(".notes, .tile, .row")) return;
       const dir = currentDir || root.root;
       if (!dir) return;
       event.preventDefault();
@@ -972,8 +848,12 @@ function Launcher() {
         else disposers.push(fn);
       });
     };
-    // 目录内容变了：缓存里钉住的文件夹也要作废（见 reload 的注释）。
-    bind("launcher-changed", () => void reload(true));
+    // 目录内容变了：缓存里钉住的文件夹也要作废（见 reload 的注释）。收藏
+    // 目录 / 开关也可能刚在设置里改过，顺手重读一遍数量，别等进收藏才更新。
+    bind("launcher-changed", () => {
+      void reload(true);
+      setLoadTick((tick) => tick + 1);
+    });
     // 后端呼出时会连发两次（摆好窗口一次、网页窗口也摆好再一次）。这里只认
     // 紧挨着的那一次：两次都跑就是整份重读两遍，还会连着还原两次位置。
     let shownAt = 0;
@@ -987,6 +867,8 @@ function Launcher() {
           if (!disposed) document.body.classList.toggle("web-open", open);
         })
         .catch(() => {});
+      // 收藏目录可能被编辑器 / 同步盘改过，每次呼出也重读一遍。
+      setLoadTick((tick) => tick + 1);
       setQuery("");
       setSelected(-1);
       setPicked(new Set());
@@ -997,7 +879,15 @@ function Launcher() {
       // 每次呼出都是新的一轮：各组「上次待的那一层」从当前位置重新记。
       folderMemory.current = {};
       hoverArmed.current = false;
-      void reload().then(restore);
+      void reload().then((listing) => {
+        if (draftRef.current) {
+          setScope({ kind: "notes" });
+          setPath("");
+          setLoadTick((tick) => tick + 1);
+          return;
+        }
+        restore(listing);
+      });
     });
     return () => {
       disposed = true;
@@ -1122,277 +1012,20 @@ function Launcher() {
   }, [forwardStack, scope, path, resetView, applyView]);
 
   // ---- 右键手势：按住右键左滑 = 后退、右滑 = 前进 ----
-  // 窗口级监听只装一次，所以历史栈和回调都经由 ref 读最新值。
+  // 手势本身在 ./gesture 里（桌面格子也用它），这里只提供历史栈和回调。
+  const gesture = useMouseGestures({
+    settings: root.gestures ?? GESTURE_DEFAULT,
+    backCount: backStack.length,
+    forwardCount: forwardStack.length,
+    onBack: goBack,
+    onForward: goForward,
+    onEmpty: (direction) =>
+      showToast(direction === "back" ? "已经是最早的位置" : "已经是最新的位置"),
+  });
   useEffect(() => {
-    goBackRef.current = goBack;
-    goForwardRef.current = goForward;
-    historyRef.current = { back: backStack.length, forward: forwardStack.length };
-  }, [goBack, goForward, backStack.length, forwardStack.length]);
+    resetGestureRef.current = gesture.reset;
+  }, [gesture.reset]);
 
-  useEffect(() => {
-    gesturesRef.current = root.gestures ?? GESTURE_DEFAULT;
-  }, [root.gestures]);
-
-  /** 按需重设 canvas 的背板尺寸（换屏幕 / 缩放变了也要跟上）。 */
-  const gestureCtx = () => {
-    const canvas = gestureCanvasRef.current;
-    if (!canvas) return null;
-    const dpr = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * dpr);
-    const height = Math.round(window.innerHeight * dpr);
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    return ctx;
-  };
-
-  const drawGesture = useCallback(() => {
-    const ctx = gestureCtx();
-    if (!ctx) return;
-    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-    const points = gestureRef.current.points;
-    if (points.length === 0) return;
-    const stroke = (width: number, color: string) => {
-      ctx.lineWidth = width;
-      ctx.strokeStyle = color;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.beginPath();
-      if (points.length === 1) {
-        ctx.moveTo(points[0].x, points[0].y);
-        ctx.lineTo(points[0].x + 0.01, points[0].y);
-      } else {
-        ctx.moveTo(points[0].x, points[0].y);
-        // 经过每个点的中点画二次曲线：采样点再密，线也不会一段一段的。
-        for (let index = 1; index < points.length - 1; index += 1) {
-          const midX = (points[index].x + points[index + 1].x) / 2;
-          const midY = (points[index].y + points[index + 1].y) / 2;
-          ctx.quadraticCurveTo(points[index].x, points[index].y, midX, midY);
-        }
-        const last = points[points.length - 1];
-        ctx.lineTo(last.x, last.y);
-      }
-      ctx.stroke();
-    };
-    stroke(9, gestureRef.current.glow);
-    stroke(3, gestureRef.current.line);
-  }, []);
-
-  const scheduleGestureDraw = useCallback(() => {
-    const g = gestureRef.current;
-    if (g.raf) return;
-    g.raf = window.requestAnimationFrame(() => {
-      g.raf = 0;
-      drawGesture();
-    });
-  }, [drawGesture]);
-
-  const updateGestureLabel = useCallback((x: number, y: number) => {
-    const label = gestureLabelRef.current;
-    const g = gestureRef.current;
-    if (!label || !g.direction) return;
-    const back = g.direction === "back";
-    const available = back ? historyRef.current.back > 0 : historyRef.current.forward > 0;
-    const text = back ? "← 后退" : "→ 前进";
-    if (label.textContent !== text) label.textContent = text;
-    label.classList.toggle("dim", !available);
-    label.hidden = false;
-    const left = Math.min(Math.max(x + 18, 8), window.innerWidth - label.offsetWidth - 8);
-    const top = Math.min(Math.max(y + 16, 8), window.innerHeight - label.offsetHeight - 8);
-    label.style.transform = `translate3d(${left}px, ${top}px, 0)`;
-  }, []);
-
-  const showGestureLayer = useCallback(
-    (x: number, y: number) => {
-      const layer = gestureLayerRef.current;
-      if (!layer) return;
-      const g = gestureRef.current;
-      const style = getComputedStyle(document.documentElement);
-      g.line = style.getPropertyValue("--gesture-line").trim() || "rgba(0, 0, 0, 0.45)";
-      g.glow = style.getPropertyValue("--gesture-glow").trim() || "rgba(0, 0, 0, 0.10)";
-      g.points = [{ x, y }];
-      window.clearTimeout(g.hideTimer);
-      layer.hidden = false;
-      // 先落地一帧再挂 .on，透明度才会从 0 过渡出来。
-      void layer.offsetWidth;
-      layer.classList.add("on");
-      updateGestureLabel(x, y);
-    },
-    [updateGestureLabel],
-  );
-
-  const hideGestureLayer = useCallback(() => {
-    const layer = gestureLayerRef.current;
-    const g = gestureRef.current;
-    if (!layer || layer.hidden) return;
-    layer.classList.remove("on");
-    const clear = () => {
-      const ctx = gestureCtx();
-      ctx?.clearRect(0, 0, window.innerWidth, window.innerHeight);
-      layer.hidden = true;
-    };
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      clear();
-      return;
-    }
-    window.clearTimeout(g.hideTimer);
-    g.hideTimer = window.setTimeout(clear, 180);
-  }, []);
-
-  /** 结束（或取消）当前手势。commit=false 用于 Esc / 失焦 / 呼出重置。 */
-  const finishGesture = useCallback(
-    (commit: boolean) => {
-      const g = gestureRef.current;
-      if (!g.active) return;
-      const recognized = g.recognized;
-      const direction = g.direction;
-      const dx = g.lastX - g.startX;
-      g.active = false;
-      g.pointerId = -1;
-      if (g.raf) {
-        window.cancelAnimationFrame(g.raf);
-        g.raf = 0;
-      }
-      if (!recognized) return;
-      // WebView2 的 contextmenu 在右键松开之后才发：抑制要多留一会儿。
-      g.suppressUntil = performance.now() + GESTURE_SUPPRESS_MS;
-      hideGestureLayer();
-      g.points = [];
-      if (!commit || !direction) return;
-      if (Math.abs(dx) < gestureDistance(gesturesRef.current.triggerDistance)) return;
-      const available = direction === "back" ? historyRef.current.back : historyRef.current.forward;
-      if (available <= 0) {
-        showToastRef.current(direction === "back" ? "已经是最早的位置" : "已经是最新的位置");
-        return;
-      }
-      if (direction === "back") goBackRef.current();
-      else goForwardRef.current();
-    },
-    [hideGestureLayer],
-  );
-
-  const cancelGesture = useCallback(() => {
-    const g = gestureRef.current;
-    if (g.raf) {
-      window.cancelAnimationFrame(g.raf);
-      g.raf = 0;
-    }
-    g.active = false;
-    g.pointerId = -1;
-    g.recognized = false;
-    g.direction = null;
-    g.points = [];
-    g.suppressUntil = 0;
-    hideGestureLayer();
-  }, [hideGestureLayer]);
-
-  useEffect(() => {
-    resetGestureRef.current = cancelGesture;
-  }, [cancelGesture]);
-
-  /** 文件区按下右键：只记起点，不动菜单——不划动时右键菜单照常弹。 */
-  const beginGesture = (event: React.PointerEvent) => {
-    if (event.button !== 2 || event.pointerType !== "mouse") return;
-    if (!gesturesRef.current.enabled) return;
-    const g = gestureRef.current;
-    if (g.active) return;
-    g.suppressUntil = 0;
-    g.active = true;
-    g.pointerId = event.pointerId;
-    g.startX = event.clientX;
-    g.startY = event.clientY;
-    g.lastX = event.clientX;
-    g.lastY = event.clientY;
-    g.recognized = false;
-    g.direction = null;
-    g.points = [];
-  };
-
-  useEffect(() => {
-    const g = gestureRef.current;
-    const down = () => {
-      // 新的按下：上一次手势留下的菜单抑制立刻作废，普通右键不能被永久吞掉。
-      if (!g.active) g.suppressUntil = 0;
-    };
-    const move = (event: PointerEvent) => {
-      if (!g.active || event.pointerId !== g.pointerId) return;
-      if ((event.buttons & 2) === 0) {
-        // 松开事件丢了（拖到窗口外松手）：按已经划到的位置收尾。
-        finishGesture(true);
-        return;
-      }
-      const settings = gesturesRef.current;
-      g.lastX = event.clientX;
-      g.lastY = event.clientY;
-      const dx = g.lastX - g.startX;
-      const dy = g.lastY - g.startY;
-      if (!g.recognized) {
-        if (Math.hypot(dx, dy) < GESTURE_START) return;
-        // 竖着划不算：右键上下拖更像是在选一行，不把人导航走。
-        if (Math.abs(dx) < Math.abs(dy) * 1.2) return;
-        g.recognized = true;
-        g.suppressUntil = performance.now() + 1500;
-        if (settings.showTrail) showGestureLayer(g.startX, g.startY);
-      }
-      g.direction = gestureAction(dx, settings.invertDirection);
-      if (settings.showTrail) {
-        const last = g.points[g.points.length - 1];
-        if (!last || Math.hypot(g.lastX - last.x, g.lastY - last.y) >= 2.5) {
-          g.points.push({ x: g.lastX, y: g.lastY });
-          // 划得再长也只留一段尾巴，别一直涨内存。
-          if (g.points.length > 600) g.points.splice(1, 1);
-        }
-        updateGestureLabel(g.lastX, g.lastY);
-        scheduleGestureDraw();
-      }
-    };
-    const up = (event: PointerEvent) => {
-      if (!g.active || event.pointerId !== g.pointerId) return;
-      g.lastX = event.clientX;
-      g.lastY = event.clientY;
-      finishGesture(true);
-    };
-    const cancel = () => finishGesture(false);
-    const key = (event: KeyboardEvent) => {
-      if (!g.active || event.key !== "Escape") return;
-      // 手势里的 Esc 只是取消手势，不能顺带退一层 / 收起面板。
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      finishGesture(false);
-    };
-    const menu = (event: MouseEvent) => {
-      // 空白处的菜单监听在 document 上，且不查 defaultPrevented：
-      // 必须在 window 的捕获阶段就把事件拦死，tile 上的 React 菜单也到不了。
-      if ((g.active && g.recognized) || performance.now() < g.suppressUntil) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-      }
-    };
-    window.addEventListener("pointerdown", down, true);
-    window.addEventListener("pointermove", move, true);
-    window.addEventListener("pointerup", up, true);
-    window.addEventListener("pointercancel", cancel, true);
-    window.addEventListener("keydown", key, true);
-    window.addEventListener("contextmenu", menu, true);
-    window.addEventListener("blur", cancel);
-    document.addEventListener("visibilitychange", cancel);
-    return () => {
-      window.removeEventListener("pointerdown", down, true);
-      window.removeEventListener("pointermove", move, true);
-      window.removeEventListener("pointerup", up, true);
-      window.removeEventListener("pointercancel", cancel, true);
-      window.removeEventListener("keydown", key, true);
-      window.removeEventListener("contextmenu", menu, true);
-      window.removeEventListener("blur", cancel);
-      document.removeEventListener("visibilitychange", cancel);
-    };
-  }, [finishGesture, scheduleGestureDraw, showGestureLayer, updateGestureLabel]);
 
   const canUp = scope.kind === "folder" && !!path && path !== base;
 
@@ -1405,7 +1038,7 @@ function Launcher() {
     (folderPath: string) => {
       // 搜索结果是跨分类的：进别的分类里的文件夹要连分类一起切过去，
       // 否则面包屑和「上一层」都会指错地方。
-      if (scope.kind === "all" || !isInside(folderPath, scope.base)) {
+      if (scope.kind !== "folder" || !isInside(folderPath, scope.base)) {
         const owner = root.categories.find((category) => isInside(folderPath, category.path));
         if (owner) {
           go({ scope: { kind: "folder", base: owner.path, label: owner.name }, path: folderPath });
@@ -1488,7 +1121,11 @@ function Launcher() {
   // 拖拽用的两份最新状态：当前在哪一项、某一项点下去做什么。
   useEffect(() => {
     activeIdRef.current =
-      scope.kind === "all" ? "__all__" : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
+      scope.kind === "all"
+        ? "__all__"
+        : scope.kind === "notes"
+          ? "__notes__"
+          : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
   }, [scope]);
 
   // 走到哪儿就记到那一组名下。
@@ -1544,6 +1181,194 @@ function Launcher() {
   const filtered = searched ?? items;
 
   const shown = useMemo(() => sortItems(filtered, sort, usage), [filtered, sort, usage]);
+
+  // ---------- 收藏：数据与操作 ----------
+
+  const loadNotes = useCallback(async () => {
+    const token = (notesToken.current += 1);
+    setNotesLoading(true);
+    try {
+      const list = await invoke<NoteSummary[]>("notes_list");
+      // 连着触发两次（拖完图片又收到 notes-changed）时只认最后一次。
+      if (token !== notesToken.current) return;
+      setNotes(list);
+    } catch (error) {
+      if (token === notesToken.current) showToast(String(error));
+    } finally {
+      if (token === notesToken.current) setNotesLoading(false);
+    }
+  }, [showToast]);
+
+  // 进收藏、拖完图片、面板重新呼出都重读一遍：磁盘上的文件才是准的。
+  // 侧边栏一直显示条数，所以不管当前看的是不是收藏都读：换过收藏目录之后
+  // 那个数字也要跟着变。
+  useEffect(() => {
+    void loadNotes();
+  }, [scope, loadNotes, loadTick]);
+
+  useEffect(() => {
+    const stop = listen("notes-changed", () => {
+      void loadNotes();
+    });
+    return () => {
+      void stop.then((unlisten) => unlisten());
+    };
+  }, [loadNotes]);
+
+  // 卡片上的缩略图也走同一套图标缓存（`hbicon://`）：一条笔记最多显示三张。
+  useEffect(() => {
+    if (scope.kind !== "notes") return;
+    const wanted: string[] = [];
+    for (const note of notes) {
+      for (const image of note.images.slice(0, 3)) {
+        if (!(image.path in iconRef.current)) wanted.push(image.path);
+      }
+    }
+    if (wanted.length) fillIcons(wanted);
+  }, [scope, notes, fillIcons]);
+
+  // 拖放回调在挂载时注册：这里把「现在是不是收藏视图」和「把图放进收藏」塞进去。
+  useEffect(() => {
+    noteHoverRef.current = (x, y) => {
+      if (scope.kind !== "notes") return false;
+      const card = document
+        .elementFromPoint(x, y)
+        ?.closest<HTMLElement>("[data-note-id]");
+      const id = card?.dataset.noteId ?? null;
+      setNoteDrop((previous) => (previous === id ? previous : id));
+      return true;
+    };
+    noteDropRef.current = (x, y, paths) => {
+      if (scope.kind !== "notes") return false;
+      const card = document
+        .elementFromPoint(x, y)
+        ?.closest<HTMLElement>("[data-note-id]");
+      const noteId = card?.dataset.noteId || null;
+      void invoke<ImportOutcome>("notes_import_images", { noteId, paths })
+        .then((outcome) => {
+          setNotes((previous) => [
+            outcome.note,
+            ...previous.filter((note) => note.id !== outcome.note.id),
+          ]);
+          if (outcome.imported === 0) {
+            showToastRef.current("只能放图片：png / jpg / gif / webp / bmp / svg");
+          } else {
+            showToastRef.current(
+              outcome.skipped
+                ? `已保存 ${outcome.imported} 张图片，忽略 ${outcome.skipped} 个非图片文件`
+                : `已保存 ${outcome.imported} 张图片`,
+            );
+          }
+        })
+        .catch((error) => showToastRef.current(String(error)));
+      return true;
+    };
+  }, [scope]);
+
+  const openNotes = useCallback(() => go({ scope: { kind: "notes" }, path: "" }), [go]);
+
+  const openNotesFolder = useCallback(() => {
+    void invoke("notes_open_folder").catch((error) => showToast(String(error)));
+  }, [showToast]);
+
+  const newNote = useCallback(() => {
+    setConfirmDelete(null);
+    draftOpenedAt.current = Date.now();
+    setDraft({ id: null, title: "", body: "" });
+  }, []);
+
+  const editNote = useCallback(
+    async (note: NoteSummary) => {
+      setConfirmDelete(null);
+      try {
+        const file = await invoke<NoteFile>("notes_read", { id: note.id });
+        draftOpenedAt.current = Date.now();
+        setDraft({ id: file.id, title: file.title, body: file.body });
+      } catch (error) {
+        showToast(String(error));
+      }
+    },
+    [showToast],
+  );
+
+  const saveDraft = useCallback(async () => {
+    if (!draft || savingNote) return;
+    const title = draft.title.trim() || "未命名笔记";
+    setSavingNote(true);
+    try {
+      let id = draft.id;
+      if (!id) {
+        const created = await invoke<NoteSummary>("notes_create", { title });
+        id = created.id;
+      }
+      await invoke<NoteSummary>("notes_save", { id, title, body: draft.body });
+      setDraft(null);
+      await loadNotes();
+    } catch (error) {
+      showToast(String(error));
+    } finally {
+      setSavingNote(false);
+    }
+  }, [draft, savingNote, loadNotes, showToast]);
+
+  const sendNote = useCallback(
+    (note: NoteSummary) => {
+      if (sendingNote) return;
+      setSendingNote(note.id);
+      // 成功后面板会收起、字直接打进原来的窗口，这里不用再提示；
+      // 失败时面板已经被叫回来，报清楚原因就行。
+      void invoke("notes_send", { id: note.id })
+        .catch((error) => showToast(String(error)))
+        .finally(() => setSendingNote(null));
+    },
+    [sendingNote, showToast],
+  );
+
+  const copyNoteImages = useCallback(
+    (note: NoteSummary) => {
+      void invoke<number>("notes_copy_images", { id: note.id })
+        .then((count) => showToast(`已复制 ${count} 张图片`))
+        .catch((error) => showToast(String(error)));
+    },
+    [showToast],
+  );
+
+  const deleteNote = useCallback(
+    (note: NoteSummary) => {
+      if (confirmDelete !== note.id) {
+        setConfirmDelete(note.id);
+        window.setTimeout(() => {
+          setConfirmDelete((current) => (current === note.id ? null : current));
+        }, 2600);
+        return;
+      }
+      setConfirmDelete(null);
+      void invoke("notes_delete", { id: note.id })
+        .then(() =>
+          setNotes((previous) => previous.filter((entry) => entry.id !== note.id)),
+        )
+        .catch((error) => showToast(String(error)));
+    },
+    [confirmDelete, showToast],
+  );
+
+  // 收藏视图按标题 / 正文预览 / 图片名过滤（搜索框和文件区共用一个）。
+  const shownNotes = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return notes;
+    return notes.filter(
+      (note) =>
+        note.title.toLowerCase().includes(needle) ||
+        note.preview.toLowerCase().includes(needle) ||
+        note.images.some((image) => image.name.toLowerCase().includes(needle)),
+    );
+  }, [notes, query]);
+
+  /** 编辑器里展示的图片：跟着列表走，拖进来追加后立刻能看到。 */
+  const editingImages = useMemo(
+    () => (draft?.id ? notes.find((note) => note.id === draft.id)?.images ?? [] : []),
+    [draft, notes],
+  );
 
   // 缩放后的基准尺寸：格子、行、间距、内边距都按同一系数走，和 CSS 里的
   // `calc(... * var(--zoom))` 对得上。格子的高取整，免得名字最后一行被半像素裁掉。
@@ -1961,6 +1786,7 @@ function Launcher() {
   const onInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     // 拼音还没上屏时的回车 / 方向键是输入法的，不是我们的。
     if (event.nativeEvent.isComposing) return;
+    if (scope.kind === "notes") return;
     if (fileShortcuts(event)) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -1985,6 +1811,8 @@ function Launcher() {
   /** Esc 的唯一处理点：改名输入框会 stopPropagation，走到这里的一定不是改名。 */
   // 删除 / 复制 / 剪切 / 粘贴：根节点和搜索框都要能用。
   const fileShortcuts = (event: React.KeyboardEvent): boolean => {
+    // 收藏视图不操作文件：Delete / Ctrl+V / Ctrl+Z 都不该落到文件逻辑上。
+    if (scope.kind === "notes") return false;
     const target = event.target as HTMLElement;
     const renaming = target.tagName === "TEXTAREA";
     const ctrl = event.ctrlKey || event.metaKey;
@@ -2054,22 +1882,8 @@ function Launcher() {
     return () => document.removeEventListener("keydown", onKey);
   }, [afterFileChange]);
 
-  // 主题跟随设置（不只是系统）：面板要跟设置窗口一致
-  useEffect(() => {
-    const apply = () =>
-      void invoke<string>("ui_theme_preference").then((preference) => {
-        const dark =
-          preference === "dark" ||
-          (preference === "system" &&
-            window.matchMedia("(prefers-color-scheme: dark)").matches);
-        document.documentElement.dataset.theme = dark ? "dark" : "light";
-      });
-    apply();
-    const query = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => apply();
-    query.addEventListener("change", onChange);
-    return () => query.removeEventListener("change", onChange);
-  }, []);
+  // 主题跟随设置（不只是系统）：面板要跟设置窗口、桌面格子一致
+  useEffect(() => watchTheme(), []);
 
   // 侧边栏是「悬停即切换」，但鼠标划过整列时会一路触发，
   // 列表跟着重排，看起来就是分类和常用文件夹来回亮、来回跳。
@@ -2096,9 +1910,10 @@ function Launcher() {
     // 否则同一次按键会走两遍。
     if (fileShortcuts(event)) return;
     const target = event.target as HTMLElement;
-    // 改名时 Ctrl+A 应该选中名字本身，而不是全选文件。
-    const renaming = target.tagName === "TEXTAREA";
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && !renaming) {
+    // 输入框里的 Ctrl+A 应该选中文字本身，而不是全选文件（改名、搜索、收藏编辑器）。
+    const typing =
+      target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.isContentEditable;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && !typing) {
       event.preventDefault();
       setPicked(new Set(shown.map((item) => item.path)));
       return;
@@ -2122,8 +1937,13 @@ function Launcher() {
   const hasRoot = root.root.trim().length > 0;
   // 同一个路径可能既是分类又是常用文件夹，id 要带来源，否则两个一起亮。
   const activeId =
-    scope.kind === "all" ? "__all__" : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
-  const baseLabel = scope.kind === "all" ? "全部" : scope.label;
+    scope.kind === "all"
+      ? "__all__"
+      : scope.kind === "notes"
+        ? "__notes__"
+        : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
+  const baseLabel =
+    scope.kind === "all" ? "全部" : scope.kind === "notes" ? "收藏" : scope.label;
 
   // 侧边栏的选中高亮是一块会滑动的形状：切换分类时从上一行滑到下一行，
   // 而不是两行各自闪一下底色。位置在绘制前算好，避免先闪在顶上。
@@ -2237,6 +2057,24 @@ function Launcher() {
             </button>
           </div>
         )}
+        {root.notesEnabled && (
+          <>
+            <button
+              type="button"
+              className={`side-item${activeId === "__notes__" ? " active" : ""}`}
+              onClick={openNotes}
+              onContextMenu={(event) => event.preventDefault()}
+              onMouseEnter={() => {
+                if (activeId !== "__notes__") hoverOpen(openNotes);
+              }}
+              onMouseLeave={hoverCancel}
+            >
+              <span>收藏</span>
+              {notes.length > 0 && <span className="count">{notes.length}</span>}
+            </button>
+            <div className="side-sep" />
+          </>
+        )}
         {root.allVisible && (
           <button
             type="button"
@@ -2343,6 +2181,30 @@ function Launcher() {
 
       <section className="content">
         <div className="toolbar">
+          {scope.kind === "notes" ? (
+            <>
+              <button
+                type="button"
+                className="tool-btn notes-new"
+                onClick={newNote}
+                title="新建一条收藏"
+              >
+                ＋ 新建
+              </button>
+              <button
+                type="button"
+                className="tool-btn"
+                onClick={openNotesFolder}
+                title="在资源管理器里打开收藏文件夹"
+              >
+                打开文件夹
+              </button>
+              <div className="crumbs">
+                <span className="notes-hint">拖图片到空白处新建，拖到卡片上追加</span>
+              </div>
+            </>
+          ) : (
+            <>
           {/* 只有进了子文件夹才给前进/后退/上一级；停在顶层时这排是空的 */}
           {canUp && (
             <>
@@ -2465,6 +2327,8 @@ function Launcher() {
               </svg>
             )}
           </button>
+            </>
+          )}
           <div className="search">
             <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
               <circle cx="7.2" cy="7.2" r="5.2" stroke="currentColor" strokeWidth="1.6" />
@@ -2490,7 +2354,13 @@ function Launcher() {
           className={view === "grid" ? "grid" : "list"}
           ref={gridRef}
           // 条目外框由 JS 按同一系数给尺寸，内部图标/字号由 CSS 的 --zoom 缩放。
-          style={{ "--zoom": metrics.factor } as React.CSSProperties}
+          // 收藏视图下只藏起来、不卸载：滚动位置和多选状态都还在。
+          style={
+            {
+              "--zoom": metrics.factor,
+              display: scope.kind === "notes" ? "none" : undefined,
+            } as React.CSSProperties
+          }
           onScroll={(event) => {
             const element = event.currentTarget;
             setViewport((previous) =>
@@ -2500,7 +2370,7 @@ function Launcher() {
             );
           }}
           onPointerDown={(event) => {
-            beginGesture(event);
+            gesture.begin(event);
             beginMarquee(event);
           }}
           onPointerMove={moveMarquee}
@@ -2728,21 +2598,227 @@ function Launcher() {
           })}
         </div>
 
+        {scope.kind === "notes" && (
+          <div className="notes">
+            {shownNotes.length === 0 ? (
+              <div className="empty">
+                {notesLoading && notes.length === 0 ? (
+                  <strong>正在读取…</strong>
+                ) : query.trim() ? (
+                  <>
+                    <strong>没有匹配的收藏</strong>
+                    换个关键词试试
+                  </>
+                ) : (
+                  <>
+                    <strong>还没有收藏</strong>
+                    点左上角「＋ 新建」写一条，或者把图片拖进来
+                    <button type="button" className="empty-action" onClick={newNote}>
+                      新建一条收藏
+                    </button>
+                  </>
+                )}
+              </div>
+            ) : (
+              shownNotes.map((note) => (
+                <article
+                  key={note.id}
+                  className={`note-card${noteDrop === note.id ? " drop-hover" : ""}`}
+                  data-note-id={note.id}
+                  // 点一下卡片就进编辑；按钮在下面自己拦住冒泡。
+                  onClick={() => void editNote(note)}
+                >
+                  <header className="note-head">
+                    <h3 title={note.title}>{note.title}</h3>
+                    <span className="note-date">{formatDate(note.modified)}</span>
+                  </header>
+                  {note.preview && <p className="note-preview">{note.preview}</p>}
+                  {note.images.length > 0 && (
+                    <div className="note-thumbs">
+                      {note.images.slice(0, 3).map((image) => {
+                        const key = iconByPath[image.path];
+                        return (
+                          <span className="note-thumb" key={image.path} title={image.name}>
+                            {key ? (
+                              <img
+                                src={`${ICON_BASE}${key}`}
+                                alt=""
+                                draggable={false}
+                                loading="lazy"
+                              />
+                            ) : (
+                              <span className="note-thumb-glyph">▤</span>
+                            )}
+                          </span>
+                        );
+                      })}
+                      {note.images.length > 3 && (
+                        <span className="note-thumb more">+{note.images.length - 3}</span>
+                      )}
+                    </div>
+                  )}
+                  <div
+                    className="note-actions"
+                    // 点按钮不该冒泡成「点击卡片编辑」；连点两下「删除」只管确认删除。
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => sendNote(note)}
+                      disabled={sendingNote !== null}
+                      title="收起面板，把文字输入到呼出前的窗口"
+                    >
+                      {sendingNote === note.id ? "发送中…" : "发送"}
+                    </button>
+                    {note.images.length > 0 && (
+                      <button type="button" onClick={() => copyNoteImages(note)}>
+                        复制图片
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className={confirmDelete === note.id ? "danger" : undefined}
+                      onClick={() => deleteNote(note)}
+                    >
+                      {confirmDelete === note.id ? "确认删除" : "删除"}
+                    </button>
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+        )}
+
+        {draft && (
+          <div
+            className="note-shade"
+            onMouseDown={(event) => {
+              if (event.target !== event.currentTarget || savingNote) return;
+              // 双击卡片打开编辑时，第二下正好落在遮罩上；刚打开就忽略一下。
+              if (Date.now() - draftOpenedAt.current < 350) return;
+              setDraft(null);
+            }}
+          >
+            <div
+              className="note-editor"
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing) return;
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (!savingNote) setDraft(null);
+                  return;
+                }
+                if (
+                  (event.ctrlKey || event.metaKey) &&
+                  event.key.toLowerCase() === "s"
+                ) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  void saveDraft();
+                }
+              }}
+            >
+              <div className="note-editor-head">
+                <input
+                  className="note-title"
+                  autoFocus
+                  value={draft.title}
+                  placeholder="标题"
+                  spellCheck={false}
+                  onChange={(event) => setDraft({ ...draft, title: event.target.value })}
+                />
+                <button
+                  type="button"
+                  className="note-close"
+                  title="关闭"
+                  // Tab 从标题直接到正文，别停在关闭按钮上；关掉用 Esc 或点。
+                  tabIndex={-1}
+                  onClick={() => {
+                    if (!savingNote) setDraft(null);
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+              <textarea
+                className="note-body"
+                value={draft.body}
+                placeholder="写点什么…支持 Markdown。发送时只发送文字，图片会被去掉。"
+                spellCheck={false}
+                onKeyDown={(event) => {
+                  // 这里单独拦 Tab / Ctrl+A 之类的默认行为以外不用做事：
+                  // 真正的 Esc / Ctrl+S 由外层编辑器处理。
+                  if (event.key === "Escape") event.stopPropagation();
+                }}
+                onChange={(event) => setDraft({ ...draft, body: event.target.value })}
+              />
+              {editingImages.length > 0 && (
+                <div className="note-editor-images">
+                  <span className="note-editor-label">
+                    图片（{editingImages.length}）· 拖图片到面板上可以继续追加
+                  </span>
+                  <div className="note-thumbs">
+                    {editingImages.map((image) => {
+                      const key = iconByPath[image.path];
+                      return (
+                        <span className="note-thumb large" key={image.path} title={image.name}>
+                          {key ? (
+                            <img
+                              src={`${ICON_BASE}${key}`}
+                              alt=""
+                              draggable={false}
+                              loading="lazy"
+                            />
+                          ) : (
+                            <span className="note-thumb-glyph">▤</span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              <div className="note-editor-foot">
+                <span className="note-editor-hint">Ctrl+S 保存 · Esc 取消</span>
+                <button
+                  type="button"
+                  className="note-btn"
+                  onClick={() => {
+                    if (!savingNote) setDraft(null);
+                  }}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="note-btn primary"
+                  disabled={savingNote}
+                  onClick={() => void saveDraft()}
+                >
+                  {savingNote ? "保存中…" : "保存"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {toast && <div className="toast">{toast}</div>}
 
         {/* 右键手势的轨迹层：fixed 铺满窗口，永远不吃鼠标事件。 */}
-        <div className="gesture-layer" ref={gestureLayerRef} hidden aria-hidden="true">
-          <canvas className="gesture-canvas" ref={gestureCanvasRef} />
-          <div className="gesture-label" ref={gestureLabelRef} hidden />
-        </div>
+        {gesture.layer}
 
         <div className="foot">
           {/* 一搜索就跨所有分类找，这里跟着说清楚范围。 */}
-          <span>{searched ? "所有分类" : baseLabel}</span>
+          <span>{scope.kind === "notes" ? "收藏" : searched ? "所有分类" : baseLabel}</span>
           <span>·</span>
-          <span>{shown.length} 项</span>
+          <span>{scope.kind === "notes" ? `${shownNotes.length} 条` : `${shown.length} 项`}</span>
           <span>·</span>
-          <span>双击打开 · 拖动拖出 · 空白处或 Alt+拖动框选 · Alt+滚轮缩放 · Ctrl+A 全选</span>
+          <span>
+            {scope.kind === "notes"
+              ? "点击卡片编辑 · 拖图片到空白处新建、到卡片上追加 · 发送会收起面板并输入到原窗口"
+              : "双击打开 · 拖动拖出 · 空白处或 Alt+拖动框选 · Alt+滚轮缩放 · Ctrl+A 全选"}
+          </span>
           <span>·</span>
           <span>
             <kbd>Esc</kbd> {canUp ? "上一层" : "关闭"}

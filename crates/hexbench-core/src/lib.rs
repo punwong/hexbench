@@ -4,6 +4,8 @@
 //! and driven from a CLI (`hexbench run` / `hexbench --layout`).
 
 pub mod config;
+#[cfg(target_os = "windows")]
+pub mod desktop_menu;
 pub mod drop_target;
 pub mod shell_ops;
 #[cfg(windows)]
@@ -12,6 +14,8 @@ pub mod geometry;
 pub mod icons;
 pub mod net;
 pub mod model;
+pub mod notes;
+pub mod snap;
 pub mod sync;
 pub mod trigger;
 pub mod usage;

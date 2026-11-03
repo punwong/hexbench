@@ -7,7 +7,7 @@ import {
   Gauge,
   Info,
   Keyboard,
-  MessageSquare,
+  LayoutGrid,
   MousePointer2,
   Rocket,
   Settings,
@@ -35,13 +35,12 @@ import {
   AboutPage,
   EdgePage,
   LauncherPage,
+  DesktopPage,
   CachePage,
   GeneralPage,
   GesturePage,
   HotkeysPage,
   Overview,
-  PhrasesPage,
-
 } from "./pages";
 import type { Patch } from "./pages";
 import { TitleBar } from "./components/TitleBar";
@@ -49,8 +48,8 @@ import { TitleBar } from "./components/TitleBar";
 type Page =
   | "overview"
   | "edge"
-  | "phrases"
   | "launcher"
+  | "desktop"
   | "gestures"
   | "hotkeys"
   | "general"
@@ -64,9 +63,12 @@ type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "ready" |
 const TITLES: Record<Page, { title: string; subtitle: string }> = {
   overview: { title: "概览", subtitle: "按需打开，各占一个设置页" },
   edge: { title: "边缘桌面", subtitle: "触发位置、时序与防误触" },
-  phrases: { title: "常用语", subtitle: "吸附在聊天窗口旁，点一下就发出去" },
-  launcher: { title: "快捷面板", subtitle: "一个键呼出：按分类找文件、搬运文件" },
-  gestures: { title: "手势", subtitle: "在快捷面板文件区按住右键滑动：左滑后退、右滑前进" },
+  launcher: { title: "快捷面板", subtitle: "一个键呼出：找文件、搬运文件、写收藏" },
+  desktop: { title: "桌面格子", subtitle: "桌面上的文件夹小组件：拖进去就算整理好" },
+  gestures: {
+    title: "手势",
+    subtitle: "在快捷面板和桌面格子的文件区按住右键滑动：左滑后退、右滑前进",
+  },
   hotkeys: { title: "热键", subtitle: "所有全局快捷键，集中在一处" },
   general: { title: "通用", subtitle: "外观、启动与配置文件" },
   cache: { title: "缓存", subtitle: "缩略图等缓存的占用与清理" },
@@ -75,12 +77,17 @@ const TITLES: Record<Page, { title: string; subtitle: string }> = {
 
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
-  const [launcherTab, setLauncherTab] = useState<"items" | "folders" | "sites">("items");
+  const [launcherTab, setLauncherTab] = useState<
+    "items" | "folders" | "sites" | "notes"
+  >("items");
   const applyNavigate = useCallback((payload: { page: string; tab: string | null } | null) => {
     const target = payload?.page ?? "overview";
     const tab = payload?.tab ?? null;
-    if (target === "launcher" && (tab === "items" || tab === "folders" || tab === "sites")) {
-      setLauncherTab(tab as "items" | "folders" | "sites");
+    if (
+      target === "launcher" &&
+      (tab === "items" || tab === "folders" || tab === "sites" || tab === "notes")
+    ) {
+      setLauncherTab(tab as "items" | "folders" | "sites" | "notes");
     }
     setPage(target as Page);
   }, []);
@@ -251,7 +258,7 @@ export default function App() {
 
 
 
-  // 后端有些命令会绕过前端直接改配置（同步设置、常用语、面板折叠）。
+  // 后端有些命令会绕过前端直接改配置（同步设置、面板折叠）。
   // 收到通知就重读一份，否则这边手里那份旧配置在下次保存时会把刚改的
   // 字段整份盖回去——比如填好的 WebDAV 地址、刚编辑的话术。
   useEffect(() => {
@@ -291,8 +298,10 @@ export default function App() {
       trigger: { ...current.trigger, ...patch.trigger },
       guard: { ...current.guard, ...patch.guard },
       hotkeys: { ...current.hotkeys, ...patch.hotkeys },
-      phrases: { ...current.phrases, ...patch.phrases },
       launcher: { ...current.launcher, ...patch.launcher },
+      notes: { ...current.notes, ...patch.notes },
+      // 桌面格子整段也要展开合并：漏了这一行，每次保存都会把 desktop 丢掉。
+      desktop: { ...current.desktop, ...patch.desktop },
       updates: { ...current.updates, ...patch.updates },
       ui: { ...current.ui, ...patch.ui },
     };
@@ -340,10 +349,18 @@ export default function App() {
   useEffect(() => {
     if (!config) return;
     if (page === "edge" && !config.enabled) setPage("overview");
-    if (page === "phrases" && !config.phrases.enabled) setPage("overview");
     if (page === "launcher" && !config.launcher.enabled) setPage("overview");
-    if (page === "gestures" && !config.launcher.enabled) setPage("overview");
-  }, [config?.enabled, config?.phrases.enabled, config?.launcher.enabled, page]);
+    // 手势设置是面板和桌面格子共用的：还开着任意一个就留着这一页。
+    if (page === "gestures" && !config.launcher.enabled && !config.desktop.enabled) {
+      setPage("overview");
+    }
+    if (page === "desktop" && !config.desktop.enabled) setPage("overview");
+  }, [
+    config?.enabled,
+    config?.launcher.enabled,
+    config?.desktop.enabled,
+    page,
+  ]);
 
   const finishOnboarding = () => {
     update({ ui: { onboarded: true } });
@@ -380,20 +397,18 @@ export default function App() {
           <NavItem page="overview" current={page} onClick={setPage} icon={<Gauge size={16} />} label="概览" />
         </div>
 
-        {config && (config.enabled || config.phrases.enabled || config.launcher.enabled) && (
+        {config &&
+          (config.enabled || config.launcher.enabled || config.desktop.enabled) && (
           <div className="nav-group">
             <div className="nav-label">工具</div>
             {config.launcher.enabled && (
               <NavItem page="launcher" current={page} onClick={setPage} icon={<Rocket size={16} />} label="快捷面板" />
             )}
-            {config.launcher.enabled && (
-              <NavItem page="gestures" current={page} onClick={setPage} icon={<MousePointer2 size={16} />} label="手势" />
-            )}
             {config.enabled && (
               <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘桌面" />
             )}
-            {config.phrases.enabled && (
-              <NavItem page="phrases" current={page} onClick={setPage} icon={<MessageSquare size={16} />} label="常用语" />
+            {config.desktop.enabled && (
+              <NavItem page="desktop" current={page} onClick={setPage} icon={<LayoutGrid size={16} />} label="桌面格子" />
             )}
           </div>
         )}
@@ -401,6 +416,10 @@ export default function App() {
         <div className="nav-group">
           <div className="nav-label">全局</div>
           <NavItem page="hotkeys" current={page} onClick={setPage} icon={<Keyboard size={16} />} label="热键" />
+          {/* 快捷面板和桌面格子共用一份手势设置，所以不算某一个工具的，跟热键一起放在全局。 */}
+          {config && (config.launcher.enabled || config.desktop.enabled) && (
+            <NavItem page="gestures" current={page} onClick={setPage} icon={<MousePointer2 size={16} />} label="手势" />
+          )}
           <NavItem page="general" current={page} onClick={setPage} icon={<Settings size={16} />} label="通用" />
           <NavItem page="cache" current={page} onClick={setPage} icon={<Database size={16} />} label="缓存" />
           <NavItem page="about" current={page} onClick={setPage} icon={<Info size={16} />} label="关于" />
@@ -496,10 +515,10 @@ export default function App() {
             onTabChange={setLauncherTab}
           />
 
+        ) : page === "desktop" ? (
+          <DesktopPage config={config} update={update} />
         ) : page === "gestures" ? (
           <GesturePage config={config} update={update} />
-        ) : page === "phrases" ? (
-          <PhrasesPage config={config} update={update} />
         ) : page === "hotkeys" ? (
           <HotkeysPage config={config} update={update} snap={snap} />
         ) : page === "general" ? (

@@ -19,22 +19,21 @@ Push the cursor into the corner zone at the **outermost** edge of the whole desk
 - Hot-plug a display, change resolution, rotate — it re-reads the layout automatically
 - Test mode highlights the live zone without switching
 
-### Tool 2 — quick-phrase panel (快捷语)
+### Tool 2 — quick launcher (快捷面板)
 
-A small panel that docks beside a chat app (built for 千牛, works with anything). Click a phrase to fill it into the focused input, or enable "fill & send" to submit it.
+One hotkey brings up a keyboard-first launcher over whatever you are doing: browse folders by category, pin the ones you use every day, drag files in and out, and open a built-in web panel next to it.
+
+The launcher also holds **收藏 (favorites)**: short Markdown notes for the personal details you keep retyping — an email address, a shipping address, a support reply. Write one in the panel, drop images into it, and hit **Send**: the panel hides, focus goes back to the window you came from, and the text is typed in. Images are stripped from the typed text; use **Copy images** to put a note's images on the clipboard as files.
+
+Every note is a plain `.md` file with its images in an `images/` folder, so the collection can be opened in any editor or synced by any cloud drive. The folder defaults to `Documents\HexBench 收藏` and can be changed in settings.
 
 | Feature | |
 | --- | --- |
-| Docking | outside or **inside** the target window, left or right |
-| Picking | search list, click-to-pick, or match by window class/title |
-| Collapse | the panel folds into a draggable bubble |
-| No focus steal | the panel uses `WS_EX_NOACTIVATE`, so your input keeps focus |
-
-<p>
-  <img src="docs/assets/phrases-panel.png" alt="Phrase panel" width="300" />
-  <img src="docs/assets/panel-collapsed.png" alt="Collapsed bubble" width="90" />
-  <img src="docs/assets/app-picker.png" alt="App picker" width="420" />
-</p>
+| Finding files | categories from a root folder, pinned folders, fuzzy search, grid/list views |
+| Moving files | drag into a folder tile or onto a sidebar folder; drag out to Explorer |
+| Notes | Markdown body, multiple images dragged in, edit and delete, recycle-bin safe |
+| Sending | Unicode `SendInput` into the previously focused window (no clipboard use) |
+| Web panel | real WebView tabs beside the launcher for docs, AI chats, dashboards |
 
 ### Shared plumbing
 
@@ -77,8 +76,9 @@ Everything lives in one file: `%APPDATA%\io.github.hexbench\config.json`
 | --- | --- |
 | `trigger` | which edges/ratio trigger a desktop switch |
 | `guard` | apps that suppress triggering while in front |
-| `hotkeys` | pause and phrase-panel shortcuts |
-| `phrases` | panel target app, side, inside/outside, phrases, send-on-click |
+| `hotkeys` | pause and launcher shortcuts |
+| `launcher` | categories root, pinned folders, web panel, gestures |
+| `notes` | favorites: enabled, folder, send-Enter |
 | `sync` | WebDAV URL, user, DPAPI-sealed password |
 | `updates` | optional endpoint override (use a mirror instead of GitHub) |
 
@@ -93,7 +93,7 @@ To publish a release: bump the version in `Cargo.toml` and `src-tauri/tauri.conf
 ## Roadmap
 
 - [x] Edge-triggered virtual desktop switching
-- [x] Quick-phrase panel with docking
+- [x] Quick launcher with Markdown favorites
 - [x] Global hotkey registry
 - [x] WebDAV config sync
 - [x] Signed one-click updates + CI releases

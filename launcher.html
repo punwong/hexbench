@@ -21,6 +21,8 @@
         --ease: cubic-bezier(0.2, 0, 0, 1);
         /* 滑块、列表这类「有惯性」的移动：起手快、收尾软，不弹过头。 */
         --glide: cubic-bezier(0.25, 0.9, 0.3, 1);
+        /* 滚动条、输入框这类系统画的东西也跟着深浅走。 */
+        color-scheme: light;
       }
 
       :root[data-theme="dark"] {
@@ -36,6 +38,7 @@
         --marquee-fill: rgba(255, 255, 255, 0.07);
         --gesture-line: rgba(255, 255, 255, 0.62);
         --gesture-glow: rgba(255, 255, 255, 0.14);
+        color-scheme: dark;
       }
 
       html,
@@ -228,6 +231,8 @@
         min-width: 0;
         display: flex;
         flex-direction: column;
+        /* 收藏编辑器是一层盖在内容上的浮层，靠它定位。 */
+        position: relative;
       }
 
       /* 搜索框挪到工具条最右侧，做成一个小输入框 */
@@ -736,6 +741,328 @@
 
       .empty-action:hover {
         opacity: 0.88;
+      }
+
+      /* ---------- 收藏 ---------- */
+
+      .notes {
+        position: relative;
+        flex: 1;
+        overflow-y: auto;
+        box-sizing: border-box;
+        padding: 14px 16px 18px;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+        gap: 12px;
+        align-content: start;
+        scrollbar-width: thin;
+      }
+
+      .notes .empty {
+        position: absolute;
+      }
+
+      .note-card {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 0;
+        min-height: 138px;
+        box-sizing: border-box;
+        padding: 12px 13px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: var(--bg);
+        overflow: hidden;
+        cursor: pointer;
+        transition:
+          background 130ms var(--ease),
+          border-color 130ms var(--ease),
+          box-shadow 130ms var(--ease);
+      }
+
+      .note-card:hover {
+        background: var(--surface);
+      }
+
+      /* 拖着图片悬在卡片上：追加到这一条。 */
+      .note-card.drop-hover {
+        border-color: var(--text);
+        background: var(--surface-2);
+        box-shadow: inset 0 0 0 1px var(--text);
+      }
+
+      .note-head {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+      }
+
+      .note-head h3 {
+        flex: 1 1 auto;
+        min-width: 0;
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .note-date {
+        flex: 0 0 auto;
+        color: var(--muted);
+        font-size: 10.5px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .note-preview {
+        flex: 1 1 auto;
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow: hidden;
+        display: -webkit-box;
+        -webkit-line-clamp: 4;
+        -webkit-box-orient: vertical;
+      }
+
+      .note-thumbs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .note-thumb {
+        display: grid;
+        place-items: center;
+        flex: 0 0 auto;
+        width: 52px;
+        height: 52px;
+        border-radius: 8px;
+        background: var(--surface-2);
+        overflow: hidden;
+      }
+
+      .note-thumb.large {
+        width: 72px;
+        height: 72px;
+      }
+
+      .note-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .note-thumb-glyph {
+        color: var(--muted);
+        font-size: 18px;
+      }
+
+      .note-thumb.more {
+        color: var(--muted);
+        font-size: 11.5px;
+      }
+
+      .note-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: auto;
+      }
+
+      .note-actions button {
+        padding: 3px 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text);
+        font: inherit;
+        font-size: 11.5px;
+        cursor: default;
+        transition: background 120ms ease, border-color 120ms ease;
+      }
+
+      .note-actions button:hover:not(:disabled) {
+        background: var(--surface-2);
+      }
+
+      .note-actions button:disabled {
+        opacity: 0.5;
+      }
+
+      .note-actions button.danger {
+        border-color: rgba(198, 40, 40, 0.5);
+        color: #c62828;
+      }
+
+      :root[data-theme="dark"] .note-actions button.danger {
+        border-color: rgba(255, 120, 120, 0.45);
+        color: #ff8a8a;
+      }
+
+      .notes-new {
+        padding: 0 10px;
+        border-color: var(--text);
+        background: var(--text);
+        color: var(--bg);
+      }
+
+      .tool-btn.notes-new:hover:not(:disabled) {
+        background: var(--text);
+        opacity: 0.88;
+      }
+
+      .notes-hint {
+        color: var(--muted);
+        font-size: 11.5px;
+        white-space: nowrap;
+      }
+
+      /* 编辑：一层浅色遮罩 + 中间一块编辑器 */
+      .note-shade {
+        position: absolute;
+        inset: 0;
+        z-index: 30;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        background: rgba(0, 0, 0, 0.28);
+      }
+
+      .note-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        width: min(660px, 100%);
+        max-height: 100%;
+        box-sizing: border-box;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--bg);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.3);
+      }
+
+      .note-editor-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .note-title {
+        flex: 1;
+        min-width: 0;
+        padding: 7px 9px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        color: var(--text);
+        font: inherit;
+        font-size: 14px;
+        font-weight: 600;
+        outline: none;
+        user-select: text;
+      }
+
+      .note-title:focus,
+      .note-body:focus {
+        border-color: var(--text);
+      }
+
+      .note-close {
+        flex: 0 0 auto;
+        width: 26px;
+        height: 26px;
+        border: none;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--muted);
+        font: inherit;
+        cursor: default;
+      }
+
+      .note-close:hover {
+        background: var(--surface-2);
+        color: var(--text);
+      }
+
+      .note-body {
+        flex: 1 1 auto;
+        min-height: 240px;
+        padding: 10px 11px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--surface);
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        line-height: 1.65;
+        resize: none;
+        outline: none;
+        user-select: text;
+        scrollbar-width: thin;
+      }
+
+      .note-editor-images {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        max-height: 120px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+      }
+
+      .note-editor-label {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .note-editor-foot {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .note-editor-hint {
+        flex: 1 1 auto;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .note-btn {
+        padding: 6px 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: transparent;
+        color: var(--text);
+        font: inherit;
+        font-size: 12.5px;
+        cursor: default;
+      }
+
+      .note-btn:hover:not(:disabled) {
+        background: var(--surface-2);
+      }
+
+      .note-btn.primary {
+        border-color: var(--text);
+        background: var(--text);
+        color: var(--bg);
+      }
+
+      .note-btn.primary:hover:not(:disabled) {
+        background: var(--text);
+        opacity: 0.88;
+      }
+
+      .note-btn:disabled {
+        opacity: 0.5;
       }
 
       .foot {

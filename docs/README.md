@@ -15,7 +15,6 @@
 
 - `launcher-*` —— 快捷面板
 - `settings-*` —— 设置页
-- `phrases-*` / `panel-*` —— 常用语面板
 - `ui-*` / `update-*` —— 主界面与更新提示
 - `web-*` —— 网页窗口
 - 其余（`context-menu`、`trigger-blue` 等）按内容命名

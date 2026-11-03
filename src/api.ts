@@ -23,7 +23,7 @@ const demoConfig: Config = {
     processBlacklist: [],
     pauseHotkey: "Ctrl+Alt+Shift+P",
   },
-  hotkeys: { pause: "Ctrl+Alt+Shift+P", phrasesPanel: "Ctrl+Alt+Shift+Q", launcher: "Ctrl+Alt+Space" },
+  hotkeys: { pause: "Ctrl+Alt+Shift+P", launcher: "Ctrl+Alt+Space" },
   updates: { endpoint: "", dismissedVersion: "" },
   sync: {
     enabled: false,
@@ -55,25 +55,20 @@ const demoConfig: Config = {
       lastLocation: { kind: "", base: "", label: "", path: "" },
       gestures: { enabled: true, invertDirection: false, triggerDistance: 80, showTrail: true },
     },
-  phrases: {
-    enabled: true,
-    items: [
-      { id: "p1", title: "在的", text: "亲，在的，有什么可以帮您～" },
-      { id: "p2", title: "稍等", text: "稍等，我帮您查一下。" },
-    ],
-    target: "",
-    targetClass: "",
-    targetTitle: "",
-    side: "right",
-    inside: false,
-    panelX: null,
-    panelY: null,
-    collapsed: false,
-    sendOnClick: false,
-    sendKey: "enter",
+  desktop: {
+    enabled: false,
+    keepOnShowDesktop: true,
+    snap: true,
+    snapGrid: false,
+    contextMenu: false,
+    opacity: 70,
+    frosted: true,
+    native: false,
+    fences: [],
   },
+  notes: { enabled: true, folder: "", sendEnter: false },
   ui: { theme: "system", language: "auto", onboarded: false },
-  meta: { schema: 1, updatedAt: 0, deviceId: "" },
+  meta: { schema: 3, updatedAt: 0, deviceId: "" },
 };
 
 let mockConfig = demoConfig;
@@ -171,14 +166,6 @@ export async function pickFolder(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
-/** Puts staged files on the clipboard as real files (Ctrl+V pastes them). */
-/** Hands a staged file to the OS so the user can drag it out of the window. */
-/** Fires when files are dropped onto the window. */
-export async function closePanel(): Promise<void> {
-  if (!isTauri) return;
-  await invoke("panel_close");
-}
-
 export async function setTestMode(enabled: boolean): Promise<void> {
   if (!isTauri) {
     mockTest = enabled;
@@ -228,11 +215,6 @@ const MOCK_APPS: RunningApp[] = [
 export async function runningApps(): Promise<RunningApp[]> {
   if (!isTauri) return MOCK_APPS;
   return invoke<RunningApp[]>("running_apps");
-}
-
-export async function togglePhrasesPanel(): Promise<void> {
-  if (!isTauri) return;
-  await invoke("toggle_phrases_panel");
 }
 
 export async function syncTest(
@@ -375,10 +357,145 @@ export async function cacheClear(): Promise<number> {
   if (!isTauri) return 0;
   return invoke<number>("cache_clear");
 }
+// ---------- 收藏 ----------
+
+/** 收藏实际用的目录（配置留空时是默认的「文档\HexBench 收藏」）。 */
+export async function notesFolder(): Promise<string> {
+  if (!isTauri) return "";
+  return invoke<string>("notes_folder");
+}
+
+/** 默认收藏目录：配置留空时用，和当前配置无关。 */
+export async function notesDefaultFolder(): Promise<string> {
+  if (!isTauri) return "";
+  return invoke<string>("notes_default_folder");
+}
+
+export async function notesOpenFolder(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("notes_open_folder");
+}
+
+/** 清空全部收藏（走回收站），返回清掉了多少条。 */
+export async function notesClearAll(): Promise<number> {
+  if (!isTauri) return 0;
+  return invoke<number>("notes_clear_all");
+}
+
 /// 保存「常用文件夹」的完整列表（增删、排序都走这里）。
 export async function saveLauncherFolders(folders: string[]): Promise<void> {
   if (!isTauri) return;
   await invoke("launcher_save_folders", { folders });
+}
+
+// ---------- 桌面格子 ----------
+
+export type FenceInfo = {
+  id: string;
+  title: string;
+  path: string;
+  kind: "folder" | "bucket";
+  rules: import("./types").FenceRule[];
+  rulesAuto: boolean;
+  monitor: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rolled: boolean;
+  visible: boolean;
+  zoom: number;
+  sortKey: string;
+  sortDir: number;
+};
+
+/** 新建一个绑定文件夹的格子（会顺带打开桌面格子总开关）。 */
+export async function fenceCreate(path: string): Promise<FenceInfo | null> {
+  if (!isTauri) return null;
+  return invoke<FenceInfo>("fence_create", { path });
+}
+
+/** 新建一个收纳盒：幕后目录由后端建在「文档\HexBench 收纳」下面。 */
+export async function fenceCreateBox(title = ""): Promise<FenceInfo | null> {
+  if (!isTauri) return null;
+  return invoke<FenceInfo>("fence_create_box", { title });
+}
+
+/** 收纳盒里有多少东西（删除前让用户决定文件怎么处理）。 */
+export type FenceBoxInfo = { store: string; items: number; bytes: number };
+
+export async function fenceBoxInfo(id: string): Promise<FenceBoxInfo | null> {
+  if (!isTauri) return null;
+  return invoke<FenceBoxInfo | null>("fence_box_info", { id });
+}
+
+/** `mode` 只对收纳盒有意义：release 搬到桌面 / purge 删到回收站 / keep 留着。 */
+export async function fenceDelete(
+  id: string,
+  mode?: "release" | "purge" | "keep",
+): Promise<void> {
+  if (!isTauri) return;
+  await invoke("fence_delete", { id, mode });
+}
+
+export async function fenceUpdate(
+  id: string,
+  patch: {
+    title?: string;
+    path?: string;
+    rolled?: boolean;
+    visible?: boolean;
+    zoom?: number;
+    sortKey?: string;
+    sortDir?: number;
+    rules?: import("./types").FenceRule[];
+    rulesAuto?: boolean;
+  },
+): Promise<void> {
+  if (!isTauri) return;
+  await invoke("fence_update", { id, ...patch });
+}
+
+/** 桌面 / 下载 / 文档的真实路径（给规则的「来源」快捷按钮用）。 */
+export type KnownFolders = {
+  desktop: string | null;
+  downloads: string | null;
+  documents: string | null;
+};
+
+export async function fenceKnownFolders(): Promise<KnownFolders> {
+  if (!isTauri) return { desktop: null, downloads: null, documents: null };
+  return invoke<KnownFolders>("fence_known_folders");
+}
+
+/** 规则匹配预览（只读，不移动）。 */
+export type FenceRuleMatch = {
+  path: string;
+  name: string;
+  rule: string;
+  subdir: string;
+  size: number;
+};
+
+export async function fenceRulePreview(id: string): Promise<FenceRuleMatch[]> {
+  if (!isTauri) return [];
+  return invoke<FenceRuleMatch[]>("fence_rule_preview", { id });
+}
+
+export async function fenceRuleRun(id: string): Promise<{ matched: number; moved: number }> {
+  if (!isTauri) return { matched: 0, moved: 0 };
+  return invoke<{ matched: number; moved: number }>("fence_rule_run", { id });
+}
+
+export async function fenceSetEnabled(enabled: boolean): Promise<void> {
+  if (!isTauri) return;
+  await invoke("fence_set_enabled", { enabled });
+}
+
+/** 卡片不透明度（百分比）/ 磨砂开关：改完全部格子立刻生效。 */
+export async function fenceSetAppearance(opacity: number, frosted: boolean): Promise<void> {
+  if (!isTauri) return;
+  await invoke("fence_set_appearance", { opacity, frosted });
 }
 
 /// 保存分类的显示顺序。

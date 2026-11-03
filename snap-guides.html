@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>HexBench</title>
+    <style>
+      /* 吸附参考线画布：一块盖住整个虚拟屏幕的透明窗口（后端设了透明、置顶、
+         点击穿透）。这里只负责把后端换算好的 CSS 坐标画成虚线。 */
+      :root {
+        --guide: rgba(47, 111, 237, 0.92);
+        --guide-halo: rgba(255, 255, 255, 0.55);
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        user-select: none;
+      }
+
+      #root {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+      }
+
+      .line {
+        position: fixed;
+        pointer-events: none;
+        /* 虚线：6px 实、6px 空。用渐变而不是 border-style: dashed——后者的
+           段长由浏览器按边框宽度算，1px 的线根本画不出虚线。 */
+        background-repeat: repeat;
+      }
+
+      .line.v {
+        width: 1px;
+        background-image: repeating-linear-gradient(
+          to bottom,
+          var(--guide) 0 6px,
+          transparent 6px 12px
+        );
+        /* 深色壁纸上一条 1px 蓝线的对比度太低，右边补一条几乎看不见的白边，
+           亮色桌面靠它，深色桌面靠蓝线本身。 */
+        box-shadow: 1px 0 0 var(--guide-halo);
+      }
+
+      .line.h {
+        height: 1px;
+        background-image: repeating-linear-gradient(
+          to right,
+          var(--guide) 0 6px,
+          transparent 6px 12px
+        );
+        box-shadow: 0 1px 0 var(--guide-halo);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/snap-guides.tsx"></script>
+  </body>
+</html>

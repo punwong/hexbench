@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>桌面格子</title>
+    <style>
+      /* 桌面格子：一张贴在桌面上的不透明卡片。圆角交给 DWM（后端设了 DWMWCP_ROUND），
+         这里不再自己画——自绘的圆角外面那圈三角会被 WebView 补成白色。 */
+      :root {
+        /* 卡片色拆成「颜色」和「透明度」两半：透明度由设置页的不透明度滑块决定，
+           页面拿到值之后改 --card-alpha（见 fence.tsx）。 */
+        --card-rgb: 250, 250, 251;
+        --header-rgb: 242, 242, 244;
+        --card-alpha: 0.97;
+        --header-alpha: 0.98;
+        --card: rgba(var(--card-rgb), var(--card-alpha));
+        --header: rgba(var(--header-rgb), var(--header-alpha));
+        --text: #0d0d0d;
+        --muted: #6b6b6b;
+        --line: rgba(0, 0, 0, 0.09);
+        --pick: rgba(0, 0, 0, 0.1);
+        --hover: rgba(0, 0, 0, 0.05);
+        --guide: rgba(47, 111, 237, 0.9);
+        --gesture-line: rgba(13, 13, 13, 0.45);
+        --gesture-glow: rgba(13, 13, 13, 0.1);
+        --ease: cubic-bezier(0.2, 0, 0, 1);
+        /* 滚动条这类系统画的东西跟着深浅走，别在深色卡片里留一条白条。 */
+        color-scheme: light;
+      }
+
+      :root[data-theme="dark"] {
+        --card-rgb: 24, 24, 26;
+        --header-rgb: 32, 32, 35;
+        --text: #ececec;
+        --muted: #9b9b9b;
+        --line: rgba(255, 255, 255, 0.1);
+        --pick: rgba(255, 255, 255, 0.14);
+        --hover: rgba(255, 255, 255, 0.07);
+        --guide: rgba(122, 165, 255, 0.95);
+        --gesture-line: rgba(255, 255, 255, 0.62);
+        --gesture-glow: rgba(255, 255, 255, 0.14);
+        color-scheme: dark;
+      }
+
+      /* 背后有系统磨砂（后端 sys::acrylic 成功）时，标题条用另一种底色，
+         和卡片分得开、也让材质在顶上更明显。透明度统一由滑块决定。 */
+      :root[data-backdrop="acrylic"] {
+        --header-rgb: 244, 244, 246;
+      }
+
+      :root[data-backdrop="acrylic"][data-theme="dark"] {
+        --header-rgb: 36, 36, 40;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        color: var(--text);
+        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+          sans-serif;
+        font-size: 13px;
+        -webkit-font-smoothing: antialiased;
+        user-select: none;
+      }
+
+      #root {
+        height: 100%;
+      }
+
+      .fence {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        box-sizing: border-box;
+        background: var(--card);
+        border: 1px solid var(--line);
+        overflow: hidden;
+        /* 窗口本身没有边框和阴影；一层很淡的内边加深，让卡片和壁纸分得开。 */
+        box-shadow: inset 0 0 0 100vmax rgba(255, 255, 255, 0.01);
+      }
+
+      /* ---------- 标题条：拖动、双击卷起、返回、菜单 ---------- */
+
+      .head {
+        flex: 0 0 40px;
+        height: 40px;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 8px;
+        background: var(--header);
+        border-bottom: 1px solid var(--line);
+        cursor: default;
+      }
+
+      .fence.rolled .head {
+        border-bottom: none;
+      }
+
+      .fence.rolled .body {
+        display: none;
+      }
+
+      /* 卷起后像 PecoFence 一样只允许横向缩放：竖向热区和四角都收起来。 */
+      .fence.rolled .resize.n,
+      .fence.rolled .resize.s,
+      .fence.rolled .resize.nw,
+      .fence.rolled .resize.ne,
+      .fence.rolled .resize.sw,
+      .fence.rolled .resize.se {
+        display: none;
+      }
+
+      .icon-btn {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        border: none;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--text);
+        font: inherit;
+        cursor: default;
+        transition: background 120ms ease;
+      }
+
+      .icon-btn:hover {
+        background: var(--hover);
+      }
+
+      .icon-btn:disabled {
+        opacity: 0.3;
+      }
+
+      .folder-glyph {
+        flex: 0 0 auto;
+        display: grid;
+        place-items: center;
+        width: 20px;
+        height: 20px;
+        color: var(--muted);
+      }
+
+      .title {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-size: 12.5px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+
+      /* 进了子文件夹：标题位置换成路径面包屑，和快捷面板的文件区同一套。
+         太长时横向滚动（不显示滚动条），不会把右侧的数量和菜单挤出去。 */
+      .crumbs {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 1px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+      }
+
+      .crumbs::-webkit-scrollbar {
+        display: none;
+      }
+
+      .crumb {
+        flex: 0 0 auto;
+        padding: 2px 6px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--muted);
+        font: inherit;
+        font-size: 12px;
+        white-space: nowrap;
+        cursor: default;
+      }
+
+      .crumb:hover {
+        background: var(--hover);
+        color: var(--text);
+      }
+
+      /* 最后一段就是当前目录，用正文色点出来。 */
+      .crumb:last-child {
+        color: var(--text);
+      }
+
+      /* 从外面拖文件到某一段上：松手就移进那一层。 */
+      .crumb.drop-hover {
+        background: var(--hover);
+        box-shadow: inset 0 0 0 2px var(--text);
+        color: var(--text);
+      }
+
+      .crumb-sep {
+        flex: 0 0 auto;
+        color: var(--muted);
+        opacity: 0.55;
+        font-size: 12px;
+      }
+
+      .count {
+        flex: 0 0 auto;
+        color: var(--muted);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .crumb-path {
+        flex: 0 0 auto;
+        max-width: 46%;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        direction: rtl;
+        text-align: left;
+        color: var(--muted);
+        font-size: 10.5px;
+      }
+
+      .title-input {
+        flex: 1 1 auto;
+        min-width: 0;
+        height: 22px;
+        padding: 0 6px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--card);
+        color: var(--text);
+        font: inherit;
+        font-size: 12.5px;
+        outline: none;
+        user-select: text;
+      }
+
+      /* ---------- 内容区 ---------- */
+
+      .body {
+        position: relative;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        /* 不写 scrollbar-width / scrollbar-color：新版 Chromium 一旦设了这两个
+           标准属性，下面的 ::-webkit-scrollbar 就不再生效，画出来的是系统滚动条
+           （固定深灰色，不跟着卡片的不透明度走）。 */
+      }
+
+      .space {
+        position: relative;
+        width: 100%;
+        pointer-events: none;
+      }
+
+      .tile {
+        position: absolute;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 4px;
+        padding: 7px 3px 4px;
+        border: none;
+        border-radius: 9px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        cursor: default;
+        outline: none;
+        overflow: hidden;
+        transition: background 120ms ease;
+        pointer-events: auto;
+      }
+
+      .tile:hover {
+        background: var(--hover);
+      }
+
+      .tile.picked {
+        background: var(--pick);
+      }
+
+      /* 拖来的文件压在文件夹上：给一圈描边，松手就移进去。 */
+      .tile.drop-hover {
+        background: var(--hover);
+        box-shadow: inset 0 0 0 2px var(--text);
+      }
+
+      .tile-icon {
+        position: relative;
+        display: grid;
+        place-items: center;
+        flex: 0 0 auto;
+      }
+
+      .tile-icon img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        opacity: 0;
+        transform: scale(0.92);
+        transition: opacity 140ms var(--ease), transform 180ms var(--ease);
+      }
+
+      .tile-icon img.ready {
+        opacity: 1;
+        transform: none;
+      }
+
+      .tile-glyph {
+        line-height: 1;
+        color: var(--muted);
+      }
+
+      .tile-name {
+        max-width: 100%;
+        line-height: 1.3;
+        text-align: center;
+        word-break: break-all;
+        overflow: hidden;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+      }
+
+      .tile-input {
+        width: 100%;
+        padding: 2px 4px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: var(--card);
+        color: var(--text);
+        font: inherit;
+        font-size: 11px;
+        line-height: 1.3;
+        text-align: center;
+        outline: none;
+        user-select: text;
+      }
+
+      .empty {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        padding: 18px;
+        box-sizing: border-box;
+        text-align: center;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.7;
+        pointer-events: none;
+      }
+
+      .empty strong {
+        color: var(--text);
+        font-size: 12.5px;
+        font-weight: 600;
+      }
+
+      .empty button {
+        pointer-events: auto;
+        margin-top: 8px;
+        padding: 5px 12px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--card);
+        color: var(--text);
+        font: inherit;
+        font-size: 12px;
+        cursor: default;
+      }
+
+      .empty button:hover {
+        background: var(--hover);
+      }
+
+      /* 吸附参考线不画在卡片里：它跨整个桌面，由 snap-guides 那层透明窗口画
+         （窗口画不出自己边界以外的线）。这里只剩卡片自己的样式。 */
+
+      /* ---------- 8 个缩放热区 ---------- */
+
+      .resize {
+        position: fixed;
+        z-index: 20;
+      }
+
+      .resize.n {
+        top: 0;
+        left: 8px;
+        right: 8px;
+        height: 5px;
+        cursor: ns-resize;
+      }
+
+      .resize.s {
+        bottom: 0;
+        left: 8px;
+        right: 8px;
+        height: 5px;
+        cursor: ns-resize;
+      }
+
+      .resize.w {
+        left: 0;
+        top: 8px;
+        bottom: 8px;
+        width: 5px;
+        cursor: ew-resize;
+      }
+
+      .resize.e {
+        right: 0;
+        top: 8px;
+        bottom: 8px;
+        width: 5px;
+        cursor: ew-resize;
+      }
+
+      .resize.nw {
+        left: 0;
+        top: 0;
+        width: 12px;
+        height: 12px;
+        cursor: nwse-resize;
+      }
+
+      .resize.ne {
+        right: 0;
+        top: 0;
+        width: 12px;
+        height: 12px;
+        cursor: nesw-resize;
+      }
+
+      .resize.sw {
+        left: 0;
+        bottom: 0;
+        width: 12px;
+        height: 12px;
+        cursor: nesw-resize;
+      }
+
+      .resize.se {
+        right: 0;
+        bottom: 0;
+        width: 12px;
+        height: 12px;
+        cursor: nwse-resize;
+      }
+
+      /* ---------- 标题条「⋯」菜单 ---------- */
+
+      .menu {
+        position: fixed;
+        z-index: 40;
+        min-width: 148px;
+        padding: 5px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        /* 菜单是压在卡片内容上的浮层，用不透明的卡片色：跟着半透明会让
+           底下的文件图标透上来，字和图标糊在一起。 */
+        background: rgb(var(--card-rgb));
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+      }
+
+      .menu button {
+        display: block;
+        width: 100%;
+        padding: 7px 10px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 12.5px;
+        text-align: left;
+        cursor: default;
+      }
+
+      .menu button:hover {
+        background: var(--hover);
+      }
+
+      .menu .sep {
+        height: 1px;
+        margin: 4px 6px;
+        background: var(--line);
+      }
+
+      /* 右键手势的轨迹和方向提示：和呼出面板同一套，只是压在卡片内容上。 */
+      .gesture-layer {
+        position: fixed;
+        inset: 0;
+        z-index: 25;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 160ms var(--ease);
+      }
+
+      .gesture-layer.on {
+        opacity: 1;
+      }
+
+      .gesture-layer[hidden] {
+        display: none;
+      }
+
+      .gesture-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      .gesture-label {
+        position: absolute;
+        left: 0;
+        top: 0;
+        padding: 5px 10px;
+        border-radius: 7px;
+        background: rgba(32, 32, 34, 0.92);
+        color: #fff;
+        font-size: 12px;
+        line-height: 1.3;
+        white-space: nowrap;
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+        will-change: transform;
+      }
+
+      .gesture-label.dim {
+        opacity: 0.45;
+      }
+
+      .gesture-label[hidden] {
+        display: none;
+      }
+
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 14px;
+        transform: translateX(-50%);
+        z-index: 45;
+        max-width: 88%;
+        padding: 6px 12px;
+        border-radius: 8px;
+        background: rgba(32, 32, 34, 0.94);
+        color: #fff;
+        font-size: 12px;
+        line-height: 1.4;
+        pointer-events: none;
+      }
+
+      /* 滚动条：细、没有底槽，颜色跟着卡片不透明度走——卡片越透，滚动条也越淡，
+         悬停在内容区时再稍微提亮，不然在一个半透明卡片上会像一道实心灰条。 */
+      .body::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+
+      .body::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      .body::-webkit-scrollbar-thumb {
+        border-radius: 999px;
+        background: rgba(0, 0, 0, calc(0.03 + var(--card-alpha) * 0.07));
+      }
+
+      .body:hover::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, calc(0.06 + var(--card-alpha) * 0.12));
+      }
+
+      :root[data-theme="dark"] .body::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, calc(0.03 + var(--card-alpha) * 0.07));
+      }
+
+      :root[data-theme="dark"] .body:hover::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, calc(0.06 + var(--card-alpha) * 0.12));
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 1ms !important;
+          animation-delay: 0ms !important;
+          transition-duration: 1ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/fence.tsx"></script>
+  </body>
+</html>

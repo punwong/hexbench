@@ -1483,3 +1483,203 @@ code,
   color: var(--muted);
   opacity: 0.55;
 }
+/* ---------- 桌面格子（设置页） ---------- */
+
+.empty-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 4px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.fence-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fence-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface, transparent);
+}
+
+.fence-glyph {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--surface-2, rgba(0, 0, 0, 0.05));
+  color: var(--muted);
+}
+
+.fence-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fence-name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fence-path {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.fence-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 收纳盒：一行格子 + 下面可以展开的规则编辑器。 */
+
+.fence-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fence-badge {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: 1px;
+}
+
+.icon-btn.active {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.rule-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.rule-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rule-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.rule-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.rule-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.rule-sources .row-label {
+  margin-right: 2px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 260px;
+  padding: 3px 4px 3px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip button {
+  flex: 0 0 auto;
+  padding: 0 3px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: default;
+}
+
+.chip button:hover {
+  color: var(--text);
+}
+
+.rule-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.icon-btn.danger:hover {
+  border-color: #d64545;
+  color: #d64545;
+}
+
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.row-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(214, 69, 69, 0.1);
+  color: #c23b3b;
+  font-size: 12.5px;
+}

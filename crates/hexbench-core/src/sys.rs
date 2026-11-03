@@ -9,7 +9,6 @@ use std::ffi::c_void;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -25,11 +24,10 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, VK_CONTROL, VK_D, VK_LBUTTON, VK_LEFT, VK_LWIN, VK_MBUTTON, VK_RBUTTON,
-    VK_RETURN, VK_RIGHT,
+    KEYEVENTF_UNICODE, VK_CONTROL, VK_D, VK_LBUTTON, VK_LEFT, VK_LWIN, VK_MBUTTON, VK_MENU,
+    VK_RBUTTON, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows_sys::core::GUID;
 use windows_sys::Win32::System::Com::{
@@ -42,16 +40,16 @@ use windows_sys::Win32::System::Ole::{DoDragDrop, OleInitialize};
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{
     CMINVOKECOMMANDINFO, SHBindToParent, SHCreateDataObject, SHGetIDListFromObject,
-    SHParseDisplayName,
+    SHGetKnownFolderPath, SHParseDisplayName,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, EVENT_SYSTEM_DESKTOPSWITCH, GetAncestor, GetClassNameW,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MSG,
-    SetCursorPos, SetWindowLongW, SetWindowPos, TranslateMessage, WindowFromPoint,
+    EnumWindows, GetAncestor, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint,
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuStringW, InsertMenuW,
     TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    WINEVENT_OUTOFCONTEXT, GA_ROOT, GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    GA_ROOT, GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
@@ -61,6 +59,8 @@ use crate::trigger::Direction;
 
 /// `MONITORINFOF_PRIMARY` is not re-exported by `windows-sys` 0.61.
 const MONITORINFOF_PRIMARY: u32 = 0x1;
+/// `SWP_NOOWNERZORDER` is not re-exported by `windows-sys` 0.61 either.
+const SWP_NOOWNERZORDER: u32 = 0x0200;
 
 
 /// Current cursor position in physical pixels, or `None` if the call failed.
@@ -555,22 +555,36 @@ fn unicode_input(unit: u16, key_up: bool) -> INPUT {
 
 /// Type text into the focused window with unicode input.
 ///
-/// The clipboard is never touched, so a phrase click cannot destroy whatever
+/// The clipboard is never touched, so sending a note cannot destroy whatever
 /// the user had copied. Classic edit controls and Chromium inputs both accept
 /// the resulting `WM_CHAR`.
 pub fn type_text(text: &str) -> bool {
-    for unit in text.encode_utf16() {
-        let inputs = [unicode_input(unit, false), unicode_input(unit, true)];
-        // SAFETY: two valid INPUT structures.
-        let sent = unsafe {
-            SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32)
+    let mut buf = [0u16; 2];
+    for ch in text.chars() {
+        // 换行和制表符不能当普通字符发：U+000A / U+0009 走 Unicode 输入时多数
+        // 控件直接丢掉（记事本会把整段笔记挤成一行），得真的敲一下回车 / Tab。
+        let ok = match ch {
+            '\n' => send_keys(VK_RETURN),
+            '\t' => send_keys(VK_TAB),
+            _ => ch.encode_utf16(&mut buf).iter().all(|unit| {
+                let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
+                // SAFETY: two valid INPUT structures.
+                unsafe { SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) == 2 }
+            }),
         };
-        if sent != 2 {
+        if !ok {
             return false;
         }
         thread::sleep(Duration::from_millis(3));
     }
     true
+}
+
+/// 按一下某个虚拟键（不进输入法，也不算字符）。
+fn send_keys(vk: u16) -> bool {
+    let inputs = [key_input(vk, false), key_input(vk, true)];
+    // SAFETY: two valid INPUT structures.
+    unsafe { SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) == 2 }
 }
 
 /// Toggle `WS_EX_NOACTIVATE` on a window.
@@ -657,7 +671,32 @@ pub fn window_under_cursor() -> Option<WindowInfo> {
     }
 }
 
-/// 前台窗口的句柄：借走焦点的地方（常用语编辑框）退出时还回去。
+/// 窗口句柄现在还有效吗：收藏的「发送」不能在目标窗口已经关掉之后乱输入。
+pub fn window_valid(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: 标准窗口查询；无效句柄返回 0。
+    unsafe { IsWindow(hwnd as HWND) != 0 }
+}
+
+/// 这个窗口属于本进程吗（呼出面板、内置网页都是自己的窗口，不能当发送目标）。
+pub fn hwnd_is_current_process(hwnd: isize) -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if hwnd == 0 {
+        return false;
+    }
+    let mut process = 0u32;
+    // SAFETY: 标准查询；pid 指针有效。
+    unsafe {
+        GetWindowThreadProcessId(hwnd as HWND, &mut process);
+        process == GetCurrentProcessId()
+    }
+}
+
+/// 前台窗口的句柄：呼出面板撑走焦点前记下来，发送收藏时再还回去。
 pub fn foreground_hwnd() -> Option<isize> {
     // SAFETY: plain query on a system handle.
     unsafe {
@@ -682,29 +721,9 @@ pub fn foreground_window_info() -> Option<WindowInfo> {
     }
 }
 
-/// Press Enter in the focused window (used by "fill and send").
-/// Ctrl+Enter, for chat apps that send on that chord.
-pub fn press_ctrl_enter() -> bool {
-    let inputs = [
-        key_input(VK_CONTROL, false),
-        key_input(VK_RETURN, false),
-        key_input(VK_RETURN, true),
-        key_input(VK_CONTROL, true),
-    ];
-    // SAFETY: array lives for the call; INPUT is plain-old-data.
-    unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        ) == inputs.len() as u32
-    }
-}
 
 pub fn press_enter() -> bool {
-    let inputs = [key_input(VK_RETURN, false), key_input(VK_RETURN, true)];
-    // SAFETY: two valid INPUT structures.
-    unsafe { SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) == 2 }
+    send_keys(VK_RETURN)
 }
 
 /// Bounds of the foreground window, in physical pixels.
@@ -807,57 +826,7 @@ pub fn start_manual_drag(hwnd: isize) {
         }
     });
 }
-/// Number of virtual desktop switches seen since the app started.
-static DESKTOP_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
-pub fn desktop_switch_count() -> u64 {
-    DESKTOP_SWITCHES.load(Ordering::Relaxed)
-}
-
-unsafe extern "system" fn desktop_switch_proc(
-    _hook: HWINEVENTHOOK,
-    event: u32,
-    _hwnd: HWND,
-    _object: i32,
-    _child: i32,
-    _thread: u32,
-    _time: u32,
-) {
-    if event == EVENT_SYSTEM_DESKTOPSWITCH {
-        DESKTOP_SWITCHES.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Count desktop switches as they happen.
-///
-/// Polling the current desktop can take a few hundred milliseconds, and during
-/// that window Windows has already carried the phrase panel to the new desktop
-/// (which shows up as a black rectangle flashing). The shell event fires as the
-/// switch starts, so the panel can be hidden in time.
-pub fn watch_desktop_switches() {
-    thread::spawn(|| {
-        // SAFETY: installing an out-of-context hook and pumping its messages.
-        unsafe {
-            let hook = SetWinEventHook(
-                EVENT_SYSTEM_DESKTOPSWITCH,
-                EVENT_SYSTEM_DESKTOPSWITCH,
-                std::ptr::null_mut(),
-                Some(desktop_switch_proc),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            if hook.is_null() {
-                return;
-            }
-            let mut msg: MSG = std::mem::zeroed();
-            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-    });
-}
 /// Move a window immediately, without activation or z-order changes.
 ///
 /// `WebviewWindow::set_position` goes through the Tauri event loop, which
@@ -1122,6 +1091,136 @@ pub fn round_window_corners(hwnd: isize) -> bool {
     result == 0
 }
 
+/// 让窗口背后是系统的磨砂材质（亚克力 / 模糊背景）。
+///
+/// 两条路，按系统版本走：
+/// - Win11 22H2+：客户区整块算进边框（`DwmExtendFrameIntoClientArea(-1)`），
+///   再设 `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW`（亚克力）。
+/// - Win10 1809+：user32 的未公开接口 `SetWindowCompositionAttribute`，
+///   `ACCENT_ENABLE_ACRYLICBLURBEHIND`。
+///
+/// **窗口本身保持不透明**：材质由 DWM 画在客户区后面，页面那边要把 WebView 的
+/// 默认背景设成透明（`Webview::set_background_color(None→alpha 0)`）并让卡片色
+/// 留出透明度，否则 WebView 自己的白底会把材质盖住。
+///
+/// 返回 true 表示材质真的上了；调用方据此决定页面用半透明还是纯色（Win10 上
+/// 两条路都可能失败，那时退回原来的不透明卡片）。
+pub fn acrylic(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    if accent_acrylic(hwnd) {
+        return true;
+    }
+    dwm_acrylic(hwnd)
+}
+
+/// Win11 22H2+ 的系统背景材质。
+fn dwm_acrylic(hwnd: isize) -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
+        DWMWA_SYSTEMBACKDROP_TYPE,
+    };
+    use windows_sys::Win32::UI::Controls::MARGINS;
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    let backdrop = DWMSBT_TRANSIENTWINDOW;
+    // SAFETY: 两个调用都只读这几字节；老系统没有这个属性，返回错误码而已。
+    unsafe {
+        let _ = DwmExtendFrameIntoClientArea(hwnd as HWND, &margins);
+        DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_SYSTEMBACKDROP_TYPE as u32,
+            (&backdrop as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        ) == 0
+    }
+}
+
+/// 把背后的材质撤掉（设置里关掉磨砂时用）。
+///
+/// 上材质的两条路顺序试，撤的时候也不知道当初是哪条生效的，所以两条都撤：
+/// DWM 那边的背景材质设回无、客户区边框收回去，重点把 Accent 关掉。
+pub fn clear_acrylic(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    accent_policy(hwnd, 0); // ACCENT_DISABLED
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    };
+    use windows_sys::Win32::UI::Controls::MARGINS;
+    let margins = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 0 };
+    let none: i32 = 0; // DWMSBT_NONE
+    // SAFETY: 都是只读这几字节的属性设置，失败返回错误码而已。
+    unsafe {
+        let _ = DwmExtendFrameIntoClientArea(hwnd as HWND, &margins);
+        let _ = DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_SYSTEMBACKDROP_TYPE as u32,
+            (&none as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
+/// Win10 1809+ 的亚克力：user32 里没进头文件的接口，按地址取。
+fn accent_acrylic(hwnd: isize) -> bool {
+    accent_policy(hwnd, 4) // ACCENT_ENABLE_ACRYLICBLURBEHIND
+}
+
+/// 摆一份 accent 策略上去。`state` = 0 就是关掉。
+fn accent_policy(hwnd: isize, state: i32) -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    #[repr(C)]
+    struct AccentPolicy {
+        state: i32,
+        flags: i32,
+        /// AABBGGRR。这里给一层很淡的白，真正的颜色由页面里的半透明色决定。
+        gradient_color: u32,
+        animation_id: i32,
+    }
+    #[repr(C)]
+    struct WindowCompositionAttributeData {
+        attribute: i32,
+        data: *mut core::ffi::c_void,
+        size: usize,
+    }
+    const WCA_ACCENT_POLICY: i32 = 19;
+
+    // SAFETY: GetProcAddress 拿到的就是 SetWindowCompositionAttribute 的地址；
+    // 结构和签名按社区通行的定义摆（这个接口没公开文档）。
+    unsafe {
+        let module = GetModuleHandleA(c"user32.dll".as_ptr().cast());
+        if module.is_null() {
+            return false;
+        }
+        let Some(entry) = GetProcAddress(module, c"SetWindowCompositionAttribute".as_ptr().cast())
+        else {
+            return false;
+        };
+        let set: unsafe extern "system" fn(isize, *mut WindowCompositionAttributeData) -> i32 =
+            std::mem::transmute(entry);
+        let mut policy = AccentPolicy {
+            state,
+            flags: 0,
+            gradient_color: 0x40_FF_FF_FF,
+            animation_id: 0,
+        };
+        let mut data = WindowCompositionAttributeData {
+            attribute: WCA_ACCENT_POLICY,
+            data: (&mut policy as *mut AccentPolicy).cast(),
+            size: std::mem::size_of::<AccentPolicy>(),
+        };
+        set(hwnd, &mut data) != 0
+    }
+}
+
 /// 在主线程上初始化 OLE。窗口创建时要注册拖放目标，没有这个初始化的话
 /// 外部拖进来的文件一个事件都不会有（看着就像「拖不进来」）。
 pub fn init_ole() {
@@ -1168,6 +1267,12 @@ pub fn screen_to_client(hwnd: isize, x: i32, y: i32) -> (i32, i32) {
 pub fn left_button_down() -> bool {
     // SAFETY: GetAsyncKeyState 只读键盘状态。
     unsafe { GetAsyncKeyState(VK_LBUTTON as i32) < 0 }
+}
+
+/// Alt 按着吗？按住 Alt 时暂停格子移动 / 缩放的吸附（和 PecoFence 一致）。
+pub fn alt_down() -> bool {
+    // SAFETY: GetAsyncKeyState 只读键盘状态。
+    unsafe { GetAsyncKeyState(VK_MENU as i32) < 0 }
 }
 /// 用系统默认程序打开一个文件或文件夹（和双击效果一致）。
 pub fn open_path(path: &std::path::Path) -> Result<(), String> {
@@ -1869,6 +1974,538 @@ pub fn show_folder_background_menu(
         Ok(choice)
     }
 }
+// ---------------------------------------------------------------------------
+// 桌面层：桌面格子的锚定与几何
+// ---------------------------------------------------------------------------
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    // SAFETY: 标准窗口查询；句柄无效时返回 0。
+    let copied = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..copied as usize])
+}
+
+unsafe extern "system" fn host_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: `lparam` 是调用方传进来的 `&mut (defview, out)`，活到枚举结束。
+    unsafe {
+        let (defview, out) = &mut *(lparam as *mut (*const u16, HWND));
+        if class_name(hwnd) == "WorkerW"
+            && !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowExW(
+                hwnd,
+                std::ptr::null_mut(),
+                *defview,
+                std::ptr::null(),
+            )
+            .is_null()
+        {
+            *out = hwnd;
+            return 0;
+        }
+    }
+    1
+}
+
+/// 桌面图标宿主：`SHELLDLL_DefView` 所在的那个顶层窗口。
+///
+/// 24H2 之后 DefView 一直挂在 `Progman` 下；更早的版本它会被挪到某个顶层
+/// `WorkerW` 下。这里每次现查、不缓存——Explorer 重启 / 切换桌面时层级会变，
+/// 缓存一次就会把格子锚到已经不存在的窗口上。
+pub fn shell_icon_host() -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, FindWindowW, GetShellWindow,
+    };
+    let defview = wide("SHELLDLL_DefView");
+    // SAFETY: 全是标准窗口查询。
+    unsafe {
+        // EnumWindows 只枚举顶层窗口；WorkerW 就是顶层宿主。
+        let mut pair: (*const u16, HWND) = (defview.as_ptr(), std::ptr::null_mut());
+        EnumWindows(Some(host_proc), &mut pair as *mut _ as LPARAM);
+        let worker = pair.1;
+
+        let shell = GetShellWindow();
+        if !shell.is_null() && class_name(shell) == "Progman" {
+            if !FindWindowExW(
+                shell,
+                std::ptr::null_mut(),
+                defview.as_ptr(),
+                std::ptr::null(),
+            )
+            .is_null()
+            {
+                return shell as isize;
+            }
+            if !worker.is_null() {
+                return worker as isize;
+            }
+            // 新版 Windows 在 Explorer 重启的瞬间可能暂时没有 DefView：
+            // 仍然锚到 Progman，比掉到 HWND_BOTTOM 更稳。
+            return shell as isize;
+        }
+        if !worker.is_null() {
+            return worker as isize;
+        }
+        let folder_view = wide("FolderView");
+        let list = FindWindowW(std::ptr::null(), folder_view.as_ptr());
+        if !list.is_null() {
+            let root = GetAncestor(list, GA_ROOT);
+            if !root.is_null() {
+                return root as isize;
+            }
+        }
+        0
+    }
+}
+
+/// 把窗口放到所有普通窗口的最底下（桌面宿主之上）。
+pub fn send_to_bottom(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;
+    const HWND_BOTTOM: isize = -1;
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 标准窗口定位；尺寸和位置都不动。
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            HWND_BOTTOM as HWND,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+/// 把窗口插到桌面图标宿主**正上方**、普通窗口之下。
+///
+/// 这是成熟桌面小组件的做法（PecoFence / DeskBox）：纯 `HWND_BOTTOM` 在
+/// Explorer 抬升桌面、Win+D 之后会被桌面盖住；锚在宿主上面则始终浮在壁纸和
+/// 图标之上、被普通窗口盖住。失败时退回最底层，至少还看得见。
+pub fn anchor_above_desktop(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindow, SetWindowPos};
+    const GW_HWNDPREV: u32 = 3;
+    if hwnd == 0 {
+        return false;
+    }
+    let host = shell_icon_host();
+    if host == 0 {
+        send_to_bottom(hwnd);
+        return false;
+    }
+    // SAFETY: 标准 z-order 查询与定位。
+    unsafe {
+        // 插在宿主**正上方**：取宿主上邻的那一扇窗口当插入点，不管它现在
+        // 可见不可见。以前这里会跳过不可见的窗口去找「第一个看得见的」，
+        // 结果是：启动时某个程序正好最小化着，格子就插到了它的上面；那个
+        // 程序一还原，格子就浮在了它前面——用户看到的就是「像置顶面板」。
+        // 挨着宿主插，所有窗口（包括当时最小化的）都留在格子上面。
+        let mut above = GetWindow(host as HWND, GW_HWNDPREV);
+        // 宿主上面没有别的窗口：插在宿主正上方（传 null 会跑到最顶层，
+        // 格子就会压住所有普通窗口）。
+        if above.is_null() {
+            above = host as HWND;
+        } else if ex_topmost(above) && !ex_topmost(host as HWND) {
+            // Win+D / 显示桌面会把桌面宿主抬到普通窗口上面，这时宿主正上方
+            // 最近的那扇可见窗口是任务栏这类**置顶**窗口。拿它当插入点，
+            // 格子自己也会被标成置顶——桌面落回去之后就永远浮在所有普通窗口
+            // 上面了。这种时候直接贴在宿主上方，等桌面落回去再重锚。
+            above = host as HWND;
+        } else if above as isize == hwnd {
+            // 已经紧贴在宿主上方，不要拿自己做锚点（SetWindowPos 会失败并
+            // 退回最底层）。
+            return true;
+        }
+        let insert_after = above;
+        let ok = SetWindowPos(
+            hwnd as HWND,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+        if ok == 0 {
+            send_to_bottom(hwnd);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+/// 窗口是不是置顶（WS_EX_TOPMOST）。
+pub fn is_topmost(hwnd: isize) -> bool {
+    hwnd != 0 && ex_topmost(hwnd as HWND)
+}
+
+fn ex_topmost(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_EXSTYLE, WS_EX_TOPMOST};
+    // SAFETY: 标准窗口查询。
+    let style = unsafe { GetWindowLongW(hwnd as _, GWL_EXSTYLE) };
+    style & WS_EX_TOPMOST as i32 != 0
+}
+
+/// 格子是不是浮到了普通窗口上面（而不是紧贴着桌面宿主）。
+///
+/// 两种情况：
+/// - 被标成了置顶。正常插在宿主上方是普通 z-order；只有「相对置顶窗口定位」
+///   的 `SetWindowPos` 会顺手把它也变成置顶（Win+D 抬起桌面时最容易踩到）。
+/// - z-order 里和宿主之间夹着一扇带标题的可见窗口——比如锚定时那个程序正好
+///   最小化着，格子插到了它上面，它一还原格子就浮在它前面。
+///
+/// `siblings` 是其他格子窗口，夹在中间不算数。没有标题的辅助窗口（IME、
+/// DWM 监听窗）不算，免得每次看门狗都白锚一遍。
+pub fn floats_above_windows(hwnd: isize, siblings: &[isize]) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindow;
+    const GW_HWNDNEXT: u32 = 2;
+    let host = shell_icon_host();
+    if hwnd == 0 || host == 0 {
+        return false;
+    }
+    if is_topmost(hwnd) && !is_topmost(host) {
+        return true;
+    }
+    let mut cursor = unsafe { GetWindow(hwnd as HWND, GW_HWNDNEXT) };
+    let mut guard = 0;
+    while !cursor.is_null() && guard < 4096 {
+        if cursor as isize == host {
+            return false;
+        }
+        if siblings.contains(&(cursor as isize)) {
+            cursor = unsafe { GetWindow(cursor, GW_HWNDNEXT) };
+            guard += 1;
+            continue;
+        }
+        if visible_surface(cursor) && window_title(cursor).is_some() && !ex_topmost(cursor) {
+            return true;
+        }
+        cursor = unsafe { GetWindow(cursor, GW_HWNDNEXT) };
+        guard += 1;
+    }
+    false
+}
+
+fn window_title(hwnd: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    // SAFETY: 标准窗口查询；先问长度再按长度取，不会越界。
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        if copied <= 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buffer[..copied as usize]))
+    }
+}
+
+fn visible_surface(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+    // SAFETY: 标准窗口查询。
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return false;
+        }
+        rect.right > rect.left && rect.bottom > rect.top
+    }
+}
+
+/// 桌面宿主是不是跑到了格子上面（Win+D / 资源管理器抬升桌面之后）。
+pub fn behind_desktop(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindow;
+    const GW_HWNDPREV: u32 = 3;
+    if hwnd == 0 {
+        return false;
+    }
+    let host = shell_icon_host();
+    if host == 0 {
+        return false;
+    }
+    // SAFETY: 只沿 z-order 链往上走，带步数上限防止环。
+    unsafe {
+        let mut cursor = GetWindow(hwnd as HWND, GW_HWNDPREV);
+        let mut guard = 0;
+        while !cursor.is_null() && guard < 4096 {
+            if cursor as isize == host {
+                return true;
+            }
+            cursor = GetWindow(cursor, GW_HWNDPREV);
+            guard += 1;
+        }
+    }
+    false
+}
+
+/// 前台窗口所属的顶层窗口（经过 `GA_ROOT`：菜单、弹出层都归到它的主窗口）。
+pub fn foreground_root() -> isize {
+    let Some(hwnd) = foreground_hwnd() else {
+        return 0;
+    };
+    // SAFETY: 标准窗口查询。
+    unsafe {
+        let root = GetAncestor(hwnd as HWND, GA_ROOT);
+        if root.is_null() {
+            hwnd
+        } else {
+            root as isize
+        }
+    }
+}
+
+/// 窗口所属进程 id；句柄无效时是 0。
+pub fn window_pid(hwnd: isize) -> u32 {
+    if hwnd == 0 {
+        return 0;
+    }
+    let mut pid = 0u32;
+    // SAFETY: 标准窗口查询。
+    unsafe { GetWindowThreadProcessId(hwnd as HWND, &mut pid) };
+    pid
+}
+
+/// 窗口类名。
+pub fn window_class_name(hwnd: isize) -> String {
+    if hwnd == 0 {
+        return String::new();
+    }
+    class_name(hwnd as HWND)
+}
+
+/// 前台是不是资源管理器抬起来的桌面窗口。
+///
+/// Win+D / 「显示桌面」不最小化任何窗口：资源管理器把 `Progman`（24H2 之后）
+/// 或图标所在的 `WorkerW`（更早的版本）抬到所有窗口上面并拿走前台。认出这一
+/// 刻靠两件事——根窗口类是桌面类，并且和 shell 窗口同进程；只看类名不够，
+/// 别的程序也能注册叫 WorkerW 的窗口。
+pub fn foreground_is_desktop() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
+    let root = foreground_root();
+    if root == 0 {
+        return false;
+    }
+    let class = window_class_name(root);
+    if class != "Progman" && class != "WorkerW" {
+        return false;
+    }
+    // SAFETY: 标准窗口查询。
+    let shell_pid = window_pid(unsafe { GetShellWindow() } as isize);
+    shell_pid != 0 && window_pid(root) == shell_pid
+}
+
+/// 前台窗口是不是资源管理器的界面：桌面本身，或任务栏、桌面右键菜单、开始
+/// 菜单这些 shell 窗口（同一个进程）。
+///
+/// 「显示桌面」之后用户往往还会点任务栏或者右键桌面——桌面还抬着，前台却换成
+/// 了菜单 / 任务栏，这时格子仍应留在桌面后面。鼠标点到上面时，这些窗口都属于
+/// Explorer 的进程。
+pub fn foreground_is_shell() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
+    let root = foreground_root();
+    if root == 0 {
+        return false;
+    }
+    if foreground_is_desktop() {
+        return true;
+    }
+    // SAFETY: 标准窗口查询。
+    let shell_pid = window_pid(unsafe { GetShellWindow() } as isize);
+    shell_pid != 0 && window_pid(root) == shell_pid
+}
+
+/// 桌面宿主是不是被抬到了所有普通窗口前面。
+///
+/// Win+D 先抬桌面、后换前台，中间有个很短的窗口：那一两毫秒里格子已经被压到
+/// 宿主下面，前台却还是原来的程序。只看前台会错过这一刻，然后（「保持可见」
+/// 模式下）把格子拉回桌面上面，此后再也认不出「显示桌面」了。宿主自己是不是
+/// 在所有普通窗口前面，正好补上这个空档——任务栏这类置顶窗口不算，最小化的
+/// 窗口也不算。
+pub fn desktop_raised_over_windows() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindow;
+    const GW_HWNDPREV: u32 = 3;
+    let host = shell_icon_host();
+    if host == 0 {
+        return false;
+    }
+    // SAFETY: 只沿 z-order 链往上走，带步数上限防止环。
+    unsafe {
+        let mut cursor = GetWindow(host as HWND, GW_HWNDPREV);
+        let mut guard = 0;
+        while !cursor.is_null() && guard < 4096 {
+            if visible_surface(cursor) && window_title(cursor).is_some() && !ex_topmost(cursor) {
+                return false;
+            }
+            cursor = GetWindow(cursor, GW_HWNDPREV);
+            guard += 1;
+        }
+    }
+    true
+}
+
+pub fn window_rect(hwnd: isize) -> Option<Rect> {
+    if hwnd == 0 {
+        return None;
+    }
+    let mut rect = RECT::default();
+    // SAFETY: 标准窗口查询。
+    let ok = unsafe { GetWindowRect(hwnd as HWND, &mut rect) };
+    if ok == 0 {
+        return None;
+    }
+    Some(Rect::new(rect.left, rect.top, rect.right, rect.bottom))
+}
+
+/// `IsWindowVisible`：窗口自己（不含最小化状态）是否可见。
+pub fn is_window_visible(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: 标准窗口查询。
+    unsafe { IsWindowVisible(hwnd as HWND) != 0 }
+}
+
+/// 直接摆窗口（物理像素）：不动 z-order、不激活。
+pub fn set_window_rect(hwnd: isize, rect: Rect) {
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 标准窗口定位。
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            rect.left,
+            rect.top,
+            rect.width().max(1),
+            rect.height().max(1),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+pub fn minimized(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: 标准窗口查询。
+    unsafe { IsIconic(hwnd as HWND) != 0 }
+}
+
+/// Win+D 之后把窗口重新显示出来并锚回桌面层。
+pub fn restore_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 标准窗口操作；SW_SHOWNOACTIVATE 不会抢前台。
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
+    }
+    anchor_above_desktop(hwnd);
+}
+
+/// A point's monitor.
+pub fn monitor_at(x: i32, y: i32) -> Option<Monitor> {
+    // SAFETY: 标准显示器查询。
+    unsafe {
+        let handle = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if handle.is_null() {
+            return None;
+        }
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(handle, &mut info.monitorInfo) == 0 {
+            return None;
+        }
+        let len = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        Some(Monitor {
+            rect: Rect::new(
+                info.monitorInfo.rcMonitor.left,
+                info.monitorInfo.rcMonitor.top,
+                info.monitorInfo.rcMonitor.right,
+                info.monitorInfo.rcMonitor.bottom,
+            ),
+            work: Rect::new(
+                info.monitorInfo.rcWork.left,
+                info.monitorInfo.rcWork.top,
+                info.monitorInfo.rcWork.right,
+                info.monitorInfo.rcWork.bottom,
+            ),
+            primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            device: String::from_utf16_lossy(&info.szDevice[..len]),
+        })
+    }
+}
+
+/// Windows 的「已知文件夹」（桌面 / 文档）。文档目录可能被 OneDrive 重定向，
+/// 拼 `%USERPROFILE%\Documents` 不一定对，所以走系统 API。
+fn known_folder(id: &GUID) -> Option<std::path::PathBuf> {
+    unsafe {
+        let mut wide: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // KF_FLAG_DEFAULT = 0；htoken 为空 = 当前用户。
+        let hr = SHGetKnownFolderPath(
+            id,
+            0,
+            std::ptr::null_mut(),
+            &mut wide,
+        );
+        if hr < 0 || wide.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while len < 32_768 && *wide.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(wide, len);
+        let path = std::path::PathBuf::from(OsString::from_wide(slice));
+        CoTaskMemFree(wide as *const c_void);
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
+}
+
+/// 系统桌面目录（Win+D 收起来的那个；不是桌面的某个快捷方式里）。
+pub fn desktop_dir() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Desktop)
+}
+
+/// 「文档」目录。收纳盒的幕后目录默认放这儿：不是缓存区，清理软件不会误删。
+pub fn documents_dir() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Documents)
+}
+
+/// 「下载」目录：整理规则最常用的来源。
+pub fn downloads_dir() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Downloads)
+}
+
+/// 当前线程 id。拖放自测拿它和「登记拖放目标的线程」比：OLE 要求登记线程
+/// 自己泵消息，登记到别的线程上，拖拽的一方会一直卡住。
+pub fn current_thread_id() -> u32 {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    // SAFETY: 无参数、无副作用。
+    unsafe { GetCurrentThreadId() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_accent;
