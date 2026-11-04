@@ -78,42 +78,32 @@ debug 构建下有个自测入口：放一个文件
 
 ### 桌面格子的界面自检
 
-同一套 eval 通道，另外两个触发文件：
-
-| 文件 | 打到哪个窗口 |
-| --- | --- |
-| `%TEMP%\hexbench-ui-fence.js` | 广播进每个 `fence-*` 窗口 |
-| `%TEMP%\hexbench-ui-main.js` | 主设置窗口 |
-| `%TEMP%\hexbench-ui-guides.js` | 吸附参考线画布 `snap-guides` |
-
-回报里带上 `location.href` 和 `document.body.innerText`，就能分清「页面没加载」和
-「页面加载了但内容不对」。建 / 删格子直接走命令，等同于右键菜单点「新建格子…」
-之后的那一步（菜单只负责把路径交给 `fence_create`）：
+格子是原生窗口（`crates/hexbench-fence`），没有页面可注入脚本：内容、视图、锁定位置
+都只能从外面看——截图 + `debug_native_state`（窗口清单、z-order）+ `debug_native_drop_target`
+（落点）。建 / 删格子仍然走命令，等同于右键菜单点「新建格子…」之后的那一步（菜单只
+负责把路径交给 `fence_create`）：
 
 ```js
 await window.__TAURI_INTERNALS__.invoke("fence_create", { path: "D:\\hexbench-test\\文档" });
 await window.__TAURI_INTERNALS__.invoke("fence_delete", { id: "<上一步返回的 id>" });
 ```
 
-建完再注入一次 fence 脚本：拿到「这里是空的 / 把文件拖进来」这类真实渲染内容才算过。
-WebView2 的「无法访问此页面」是错误页，脚本根本注入不进去，回报文件里会缺这一行——
-只看到 `fence …: created` 的日志不能证明格子显示正常。
+只看到 `fence …: created` 的日志不能证明格子显示正常：先 `Shell.Application.MinimizeAll()`
+露出桌面再截图，标题条和条目画出来了才算过。最大化 / 被别的窗口盖住时截到的是别的窗口。
 
-外观（不透明度 / 磨砂）没有别的可观测面，只能「改完看像素」：
+外观（不透明度 / 磨砂）只能「改完看像素」：
 
 ```js
 await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, frosted: false });
-const root = document.documentElement; // 在 fence 窗口里读
-({ alpha: root.style.getPropertyValue("--card-alpha"), backdrop: root.dataset.backdrop ?? null })
 ```
 
-- 磨砂开着：`backdrop === "acrylic"`，卡片平均亮度比纯壁纸高（材质自带一层很淡的白）。
-- 磨砂关掉：`backdrop === null`，卡片亮度≈`不透明度 × 卡片色` + `(1 − 不透明度) × 壁纸`。
+- 磨砂开着：卡片平均亮度比纯壁纸高（DWM 亚克力自带一层很淡的白）。
+- 磨砂关掉：卡片亮度≈`不透明度 × 卡片色` + `(1 − 不透明度) × 壁纸`。
   深色壁纸上 60% 约 150、100% 约 239，差得足够分辨。
 - 像素采样前先 `Shell.Application.ToggleDesktop()` 收起别的窗口：设置窗口压在格子上时
   量到的是设置窗口的白底（实测 238，和 100% 不透明度几乎一样，很容易判错）。
 
-**z-order 和拖动只能从外面看。** 页面里的脚本看不见窗口层级。判定「格子贴着桌面」：
+**z-order 和拖动只能从外面看。** 判定「格子贴着桌面」：
 
 - 取格子的 `GetWindowLongPtr(hwnd, GWL_EXSTYLE)`：`0x8`（`WS_EX_TOPMOST`）必须没有——
   有它就是置顶面板，盖住了所有普通窗口。
@@ -125,18 +115,7 @@ const root = document.documentElement; // 在 fence 窗口里读
 
 ### 格子的右键手势
 
-手势和快捷面板共用一份设置（`launcher.gestures`），逻辑在 `src/gesture.tsx`。页面里验证：
-注入 fence 脚本，在 `.body` 上派发 `pointerdown`（`button: 2, buttons: 2`）再连着派发
-`pointermove`（`buttons: 2`），250ms 后读 `.gesture-layer`：`hidden === false`、
-`.gesture-label` 是「← 上一层 / → 下一层」才算认出来。派发 `dblclick` 进子目录再划一次，
-标题条应当退回上一层；划反方向回到刚退出的目录。
-
-从外面用 `mouse_event` 验证时，**`SetCursorPos` 是异步的**：按下右键之前要用 `GetCursorPos`
-读回来确认光标真的到位，否则 pointerdown 会落在上一个位置，起点终点颠倒，方向被判反
-（实测起点 1330、终点 1500，报成「下一层」）。设置页改手势后，日志里有
-`gestures: pushed to N fence(s)` 才说明推送到了每个格子。
-
-**原生格子**（`HEXBENCH_FENCE_NATIVE=1`）走的是 `win.rs` 里的右键状态机，不是这套页面脚本：
+手势和快捷面板共用一份设置（`launcher.gestures`），格子这边是 `win.rs` 里的右键状态机：
 `WM_RBUTTONDOWN` 只记起点，横向位移超过 8px 且横向占优才判成手势（这时才 `SetCapture`），
 松手时位移够 `triggerDistance` 才发 `Event::Back` / `Event::Forward`，历史在 `NATIVE_NAV`
 （根 + 走过的目录，最多 50 层）。用 `mouse_event`（`0x0008` 按下、`0x0010` 松开）从格子
@@ -153,11 +132,11 @@ const root = document.documentElement; // 在 fence 窗口里读
 - 划回上一层后标题条的面包屑应退一段；反方向划回来应恢复。
 - 只在正文起手（`y >= HEADER_H`），标题条上右键不认手势。
 
-### 原生格子的拖动 / 缩放 / 菜单 / 拖出
+### 格子的拖动 / 缩放 / 菜单 / 拖出
 
-原生格子自己发 `Event::BeginMove` / `Event::BeginResize`（带 `hwnd` 和 `scale`），后端
-`fence_run_move` / `fence_run_resize` 就是网页格子那两个命令的实现——吸附、参考线、
-松开后落盘完全共用一份代码，所以上面「吸附参考线」那套验法原样适用。窗口过程这边只做
+格子自己发 `Event::BeginMove` / `Event::BeginResize`（带 `hwnd` 和 `scale`），后端
+`fence_run_move` / `fence_run_resize` 负责吸附、参考线、松开落盘，所以上面「吸附参考线」
+那套验法原样适用。窗口过程这边只做
 命中判定，移动 / 缩放本身靠后端 8ms 的轮询循环，窗口自己的 `WM_MOUSEMOVE` 不参与。
 
 - 标题条起拖（`y < HEADER_H`，三颗点和面包屑除外）；正文条目上按住移动 4px 起的是
@@ -171,16 +150,49 @@ const root = document.documentElement; // 在 fence 窗口里读
 - 标题菜单按 `Frame` 里的 `is_bucket` / `rule_count` / `sort_key` / `sort_dir` 生成：
   文件夹是「更换文件夹… / 在资源管理器中打开」，收纳盒是「打开收纳目录 / 立即整理
   （有规则时）」；当前排序键后面带 ↑ / ↓，再点同键反转方向（配置 `sortKey/sortDir`）。
+- 标题条右侧的计数数字换成了**视图切换图标**（原来是文件数）：现在是图标网格就画列表
+  （三条线），现在是列表就画网格（四个方块），点一下在 `Frame.list` 的 `true` / `false`
+  之间切，行高 28px、图标 18px。它占 `DOTS_W + 6` 到 `DOTS_W + 6 + VIEW_W` 这一段，
+  点在这里不启动拖动、双击也不卷起。设置页对应行的小按钮是同一份状态。
+- 多选：`picked` 存的是**路径**（重读目录、过滤之后都还对得上），`shown` 存的是显示顺序，
+  所以命中 / 高亮 / 框选 / 拖出全部用「显示位置」索引，`items` 本身不动。Ctrl 点选、
+  Shift 从锚点连选、空白处拖 `Band`（相交即选，按 Ctrl 时叠在按下前的底子上）。
+  按在已选中的一项上先不缩成单选，松手才缩（`collapse`）；真拖起来就把整组交给
+  `start_file_drag(&paths)`。右键菜单走 `sys::show_shell_context_menu_for`，只把
+  **同一父目录**的条目塞进一份菜单；多选时不插自绘的「重命名」。验证时选中两项再右键，
+  菜单里应没有「重命名」；删除只会动自己的测试目录（删到回收站）。
+- 搜索：标题条放大镜占 `view_left - 6 - SEARCH_W` .. `view_left - 6`，点开是贴着标题条
+  的弹层（窗口类 `HexBenchNativeFenceSearch` + 系统 `EDIT`，和改名框共用
+  `create_edit_popup`）。`WM_CHAR` / `WM_KEYUP` / `WM_PASTE` / `WM_CUT` / `WM_CLEAR`
+  之后 `apply_search` 重算 `shown`；回车只收框、Esc 清空再收，失焦也收（筛选留着）。
+  放大镜本身在筛选非空时用正文色。弹层是格子的子弹层，格子 `WM_NCDESTROY` 时一起销毁。
+  验证：输入一个只匹配一条的字，回车后双击那一条——必须打开 / 进入匹配到的那一项；
+  进子文件夹后筛选词仍在，空结果应显示「没有匹配的条目」而不是「这里是空的」。
+  打字用剪贴板 + `SendKeys("^v")` 送中文；`shot.ps1` 会 MinimizeAll，先打完字再截图。
+- 列表信息列：`list_cols()` 给出名称列结束 / 时间列起点 / 大小列起点，全部按 zoom 缩放。
+  时间今年只写「月-日 时:分」、往年带年（`local_offset_secs` 取一次时区偏移），文件夹的
+  大小留空。列名条固定在 `HEADER_H .. HEADER_H + LIST_HEAD_H`，条目在它下面滚动
+  （`paint` 里给正文区单独 `PushAxisAlignedClip`，否则滚上来的行会盖住列名）。点列名发
+  `Event::Sort`，同键反转，箭头画在列名后面。行与行之间那 2px `LIST_GAP` 也算命中
+  （算上面那一行），别留成点一下就清空选中的死区。
+- 托盘「显示全部格子」：把所有 `visible = false` 的格子置回可见、存盘、
+  `apply_fence_windows`。没有隐藏的格子时什么也不做（不写盘）。验证：用测试格子
+  （`D:\hexbench-test` 里随便建一个）的「⋯ → 隐藏格子」，`EnumWindows` 里应少一个
+  `HexBenchNativeFence`、配置里 `visible: false`；再点托盘这一项，窗口回来、`visible: true`。
+  托盘图标在 UIA 里叫 `SystemTray.NormalButton`、名字 `HexBench · 海克斯`（坐标取
+  `BoundingRectangle` 中心）。
+- 菜单最后一项是「锁定位置 / 解锁位置」（`Frame.locked`）。锁定后标题条拖不动、
+  边角光标也不出现，但双击卷起、面包屑、视图按钮、菜单照常。
 - 条目的拖出用 `hexbench_core::sys::start_file_drag`，**在渲染线程上调**，起手前
   `SetCapture` 这个窗口：`DoDragDrop` 要和自己窗口同线程的捕获。曾经改到主线程
   `run_on_main_thread` 上跑，主线程被 `DoDragDrop` 卡住、`ui: main thread busy` 一直
   报，松手也不返回——落点还收不到文件。落回自己的格子 / 另一个格子 / 资源管理器都走
   OLE 那一路；`Event::Drop` 里会先挡掉「拖进自己所在目录」的空操作。
-- 提示（网页版 toast）画在格子底部，`NativeFences::toast(id, text)` 推给渲染线程，
+- 提示 toast 画在格子底部，`NativeFences::toast(id, text)` 推给渲染线程，
   `TIMER_TOAST` 2.6 秒后自己消失。拖入成功 / 规则整理结果 / 失败信息都走它。
 - Win+D / 显示桌面：原生窗口是 `WS_POPUP + WS_EX_TOOLWINDOW` 的桌面层窗口，Show Desktop
-  根本不给它发 `SC_MINIMIZE`（去掉 `WS_EX_TOOLWINDOW` 试过，同样不发），所以网页格子
-  「被最小化再还原」那套在原生这条路上不成立。资源管理器抬起来的是桌面窗口本身
+  根本不给它发 `SC_MINIMIZE`（去掉 `WS_EX_TOOLWINDOW` 试过，同样不发），所以只能靠 z-order
+  判断。资源管理器抬起来的是桌面窗口本身
   （24H2 之后是 `Progman`，更早的版本是图标所在的 `WorkerW`），格子被压在它下面。
   `fence_watchdog` 靠两件事认出这一刻：某个格子的 z-order 掉到了桌面宿主下面
   （`behind_desktop`），并且前台是 shell 自己的窗口（`foreground_is_shell`：桌面、
@@ -305,47 +317,25 @@ cargo test -p hexbench-core --test file_ops -- --test-threads=1 --nocapture
 
 拖放目标由 OLE 按窗口登记，而 **OLE 只把回调交给「调用 `RegisterDragDrop` 的那条线程」，
 并且那条线程必须自己泵消息**（msdn 原话：不满足时，任何拖着东西经过这个窗口的程序都会
-一直卡住，直到目标程序退出）。格子和呼出面板的窗口都属于主线程，所以登记必须走
-`run_on_main_thread`；曾经在「建窗的 worker 线程」上登记，用户看到的就是从桌面拖个文件
+一直卡住，直到目标程序退出）。原生格子的窗口和拖放目标都挂在渲染层自己的消息循环线程上
+（`crates/hexbench-fence`），那条线程本来就泵消息；呼出面板的窗口属于主线程，登记仍然走
+`run_on_main_thread`。曾经在「建窗的 worker 线程」上登记，用户看到的就是从桌面拖个文件
 进收纳盒、整个拖拽直接冻住。
 
-自动化回归（debug 版正在运行时）：
-
-```
-powershell -ExecutionPolicy Bypass -File scripts\fence-drop-test.ps1
-```
-
-它会自己建一个 `DROP TEST` 收纳盒，投喂三次拖放（空白处 / 子文件夹 / 撞名），然后核对
-「文件真的进了盒子、源文件没了、撞名不覆盖、页面有提示、主线程还活着」，最后把盒子
-（`mode: "purge"`）和测试数据删掉。测试数据只在 `D:\hexbench-test\fence-drop\`。
-
-它依赖两个只在 debug 构建里有的命令：
+格子没有页面可注入脚本，自动化只能看窗口和落点：
 
 | 命令 | 用途 |
 | --- | --- |
-| `debug_drop_targets` | 列出每个已登记的拖放目标：`label` / `hwnd` / `registered_tid` / `owner_tid` / `main`。**`main=true` 才是对的**，它是这次卡死的回归护栏（全部登记项都在主线程上才算过，实测 36 个）。 |
-| `debug_fence_drag` | 把一次 `enter` / `over` / `leave` / `drop` 事件按 OLE 的样子投给某个格子，`paths` 用真实路径。 |
+| `debug_native_state` | 列出原生格子的窗口：`hwnd` / `visible` / `topmost` / `behind_desktop` / `rect`。 |
+| `debug_native_drop_target` | 按 OLE 回调同一份口径算一次落点（只算不搬）：传格子 id 和客户区物理坐标，返回此刻压在那个点下的目录。滚动后落错目录的回归靠它。 |
+| `debug_drop_targets` | 面板侧拖放目标的登记线程：`label` / `hwnd` / `registered_tid` / `owner_tid` / `main`。**`main=true` 才是对的**。 |
 
-真实的 OLE 拖拽没法在脚本里「发起」——脚本投的是事件，不是系统那一层的拖拽。
-不过 `mouse_event` + `SetCursorPos` 能真的按住桌面图标拖到格子上：资源管理器自己
-进 `DoDragDrop`，格子那边收到的是真 OLE 回调（实测日志 `drag entered` → `dropped`，
-文件进了盒子，截图里也能看到）。这条路要人工定坐标，所以没进回归脚本；写脚本时要
-先 Win+D 把桌面露出来（被窗口盖住就拖的是那个窗口），落点取格子的 `pixelX/pixelY`
-中心。
+真实的 OLE 拖拽没法在脚本里「发起」，`mouse_event` + `SetCursorPos` 可以：资源管理器
+自己进 `DoDragDrop`，格子那边收到的是真 OLE 回调（日志 `drag: enter` → `drop`）。
+这条路要人工定坐标，所以没进回归脚本；写脚本时要先 Win+D 把桌面露出来（被窗口盖住就
+拖的是那个窗口），落点取格子的 `pixelX/pixelY` 中心。
 
-回归脚本本身仍然只投事件（`debug_fence_drag`），测的是「事件 → 落点 → 移动文件 → 刷新」，
-系统那一层靠上面那条线程断言 + 手动拖一次兜底。
-
-脚本这边还有两个坑：
-
-1. 新格的 WebView2 可能还没准备好，第一次注入是 `FailedToReceiveMessage`，而脚本
-   文件读到就删。所以测试脚本会重复投递，页面里用 `window.__dragtestStarted` 保证
-   同一窗口只跑一遍。
-2. 整套测试全红、日志里是 `failed to create webview: … RPC_E_DISCONNECTED`，说明这个
-   应用实例跑久了已经建不出新 WebView（新建格子也是空白窗口）。重启应用再测，
-   不是拖放代码坏了。
-
-**改完拖放代码仍要人工拖一次**：桌面 → 收纳盒空白处、桌面 → 盒子里的子文件夹、
+**改完拖放代码要人工拖一次**：桌面 → 收纳盒空白处、桌面 → 盒子里的子文件夹、
 盒子 → 资源管理器、两个盒子互拖；松手前光标要一直跟手，资源管理器不能卡。
 
 ### 拖放：浏览器网页里的图片（虚拟文件）
@@ -402,6 +392,22 @@ cargo test -p hexbench-core drop_target
 - 回归：`dist/` 里不应再有 `phrases.html`；托盘没有「常用语」；`Ctrl+Alt+Shift+Q` 无反应；
   旧配置里的 `phrases` 段读入后不报错、下次保存自动消失。
 
+## 删除 / 回收站后的键盘焦点
+
+删进回收站、撤销这类操作会把键盘焦点从 WebView2 收回到顶层的「Tauri Window」。
+之后 `GetForegroundWindow` 仍然是面板，但页面收不到任何按键——表现就是删完立刻
+按 Ctrl+Z 没反应，而过了几秒点别处再点回来又好了。
+
+- `launcher_refocus` 在删除 / 撤销后延迟 180 ms 抢前台，并调
+  `sys::focus_webview`：找到 WebView2 的 `Chrome_WidgetWin_1` 子窗口，
+  `AttachThreadInput` 之后 `SetFocus`（光 `SetFocus` 顶层窗口没用）。上次成功
+  聚焦的子窗口会记在 `sys.rs` 的静态量里，面板里开内置网页时也不会把焦点交给网页那一半。
+- 复现：面板里点一个文件 → Delete → 0.5 s 内按 Ctrl+Z。
+  判定：文件从回收站回来了（日志 `undo: 已从回收站还原 1 个文件`），全程不点面板。
+- 排查技巧：`GetGUIThreadInfo(fgThread)` 的 `hwndFocus` 应该是一个
+  `Chrome_WidgetWin_1`，如果等于顶层窗口句柄（`class=Tauri Window`）就是焦点丢了；
+  此时直接向页面打字也不会出现字符。
+
 ## 呼出 / 收起的压测
 
 卡死过的两次都在这里，改完 `reveal_launcher` / `hide_launcher` 都要跑一遍：
@@ -438,10 +444,10 @@ cargo test -p hexbench-core drop_target
 
 ## 调试版 exe 的前端来源
 
-`cargo build` 出来的 debug exe **不内嵌前端**：主界面、面板、格子所有窗口都从
+`cargo build` 出来的 debug exe **不内嵌前端**：主界面、面板这些 WebView 窗口都从
 `http://127.0.0.1:1420`（`devUrl`）加载，也就是必须先 `npm run dev`。忘了起 Vite
-时每个窗口都是 WebView2 的「无法访问此页面」，界面上没有任何更明确的提示，格子窗口
-尤其容易被误判成格子功能坏了。
+时每个窗口都是 WebView2 的「无法访问此页面」，界面上没有任何更明确的提示。
+桌面格子不是 WebView（见 `crates/hexbench-fence`），不受这条影响。
 
 手动验证、或者交给别人试的时候用内嵌版：
 

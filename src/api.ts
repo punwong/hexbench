@@ -63,7 +63,6 @@ const demoConfig: Config = {
     contextMenu: false,
     opacity: 70,
     frosted: true,
-    native: false,
     fences: [],
   },
   notes: { enabled: true, folder: "", sendEnter: false },
@@ -450,6 +449,8 @@ export async function fenceUpdate(
     sortDir?: number;
     rules?: import("./types").FenceRule[];
     rulesAuto?: boolean;
+    locked?: boolean;
+    view?: import("./types").FenceView;
   },
 ): Promise<void> {
   if (!isTauri) return;

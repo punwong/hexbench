@@ -50,8 +50,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteFactory,
     IDWriteTextFormat, IDWriteTextLayout,
 };
@@ -66,6 +67,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -101,6 +103,10 @@ const CELL_GAP: f32 = 12.0;
 const CELL_PAD: f32 = 10.0;
 const ICON_BASE: f32 = 32.0;
 const NAME_TOP_PAD: f32 = 7.0;
+/// 列表视图：一行的高度、图标大小、行与行之间留的缝。
+const LIST_ROW_H: f32 = 28.0;
+const LIST_ICON: f32 = 18.0;
+const LIST_GAP: f32 = 2.0;
 
 /// 渲染线程收到新命令。
 const WM_FENCE_WAKE: u32 = WM_APP + 1;
@@ -117,6 +123,8 @@ const MK_CONTROL: u32 = 0x0008;
 const MK_RBUTTON: usize = 0x0002;
 /// 左键还按着。
 const MK_LBUTTON: usize = 0x0001;
+/// Shift 按着（连选）。
+const MK_SHIFT: usize = 0x0004;
 /// Show 之后补一帧的定时器（坑 3）。
 const TIMER_FIRST_FRAME: usize = 1;
 /// 右键手势：移动超过这个距离才判方向（和网页版一致）。
@@ -558,7 +566,15 @@ fn upsert(engine: &mut Engine, frame: Frame) -> Result<()> {
         hexbench_core::sys::round_window_corners(hwnd.0 as isize);
         hexbench_core::sys::anchor_above_desktop(hwnd.0 as isize);
     }
-    fence.render(&engine.gpu)?;
+    if let Err(error) = fence.render(&engine.gpu) {
+        // 窗口已经显示、USERDATA 也已经指向这个 Box：直接返回会让 Box 在这里
+        // 析构，而窗口还活着。之后任何一条窗口消息都会解引用已释放的内存。
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(hwnd);
+        }
+        return Err(error);
+    }
     // 外部拖进来的文件：OLE 目标登记在这条渲染线程上——窗口属于它、消息
     // 循环也在它上面，回调里只留快照和事件出口，不碰窗口本身。
     {
@@ -597,6 +613,8 @@ fn upsert(engine: &mut Engine, frame: Frame) -> Result<()> {
                             id: id.clone(),
                             dest,
                             paths,
+                            // 和返回给 OLE 的效果保持一致：说了 COPY 就真的复制。
+                            copy: keys & MK_CONTROL != 0,
                         });
                     }
                 }
@@ -729,13 +747,15 @@ struct Gpu {
     wic: IWICImagingFactory,
     instance: HINSTANCE,
     fmt_title: IDWriteTextFormat,
-    fmt_count: IDWriteTextFormat,
     /// 面包屑：12px 常规，单行，长了省略。
     fmt_crumb: IDWriteTextFormat,
     /// 手势方向提示：「← 后退」这类小标签。
     fmt_label: IDWriteTextFormat,
     fmt_empty_title: IDWriteTextFormat,
     fmt_empty: IDWriteTextFormat,
+    /// 本地时区相对 UTC 的偏移（秒）和今年的年份：列表里的时间按本地时间画。
+    tz_offset: i64,
+    this_year: i32,
     folder: ID2D1PathGeometry,
     /// 手势轨迹：圆头圆角，点再密也看不到接缝。
     stroke: ID2D1StrokeStyle,
@@ -784,18 +804,6 @@ impl Gpu {
             fmt_title.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             fmt_title.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK)?;
             set_trimming(&dwrite, &fmt_title)?;
-
-            let fmt_count = dwrite.CreateTextFormat(
-                font,
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                11.0,
-                locale,
-            )?;
-            fmt_count.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-            fmt_count.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             let fmt_crumb = dwrite.CreateTextFormat(
                 font,
@@ -860,14 +868,20 @@ impl Gpu {
             fmt_empty.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             // 标题条左边的文件夹轮廓：20×20 viewBox 的 SVG 路径，圆角换成直角折线。
+            // 坐标直接按「17px 大小、左上角在 (9.5, 11.5)」烘进几何体里——传给
+            // `DrawGeometry` 的只有当前变换（含 DComp 图集偏移），不再自己拼矩阵。
             let folder = factory.CreatePathGeometry()?;
             let sink = folder.Open()?;
-            sink.BeginFigure(Vector2 { X: 3.8, Y: 5.4 }, D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(Vector2 { X: 6.9, Y: 5.4 });
-            sink.AddLine(Vector2 { X: 8.4, Y: 7.0 });
-            sink.AddLine(Vector2 { X: 16.2, Y: 7.0 });
-            sink.AddLine(Vector2 { X: 16.2, Y: 15.2 });
-            sink.AddLine(Vector2 { X: 3.8, Y: 15.2 });
+            let at = |x: f32, y: f32| Vector2 {
+                X: 9.5 + x * (17.0 / 20.0),
+                Y: 11.5 + y * (17.0 / 20.0),
+            };
+            sink.BeginFigure(at(3.8, 5.4), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(at(6.9, 5.4));
+            sink.AddLine(at(8.4, 7.0));
+            sink.AddLine(at(16.2, 7.0));
+            sink.AddLine(at(16.2, 15.2));
+            sink.AddLine(at(3.8, 15.2));
             sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             sink.Close()?;
 
@@ -881,11 +895,12 @@ impl Gpu {
                 wic,
                 instance: HINSTANCE(module.0),
                 fmt_title,
-                fmt_count,
                 fmt_crumb,
                 fmt_label,
                 fmt_empty_title,
                 fmt_empty,
+                tz_offset: local_offset_secs(),
+                this_year: this_year_local(),
                 folder: folder.into(),
                 stroke: stroke.into(),
             })
@@ -912,6 +927,9 @@ struct ItemView {
     layout: Option<IDWriteTextLayout>,
     icon: Option<ID2D1Bitmap1>,
     tried: bool,
+    /// 列表视图的修改时间 / 大小，进帧时排成 UTF-16，画的时候不用再转。
+    time_text: Vec<u16>,
+    size_text: Vec<u16>,
 }
 
 /// 标题条上的一截面包屑。第 0 段是绑定目录（用格子标题），后面是子目录。
@@ -991,8 +1009,38 @@ impl Brushes {
 
 /// 左键按在条目上：拖出一段距离才真的发起 OLE 拖拽。
 struct FileDrag {
-    index: usize,
+    /// 拖出去的路径；按在已选中的条目上时是整组。
+    paths: Vec<String>,
     origin: POINT,
+}
+
+/// 空白处按下拖出的选框（逻辑像素）。
+struct Band {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    /// 按住 Ctrl 框选时保留原来的选中。
+    base: Vec<String>,
+}
+
+/// 标题条右侧的小按钮，鼠标压在上面时给个底色和手型光标。
+#[derive(Clone, Copy, PartialEq)]
+enum HeadAction {
+    Search,
+    View,
+    Dots,
+}
+
+impl Band {
+    fn rect(&self) -> (f32, f32, f32, f32) {
+        (
+            self.x0.min(self.x1),
+            self.y0.min(self.y1),
+            self.x0.max(self.x1),
+            self.y0.max(self.y1),
+        )
+    }
 }
 
 /// 底部短提示：排版好的文字 + 到点消失的时刻。
@@ -1089,8 +1137,14 @@ struct FenceWindow {
     brushes: Brushes,
     dark: bool,
     opacity: u32,
+    /// 窗口背后的磨砂材质现在是不是开着。
+    frosted: bool,
     title: String,
     title_layout: Option<IDWriteTextLayout>,
+    /// 列表视图顶部的列名（名称 / 修改时间 / 大小），当前排序列带箭头。
+    head_name: Option<IDWriteTextLayout>,
+    head_time: Option<IDWriteTextLayout>,
+    head_size: Option<IDWriteTextLayout>,
     /// 面包屑的每一段（画出来的、可点的）。
     nav: Vec<NavSeg>,
     nav_sep: Option<IDWriteTextLayout>,
@@ -1100,17 +1154,39 @@ struct FenceWindow {
     nav_elided: bool,
     /// 鼠标压在哪一段面包屑上（0 起）。
     nav_hot: Option<usize>,
-    count_layout: Option<IDWriteTextLayout>,
     empty_title_layout: Option<IDWriteTextLayout>,
     empty_layout: Option<IDWriteTextLayout>,
+    /// 搜索没命中时的两行提示。
+    empty_filter_title: Option<IDWriteTextLayout>,
+    empty_filter_hint: Option<IDWriteTextLayout>,
     items: Vec<ItemView>,
     name_format: Option<IDWriteTextFormat>,
+    /// 列表视图两列小字用的格式（右对齐、随 zoom 缩放）。
+    meta_format: Option<IDWriteTextFormat>,
+    /// 列名那一行用的格式（左对齐，字号同上）。
+    head_format: Option<IDWriteTextFormat>,
     zoom: u32,
     rolled: bool,
     scroll: f32,
     hover: Option<usize>,
-    /// 单击选中的条目（和网页版的 picked 一样，只是本地状态）。
-    pick: Option<usize>,
+    /// 选中的条目（按路径记：重读目录后不会指错行）。多选时是整组。
+    picked: Vec<String>,
+    /// Shift 连选的锚点。
+    anchor: Option<String>,
+    /// 在已选中的条目上按下：没拖动就收窄成这一项（和资源管理器的手感一致）。
+    collapse: Option<String>,
+    /// 空白处拖出来的框选。
+    band: Option<Band>,
+    /// 标题条右侧悬停的按钮。
+    hot_action: Option<HeadAction>,
+    /// 列表视图顶部悬停的列（排序键）。
+    head_hot: Option<&'static str>,
+    /// 搜索框里的词：只显示名字包含它的条目。
+    filter: String,
+    /// `items` 里当前显示出来的那些（下标）；没搜索时就是全部。
+    shown: Vec<usize>,
+    /// 搜索框开着时的弹层窗口。
+    search_popup: Option<HWND>,
     /// 左键按在「更多」按钮上：松手时再弹菜单。
     /// 在 `WM_LBUTTONDOWN` 里直接弹菜单会让按钮一直按着，菜单收不到后续鼠标输入。
     dots_down: bool,
@@ -1131,6 +1207,10 @@ struct FenceWindow {
     rule_count: usize,
     sort_key: String,
     sort_dir: i32,
+    /// 锁定位置：标题条拖不动、边角也拉不了。
+    locked: bool,
+    /// 列表视图（一行一个）；false = 图标网格。
+    list: bool,
     /// 左键按在条目上还没松：拖出格子时用。
     file_drag: Option<FileDrag>,
     /// 当前那条短提示。
@@ -1150,6 +1230,8 @@ struct FenceWindow {
     pad: f32,
     icon_size: f32,
     name_size: f32,
+    list_row_h: f32,
+    list_icon: f32,
 }
 
 impl FenceWindow {
@@ -1236,24 +1318,40 @@ impl FenceWindow {
                 brushes,
                 dark: frame.dark,
                 opacity: frame.opacity,
+                // 磨砂在窗口建好之后立刻按设置上，下面 `apply_backdrop` 再补一次。
+                frosted: false,
                 title: frame.title,
                 title_layout: None,
+                head_name: None,
+                head_time: None,
+                head_size: None,
                 nav: Vec::new(),
                 nav_sep: None,
                 nav_sep_w: 8.0,
                 nav_more: None,
                 nav_elided: false,
                 nav_hot: None,
-                count_layout: None,
                 empty_title_layout: None,
                 empty_layout: None,
+                empty_filter_title: None,
+                empty_filter_hint: None,
                 items: Vec::new(),
                 name_format: None,
+                meta_format: None,
+                head_format: None,
                 zoom: frame.zoom,
                 rolled: frame.rolled,
                 scroll: 0.0,
                 hover: None,
-                pick: None,
+                picked: Vec::new(),
+                anchor: None,
+                collapse: None,
+                band: None,
+                hot_action: None,
+                head_hot: None,
+                filter: String::new(),
+                shown: Vec::new(),
+                search_popup: None,
                 dots_down: false,
                 gestures: GestureSettings::default(),
                 gesture: None,
@@ -1267,6 +1365,8 @@ impl FenceWindow {
                 rule_count: frame.rule_count,
                 sort_key: frame.sort_key,
                 sort_dir: frame.sort_dir,
+                locked: frame.locked,
+                list: frame.list,
                 file_drag: None,
                 toast: None,
                 drop: Arc::new(Mutex::new(DropSnapshot {
@@ -1286,6 +1386,8 @@ impl FenceWindow {
                 pad: safe(consts.pad, CELL_PAD),
                 icon_size: safe(consts.icon_size, ICON_BASE),
                 name_size: safe(consts.name_size, 11.0),
+                list_row_h: safe(consts.list_row_h, LIST_ROW_H),
+                list_icon: safe(consts.list_icon, LIST_ICON),
             })
         })();
         if built.is_err() {
@@ -1374,6 +1476,11 @@ impl FenceWindow {
         self.rule_count = frame.rule_count;
         self.sort_key = frame.sort_key;
         self.sort_dir = frame.sort_dir;
+        self.locked = frame.locked;
+        self.set_frosted(frame.frosted);
+        let list = frame.list;
+        let view_changed = list != self.list;
+        self.list = list;
         let consts = LayoutConsts::for_logical(frame.zoom, self.logical_w, self.logical_h);
         self.cell_w = safe(consts.cell_w, CELL_W);
         self.cell_h = safe(consts.cell_h, CELL_H);
@@ -1381,35 +1488,179 @@ impl FenceWindow {
         self.pad = safe(consts.pad, CELL_PAD);
         self.icon_size = safe(consts.icon_size, ICON_BASE);
         self.name_size = safe(consts.name_size, 11.0);
+        self.list_row_h = safe(consts.list_row_h, LIST_ROW_H);
+        self.list_icon = safe(consts.list_icon, LIST_ICON);
+        if view_changed {
+            // 换视图等于换了一套坐标：悬停 / 选中都不再指同一个东西。
+            self.hover = None;
+            self.picked.clear();
+            self.anchor = None;
+            self.collapse = None;
+            self.band = None;
+            self.set_scroll(0.0);
+        }
         self.items = frame
             .items
             .into_iter()
-            .map(|Item { name, path, is_dir }| ItemView {
-                name,
-                path,
-                is_dir,
-                layout: None,
-                icon: None,
-                tried: false,
-            })
+            .map(
+                |Item {
+                     name,
+                     path,
+                     is_dir,
+                     modified,
+                     size,
+                 }| ItemView {
+                    name,
+                    path,
+                    is_dir,
+                    layout: None,
+                    icon: None,
+                    tried: false,
+                    time_text: format_time(modified, gpu.tz_offset, gpu.this_year)
+                        .encode_utf16()
+                        .collect(),
+                    size_text: if is_dir {
+                        Vec::new()
+                    } else {
+                        format_size(size).encode_utf16().collect()
+                    },
+                },
+            )
             .collect();
         self.rebuild_layout(gpu);
         if navigated {
             // 换了一层：上一层的选中 / 悬停 / 滚动位置都没有意义了。
             self.hover = None;
-            self.pick = None;
+            self.picked.clear();
+            self.anchor = None;
+            self.collapse = None;
+            self.band = None;
             self.set_scroll(0.0);
             self.nav_hot = None;
         } else {
             self.hover = self.hover.filter(|index| *index < self.items.len());
-            self.pick = self.pick.filter(|index| *index < self.items.len());
+            // 选中按路径记：文件没了就跟着去掉。
+            self.picked
+                .retain(|path| self.items.iter().any(|item| &item.path == path));
+            self.anchor = self
+                .anchor
+                .take()
+                .filter(|path| self.items.iter().any(|item| &item.path == path));
             // 条目变少 / 窗口变高之后滚动位置可能被夹小，快照要跟着更新。
             self.set_scroll(self.scroll);
+        }
+        self.apply_filter();
+    }
+
+    /// 按搜索词重算要显示哪些条目。滚动、悬停、框选都跟着作废——
+    /// 它们指的都是旧坐标。
+    fn apply_filter(&mut self) {
+        let needle = self.filter.to_lowercase();
+        self.shown.clear();
+        if needle.is_empty() {
+            self.shown.extend(0..self.items.len());
+        } else {
+            self.shown.extend(
+                self.items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.name.to_lowercase().contains(&needle))
+                    .map(|(index, _)| index),
+            );
+        }
+        self.hover = None;
+        self.band = None;
+        self.collapse = None;
+        self.set_scroll(self.scroll);
+    }
+
+    /// 按设置上 / 撤窗口背后的磨砂材质。DWM 的亚克力没有强度可调，只有有和没有。
+    fn set_frosted(&mut self, frosted: bool) {
+        if frosted == self.frosted {
+            return;
+        }
+        self.frosted = frosted;
+        let hwnd = self.hwnd.0 as isize;
+        if frosted {
+            if !hexbench_core::sys::acrylic(hwnd) {
+                log::info!("fence {}: 磨砂不可用，卡片用纯透明", self.id);
+            }
+        } else {
+            hexbench_core::sys::clear_acrylic(hwnd);
         }
     }
 
     fn body_h(&self) -> f32 {
         (self.logical_h - HEADER_H).max(0.0)
+    }
+
+    /// 列表视图顶部那一行列名占的高度（网格视图、卷起时是 0）。
+    fn head_row_h(&self) -> f32 {
+        if self.list && !self.rolled {
+            LIST_HEAD_H
+        } else {
+            0.0
+        }
+    }
+
+    /// 真正放条目的高度：标题条（和列名）下面那一段。
+    fn view_h(&self) -> f32 {
+        (self.body_h() - self.head_row_h()).max(0.0)
+    }
+
+    /// 标题条右侧三个按钮的左边界（从右往左：⋯ / 视图 / 搜索）。
+    fn dots_left(&self) -> f32 {
+        self.logical_w - DOTS_W
+    }
+
+    fn view_left(&self) -> f32 {
+        self.dots_left() - 6.0 - VIEW_W
+    }
+
+    fn search_left(&self) -> f32 {
+        self.view_left() - 6.0 - SEARCH_W
+    }
+
+    /// 标题条右侧的按钮命中。
+    fn head_action_at(&self, x: f32, y: f32) -> Option<HeadAction> {
+        if y >= HEADER_H {
+            return None;
+        }
+        if x >= self.dots_left() {
+            Some(HeadAction::Dots)
+        } else if x >= self.view_left() && x < self.dots_left() - 6.0 {
+            Some(HeadAction::View)
+        } else if x >= self.search_left() && x < self.view_left() - 6.0 {
+            Some(HeadAction::Search)
+        } else {
+            None
+        }
+    }
+
+    /// 列表列名的命中：名称 / 修改时间 / 大小。
+    fn head_key_at(&self, x: f32) -> Option<&'static str> {
+        if self.head_row_h() <= 0.0 {
+            return None;
+        }
+        let (time_left, size_left, right) = self.list_cols();
+        if x >= self.pad && x < time_left {
+            Some("name")
+        } else if x >= time_left && x < size_left - 4.0 {
+            Some("modified")
+        } else if x >= size_left - 4.0 && x < right {
+            Some("size")
+        } else {
+            None
+        }
+    }
+
+    /// 列表视图的三列：名称列结束 / 时间列起点 / 大小列起点 / 右侧尽头。
+    fn list_cols(&self) -> (f32, f32, f32) {
+        let z = self.zoom as f32 / 100.0;
+        let right = (self.logical_w - self.pad - 10.0).max(60.0);
+        let size_left = right - COL_SIZE_W * z;
+        let time_left = size_left - COL_TIME_W * z;
+        (time_left, size_left, right)
     }
 
     fn columns(&self) -> usize {
@@ -1418,13 +1669,126 @@ impl FenceWindow {
     }
 
     fn max_scroll(&self) -> f32 {
-        if self.rolled || self.items.is_empty() {
+        let rows = self.shown.len();
+        if self.rolled || rows == 0 {
             return 0.0;
         }
-        let cols = self.columns();
-        let rows = self.items.len().div_ceil(cols);
-        let content = rows as f32 * self.cell_h + rows.saturating_sub(1) as f32 * self.gap;
-        (2.0 * self.pad + content - self.body_h()).max(0.0)
+        let content = if self.list {
+            (rows as f32 * (self.list_row_h + LIST_GAP) - LIST_GAP).max(0.0)
+        } else {
+            let cols = self.columns();
+            let count = rows.div_ceil(cols);
+            count as f32 * self.cell_h + count.saturating_sub(1) as f32 * self.gap
+        };
+        (2.0 * self.pad + content - self.view_h()).max(0.0)
+    }
+
+    /// 条目在窗口里的矩形（逻辑像素，已经算上滚动）。`index` 是**显示位置**
+    /// （`shown` 的下标）。网格和列表只有这一处定义坐标，画、命中、拖放快照
+    /// 都从这里取，换视图不会三处对不上。
+    fn item_rect(&self, index: usize) -> (f32, f32, f32, f32) {
+        if self.list {
+            let y0 = HEADER_H + self.head_row_h() + self.pad - self.scroll;
+            let y = y0 + index as f32 * (self.list_row_h + LIST_GAP);
+            let w = (self.logical_w - 2.0 * self.pad - 6.0).max(20.0);
+            (self.pad, y, w, self.list_row_h)
+        } else {
+            let cols = self.columns();
+            let col = (index % cols) as f32;
+            let row = (index / cols) as f32;
+            let x = self.pad + col * (self.cell_w + self.gap);
+            let y = HEADER_H + self.pad - self.scroll + row * (self.cell_h + self.gap);
+            (x, y, self.cell_w, self.cell_h)
+        }
+    }
+
+    fn shown_item(&self, position: usize) -> Option<&ItemView> {
+        self.shown
+            .get(position)
+            .and_then(|index| self.items.get(*index))
+    }
+
+    fn is_picked(&self, path: &str) -> bool {
+        self.picked.iter().any(|picked| picked == path)
+    }
+
+    /// 当前选中的路径，按显示顺序（拖出 / 右键菜单用）。
+    fn picked_paths(&self) -> Vec<String> {
+        self.shown
+            .iter()
+            .filter_map(|index| self.items.get(*index))
+            .filter(|item| self.is_picked(&item.path))
+            .map(|item| item.path.clone())
+            .collect()
+    }
+
+    fn select_only(&mut self, path: String) {
+        self.picked.clear();
+        self.picked.push(path.clone());
+        self.anchor = Some(path);
+        self.collapse = None;
+    }
+
+    fn toggle_pick(&mut self, path: String) {
+        if let Some(position) = self.picked.iter().position(|picked| picked == &path) {
+            self.picked.remove(position);
+        } else {
+            self.picked.push(path.clone());
+        }
+        self.anchor = Some(path);
+        self.collapse = None;
+    }
+
+    /// Shift 连选：从锚点到这一行（按当前显示顺序，含两端）。
+    fn select_through(&mut self, path: String) {
+        let Some(anchor) = self.anchor.clone() else {
+            self.select_only(path);
+            return;
+        };
+        let mut paths = Vec::new();
+        let mut from = None;
+        let mut to = None;
+        for (position, index) in self.shown.iter().enumerate() {
+            let Some(item) = self.items.get(*index) else {
+                continue;
+            };
+            if item.path == anchor {
+                from = Some(position);
+            }
+            if item.path == path {
+                to = Some(position);
+            }
+            paths.push(item.path.clone());
+        }
+        match (from, to) {
+            (Some(from), Some(to)) => {
+                self.picked = paths[from.min(to)..=from.max(to)].to_vec();
+                self.collapse = None;
+            }
+            // 锚点被筛掉 / 换了目录：退化成单选。
+            _ => self.select_only(path),
+        }
+    }
+
+    /// 框选：所有和矩形有交集的条目（加上按住 Ctrl 之前的底子）。
+    fn select_band(&mut self) {
+        let Some(band) = &self.band else {
+            return;
+        };
+        let (left, top, right, bottom) = band.rect();
+        let mut picked = band.base.clone();
+        for position in 0..self.shown.len() {
+            let (tx, ty, tw, th) = self.item_rect(position);
+            if tx >= right || tx + tw <= left || ty >= bottom || ty + th <= top {
+                continue;
+            }
+            if let Some(item) = self.shown_item(position) {
+                if !picked.iter().any(|path| path == &item.path) {
+                    picked.push(item.path.clone());
+                }
+            }
+        }
+        self.picked = picked;
     }
 
     /// 标题条上的面包屑命中（热区含左右 6px 的 padding）。
@@ -1444,19 +1808,15 @@ impl FenceWindow {
     }
 
     fn tile_at(&self, x: f32, y: f32) -> Option<usize> {
-        if self.rolled || y < HEADER_H {
+        if self.rolled || y < HEADER_H + self.head_row_h() {
             return None;
         }
-        let cols = self.columns();
-        let x0 = self.pad;
-        let y0 = HEADER_H + self.pad - self.scroll;
-        for (index, _) in self.items.iter().enumerate() {
-            let col = (index % cols) as f32;
-            let row = (index / cols) as f32;
-            let tx = x0 + col * (self.cell_w + self.gap);
-            let ty = y0 + row * (self.cell_h + self.gap);
-            if x >= tx && x < tx + self.cell_w && y >= ty && y < ty + self.cell_h {
-                return Some(index);
+        for position in 0..self.shown.len() {
+            let (tx, ty, tw, th) = self.item_rect(position);
+            // 列表的行间那 2px 也别留成死区：点在上沿的缝里算点中它上面那一行。
+            let th = if self.list { th + LIST_GAP } else { th };
+            if x >= tx && x < tx + tw && y >= ty && y < ty + th {
+                return Some(position);
             }
         }
         None
@@ -1609,10 +1969,9 @@ impl FenceWindow {
 
     fn rebuild_layout(&mut self, gpu: &Gpu) {
         let dwrite = &gpu.dwrite;
-        let title_width = (self.logical_w - 34.0 - 90.0).max(20.0);
+        // 标题 / 面包屑要让开右边三个按钮。
+        let title_width = (self.search_left() - 34.0 - 6.0).max(20.0);
         self.title_layout = make_layout(dwrite, &self.title, &gpu.fmt_title, title_width, HEADER_H);
-        let count = self.items.len().to_string();
-        self.count_layout = make_layout(dwrite, &count, &gpu.fmt_count, 60.0, HEADER_H);
 
         // 进了子目录：标题位置换成面包屑（根标题 › 子目录 › …），每段可点。
         self.nav.clear();
@@ -1641,7 +2000,7 @@ impl FenceWindow {
                 });
             }
             // 太长就从最外层开始省略，只留「…」；最后一段（当前目录）总在。
-            let available = (self.logical_w - NAV_START - 104.0).max(60.0);
+            let available = (self.search_left() - NAV_START - 8.0).max(60.0);
             loop {
                 let mut x = NAV_START + if self.nav_elided { 16.0 } else { 0.0 };
                 let count = self.nav.len();
@@ -1669,7 +2028,63 @@ impl FenceWindow {
             empty_width,
             22.0,
         );
+        self.empty_filter_title = make_layout(
+            dwrite,
+            "没有匹配的条目",
+            &gpu.fmt_empty_title,
+            empty_width,
+            24.0,
+        );
+        self.empty_filter_hint = make_layout(
+            dwrite,
+            "换个关键词，或按 Esc 清空筛选",
+            &gpu.fmt_empty,
+            empty_width,
+            22.0,
+        );
         self.name_format = None;
+        self.meta_format = None;
+        self.head_format = None;
+        self.head_name = None;
+        self.head_time = None;
+        self.head_size = None;
+        // 列表视图的小字（时间 / 大小 / 列名）：字号跟着 zoom 走。
+        let meta_size = (10.5 * self.zoom as f32 / 100.0).max(9.0);
+        self.meta_format = make_meta_format(dwrite, meta_size, true);
+        self.head_format = make_meta_format(dwrite, meta_size, false);
+        if let Some(format) = &self.head_format {
+            let arrow = |key: &str| {
+                if self.sort_key != key {
+                    ""
+                } else if self.sort_dir < 0 {
+                    " ↓"
+                } else {
+                    " ↑"
+                }
+            };
+            let (time_left, size_left, right) = self.list_cols();
+            self.head_name = make_layout(
+                dwrite,
+                &format!("名称{}", arrow("name")),
+                format,
+                (time_left - self.pad).max(20.0),
+                LIST_HEAD_H,
+            );
+            self.head_time = make_layout(
+                dwrite,
+                &format!("修改时间{}", arrow("modified")),
+                format,
+                (size_left - time_left - 8.0).max(20.0),
+                LIST_HEAD_H,
+            );
+            self.head_size = make_layout(
+                dwrite,
+                &format!("大小{}", arrow("size")),
+                format,
+                (right - size_left).max(20.0),
+                LIST_HEAD_H,
+            );
+        }
         if !self.items.is_empty() {
             let size = self.name_size;
             let format = unsafe {
@@ -1686,14 +2101,29 @@ impl FenceWindow {
             .ok();
             if let Some(format) = &format {
                 unsafe {
-                    let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-                    let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
+                    if self.list {
+                        // 列表：名字在图标右边、单行，放不下就省略。
+                        let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    } else {
+                        let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                        let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
+                    }
                 }
                 let _ = set_trimming(dwrite, format);
             }
-            let width = (self.cell_w - 6.0).max(10.0);
-            let height = (self.cell_h - (NAME_TOP_PAD + self.icon_size + 4.0) - 4.0).max(12.0);
+            let (width, height) = if self.list {
+                // 名字让开右边的「修改时间 / 大小」两列。
+                let (time_left, ..) = self.list_cols();
+                let name_left = self.pad + 8.0 + self.list_icon + 8.0;
+                ((time_left - name_left - 10.0).max(20.0), self.list_row_h)
+            } else {
+                let width = (self.cell_w - 6.0).max(10.0);
+                let height = (self.cell_h - (NAME_TOP_PAD + self.icon_size + 4.0) - 4.0).max(12.0);
+                (width, height)
+            };
             if let Some(format) = &format {
                 for item in &mut self.items {
                     item.layout = make_layout(dwrite, &item.name, format, width, height);
@@ -1732,22 +2162,16 @@ impl FenceWindow {
     fn sync_drop_snapshot(&self) {
         let mut folders = Vec::new();
         if !self.rolled {
-            let cols = self.columns();
-            let x0 = self.pad;
-            let y0 = HEADER_H + self.pad - self.scroll;
-            for (index, item) in self.items.iter().enumerate() {
+            // 只登记屏幕上真显示出来的文件夹：搜索筛掉的条目拖不上去。
+            for position in 0..self.shown.len() {
+                let Some(item) = self.shown_item(position) else {
+                    continue;
+                };
                 if !item.is_dir {
                     continue;
                 }
-                let col = (index % cols) as f32;
-                let row = (index / cols) as f32;
-                folders.push((
-                    x0 + col * (self.cell_w + self.gap),
-                    y0 + row * (self.cell_h + self.gap),
-                    self.cell_w,
-                    self.cell_h,
-                    item.path.clone(),
-                ));
+                let (x, y, w, h) = self.item_rect(position);
+                folders.push((x, y, w, h, item.path.clone()));
             }
         }
         if let Ok(mut snapshot) = self.drop.lock() {
@@ -1813,7 +2237,7 @@ impl FenceWindow {
             self.dc.SetTransform(&base);
             let transparent = rgb(0, 0, 0, 0.0);
             self.dc.Clear(Some(&transparent));
-            self.paint(gpu, &base);
+            self.paint(gpu);
             self.dc.EndDraw(None, None)?;
             self.dc.SetTarget(None::<&ID2D1Image>);
         }
@@ -1824,7 +2248,7 @@ impl FenceWindow {
         Ok(())
     }
 
-    fn paint(&self, gpu: &Gpu, base: &Matrix3x2) {
+    fn paint(&self, gpu: &Gpu) {
         let w = self.logical_w;
         let h = self.logical_h;
         let dc = &self.dc;
@@ -1877,19 +2301,13 @@ impl FenceWindow {
 
         if self.crumbs.is_empty() {
             // 根目录：文件夹轮廓 + 标题。
-            let glyph = *base
-                * Matrix3x2 {
-                    M11: 17.0 / 20.0,
-                    M12: 0.0,
-                    M21: 0.0,
-                    M22: 17.0 / 20.0,
-                    M31: 9.5,
-                    M32: 11.5,
-                };
+            //
+            // 几何体在构造时就已经按 17px 缩放、平移到标题条上了，这里直接用
+            // `base` 画。以前是 `*base * 局部变换` 叠一次：`base` 带着 DComp
+            // 图集给的偏移，矩阵乘法顺序一变，图形就画到窗口外面去了——
+            // 鼠标扫过重绘时一帧有一帧没有，看着就是标题前的小图标在闪。
             unsafe {
-                dc.SetTransform(&glyph);
                 dc.DrawGeometry(&gpu.folder, &self.brushes.muted, 1.1, None);
-                dc.SetTransform(base);
             }
             if let Some(layout) = &self.title_layout {
                 unsafe {
@@ -1979,21 +2397,113 @@ impl FenceWindow {
                 }
             }
         }
-        if let Some(layout) = &self.count_layout {
+        // 标题条右侧三个按钮：搜索 / 视图 / 更多。悬停时各有一块浅底色。
+        if let Some(hot) = self.hot_action {
+            let cx = match hot {
+                HeadAction::Search => self.search_left() + SEARCH_W / 2.0,
+                HeadAction::View => self.view_left() + VIEW_W / 2.0,
+                HeadAction::Dots => self.dots_left() + DOTS_W / 2.0,
+            };
+            let pill = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: cx - 13.0,
+                    top: HEADER_H / 2.0 - 13.0,
+                    right: cx + 13.0,
+                    bottom: HEADER_H / 2.0 + 13.0,
+                },
+                radiusX: 7.0,
+                radiusY: 7.0,
+            };
             unsafe {
-                dc.DrawTextLayout(
-                    Vector2 { X: w - 100.0, Y: 0.0 },
-                    layout,
-                    &self.brushes.muted,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                dc.FillRoundedRectangle(&pill, &self.brushes.hover);
+            }
+        }
+        // 搜索：放大镜。筛选生效时用正文色，一眼能看出「这一格在过滤」。
+        {
+            let cx = self.search_left() + SEARCH_W / 2.0;
+            let cy = HEADER_H / 2.0;
+            let ink = if self.filter.is_empty() {
+                &self.brushes.muted
+            } else {
+                &self.brushes.text
+            };
+            let ring = D2D1_ELLIPSE {
+                point: Vector2 {
+                    X: cx - 1.5,
+                    Y: cy - 1.5,
+                },
+                radiusX: 4.4,
+                radiusY: 4.4,
+            };
+            unsafe {
+                dc.DrawEllipse(&ring, ink, 1.3, None);
+                dc.DrawLine(
+                    Vector2 {
+                        X: cx + 1.8,
+                        Y: cy + 1.8,
+                    },
+                    Vector2 {
+                        X: cx + 5.0,
+                        Y: cy + 5.0,
+                    },
+                    ink,
+                    1.4,
+                    None,
                 );
             }
         }
-        // 右侧「更多」的三颗点（入口在原生版里还没接，先画出和网页一致的样子）。
+        // 视图切换按钮：图标画的是「点了会变成什么样」——
+        // 现在是图标网格就画列表，现在是列表就画网格。
+        {
+            let cx = self.view_left() + VIEW_W / 2.0;
+            let cy = HEADER_H / 2.0;
+            let ink = &self.brushes.muted;
+            unsafe {
+                if self.list {
+                    for (dx, dy) in [(-6.0f32, -6.0f32), (1.0, -6.0), (-6.0, 1.0), (1.0, 1.0)] {
+                        let cell = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: cx + dx,
+                                top: cy + dy,
+                                right: cx + dx + 5.0,
+                                bottom: cy + dy + 5.0,
+                            },
+                            radiusX: 1.2,
+                            radiusY: 1.2,
+                        };
+                        dc.FillRoundedRectangle(&cell, ink);
+                    }
+                } else {
+                    for dy in [-5.5f32, 0.0, 5.5] {
+                        let line = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: cx - 1.0,
+                                top: cy + dy - 1.0,
+                                right: cx + 7.0,
+                                bottom: cy + dy + 1.0,
+                            },
+                            radiusX: 1.0,
+                            radiusY: 1.0,
+                        };
+                        dc.FillRoundedRectangle(&line, ink);
+                        let dot = D2D1_ELLIPSE {
+                            point: Vector2 {
+                                X: cx - 5.0,
+                                Y: cy + dy,
+                            },
+                            radiusX: 1.0,
+                            radiusY: 1.0,
+                        };
+                        dc.FillEllipse(&dot, ink);
+                    }
+                }
+            }
+        }
+        // 右侧「更多」的三颗点。
         for index in 0..3 {
             let dot = D2D1_ELLIPSE {
                 point: Vector2 {
-                    X: w - 25.2 + index as f32 * 4.2,
+                    X: self.dots_left() + DOTS_W / 2.0 - 4.2 + index as f32 * 4.2,
                     Y: HEADER_H / 2.0,
                 },
                 radiusX: 1.15,
@@ -2017,21 +2527,103 @@ impl FenceWindow {
         unsafe {
             dc.PushAxisAlignedClip(&body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
-        if self.items.is_empty() {
-            if let Some(layout) = &self.empty_title_layout {
+        // 列表视图顶部的列名：点一下按那一列排序。
+        if self.head_row_h() > 0.0 {
+            let (time_left, size_left, right) = self.list_cols();
+            if let Some(hot) = self.head_hot {
+                let (left, edge) = match hot {
+                    "name" => (self.pad, time_left),
+                    "modified" => (time_left, size_left - 4.0),
+                    _ => (size_left - 4.0, right),
+                };
+                let cell = D2D_RECT_F {
+                    left,
+                    top: HEADER_H + 2.0,
+                    right: edge,
+                    bottom: HEADER_H + LIST_HEAD_H - 2.0,
+                };
+                unsafe {
+                    dc.FillRectangle(&cell, &self.brushes.hover);
+                }
+            }
+            unsafe {
+                if let Some(layout) = &self.head_name {
+                    dc.DrawTextLayout(
+                        Vector2 {
+                            X: self.pad + 8.0,
+                            Y: HEADER_H,
+                        },
+                        layout,
+                        &self.brushes.muted,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                if let Some(layout) = &self.head_time {
+                    dc.DrawTextLayout(
+                        Vector2 {
+                            X: time_left,
+                            Y: HEADER_H,
+                        },
+                        layout,
+                        &self.brushes.muted,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                if let Some(layout) = &self.head_size {
+                    dc.DrawTextLayout(
+                        Vector2 {
+                            X: size_left,
+                            Y: HEADER_H,
+                        },
+                        layout,
+                        &self.brushes.muted,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                let line = D2D_RECT_F {
+                    left: 0.0,
+                    top: HEADER_H + LIST_HEAD_H - 1.0,
+                    right: w,
+                    bottom: HEADER_H + LIST_HEAD_H,
+                };
+                dc.FillRectangle(&line, &self.brushes.line);
+            }
+        }
+        // 列表的列名钉在顶上：条目从它下面开始滚，别画到列名上。
+        let view_top = HEADER_H + self.head_row_h();
+        let view_clipped = self.head_row_h() > 0.0;
+        if view_clipped {
+            let viewport = D2D_RECT_F {
+                left: 0.0,
+                top: view_top,
+                right: w,
+                bottom: h,
+            };
+            unsafe {
+                dc.PushAxisAlignedClip(&viewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            }
+        }
+        if self.shown.is_empty() {
+            // 搜索没命中时不说「这里是空的」——目录里其实有东西，只是被筛掉了。
+            let (title, hint) = if self.filter.is_empty() {
+                (&self.empty_title_layout, &self.empty_layout)
+            } else {
+                (&self.empty_filter_title, &self.empty_filter_hint)
+            };
+            if let Some(layout) = title {
                 unsafe {
                     dc.DrawTextLayout(
-                        Vector2 { X: 18.0, Y: HEADER_H + self.body_h() / 2.0 - 24.0 },
+                        Vector2 { X: 18.0, Y: view_top + self.view_h() / 2.0 - 24.0 },
                         layout,
                         &self.brushes.text,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
                     );
                 }
             }
-            if let Some(layout) = &self.empty_layout {
+            if let Some(layout) = hint {
                 unsafe {
                     dc.DrawTextLayout(
-                        Vector2 { X: 18.0, Y: HEADER_H + self.body_h() / 2.0 },
+                        Vector2 { X: 18.0, Y: view_top + self.view_h() / 2.0 },
                         layout,
                         &self.brushes.muted,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -2039,33 +2631,34 @@ impl FenceWindow {
                 }
             }
         } else {
-            let cols = self.columns();
-            let y0 = HEADER_H + self.pad - self.scroll;
-            for (index, item) in self.items.iter().enumerate() {
-                let col = (index % cols) as f32;
-                let row = (index / cols) as f32;
-                let tx = self.pad + col * (self.cell_w + self.gap);
-                let ty = y0 + row * (self.cell_h + self.gap);
-                if ty + self.cell_h < HEADER_H || ty > h {
+            for position in 0..self.shown.len() {
+                let Some(item) = self.shown_item(position) else {
+                    continue;
+                };
+                let (tx, ty, tw, th) = self.item_rect(position);
+                let head_bottom = HEADER_H + self.head_row_h();
+                if ty + th < head_bottom || ty > h {
                     continue;
                 }
                 let clip = D2D_RECT_F {
                     left: tx,
                     top: ty,
-                    right: tx + self.cell_w,
-                    bottom: ty + self.cell_h,
+                    right: tx + tw,
+                    bottom: ty + th,
                 };
                 unsafe {
                     dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                 }
-                if self.hover == Some(index) || self.pick == Some(index) {
+                let picked = self.is_picked(&item.path);
+                if self.hover == Some(position) || picked {
                     let highlight = D2D1_ROUNDED_RECT {
                         rect: clip,
-                        radiusX: TILE_RADIUS,
-                        radiusY: TILE_RADIUS,
+                        // 列表是一整行，圆角小一点更像列表项。
+                        radiusX: if self.list { 6.0 } else { TILE_RADIUS },
+                        radiusY: if self.list { 6.0 } else { TILE_RADIUS },
                     };
                     // 选中比悬停深一档；两者叠加时按选中画。
-                    let brush = if self.pick == Some(index) {
+                    let brush = if picked {
                         &self.brushes.pick
                     } else {
                         &self.brushes.hover
@@ -2074,14 +2667,32 @@ impl FenceWindow {
                         dc.FillRoundedRectangle(&highlight, brush);
                     }
                 }
-                let icon_left = tx + (self.cell_w - self.icon_size) / 2.0;
-                let icon_top = ty + NAME_TOP_PAD;
+                // 网格：图标居中在上、名字在下；列表：图标在左、名字在右并垂直居中。
+                let (icon_left, icon_top, icon_size, name_x, name_y) = if self.list {
+                    let size = self.list_icon;
+                    (
+                        tx + 8.0,
+                        ty + ((th - size) / 2.0).max(0.0),
+                        size,
+                        tx + 8.0 + size + 8.0,
+                        // 排版框就是这一行的高度，段落居中会自己把字摆在中间。
+                        ty,
+                    )
+                } else {
+                    (
+                        tx + (tw - self.icon_size) / 2.0,
+                        ty + NAME_TOP_PAD,
+                        self.icon_size,
+                        tx + 3.0,
+                        ty + NAME_TOP_PAD + self.icon_size + 4.0,
+                    )
+                };
                 if let Some(icon) = &item.icon {
                     let dest = D2D_RECT_F {
                         left: icon_left,
                         top: icon_top,
-                        right: icon_left + self.icon_size,
-                        bottom: icon_top + self.icon_size,
+                        right: icon_left + icon_size,
+                        bottom: icon_top + icon_size,
                     };
                     unsafe {
                         dc.DrawBitmap(
@@ -2094,13 +2705,13 @@ impl FenceWindow {
                         );
                     }
                 } else {
-                    // 图标还没抽出来：文件夹画轮廓、文件画一个点，和网页版的占位一致。
+                    // 图标还没抽出来：画一个圆角轮廓占位。
                     let placeholder = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
                             left: icon_left + 2.0,
                             top: icon_top + 1.0,
-                            right: icon_left + self.icon_size - 2.0,
-                            bottom: icon_top + self.icon_size - 3.0,
+                            right: icon_left + icon_size - 2.0,
+                            bottom: icon_top + icon_size - 3.0,
                         },
                         radiusX: 3.0,
                         radiusY: 3.0,
@@ -2113,8 +2724,8 @@ impl FenceWindow {
                     unsafe {
                         dc.DrawTextLayout(
                             Vector2 {
-                                X: tx + 3.0,
-                                Y: icon_top + self.icon_size + 4.0,
+                                X: name_x,
+                                Y: name_y,
                             },
                             layout,
                             &self.brushes.text,
@@ -2122,9 +2733,68 @@ impl FenceWindow {
                         );
                     }
                 }
+                // 列表视图右侧两列：时间、大小，右对齐。
+                if self.list {
+                    if let Some(format) = &self.meta_format {
+                        let (time_left, size_left, right) = self.list_cols();
+                        unsafe {
+                            if !item.time_text.is_empty() {
+                                let rect = D2D_RECT_F {
+                                    left: time_left,
+                                    top: ty,
+                                    right: size_left - 10.0,
+                                    bottom: ty + th,
+                                };
+                                dc.DrawText(
+                                    &item.time_text,
+                                    format,
+                                    &rect,
+                                    &self.brushes.muted,
+                                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                            }
+                            if !item.size_text.is_empty() {
+                                let rect = D2D_RECT_F {
+                                    left: size_left,
+                                    top: ty,
+                                    right,
+                                    bottom: ty + th,
+                                };
+                                dc.DrawText(
+                                    &item.size_text,
+                                    format,
+                                    &rect,
+                                    &self.brushes.muted,
+                                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                            }
+                        }
+                    }
+                }
                 unsafe {
                     dc.PopAxisAlignedClip();
                 }
+            }
+        }
+        // 框选：半透明底 + 细边，和系统的一样。
+        if let Some(band) = &self.band {
+            let (left, top, right, bottom) = band.rect();
+            let box_rect = D2D_RECT_F {
+                left,
+                top,
+                right,
+                bottom,
+            };
+            unsafe {
+                dc.FillRectangle(&box_rect, &self.brushes.hover);
+                dc.DrawRectangle(&box_rect, &self.brushes.muted, 1.0, None);
+            }
+        }
+        if view_clipped {
+            unsafe {
+                dc.PopAxisAlignedClip();
             }
         }
         unsafe {
@@ -2134,11 +2804,11 @@ impl FenceWindow {
         // 滚动条：网页版是 6px 宽、半透明的 thumb，这里照画。
         let max = self.max_scroll();
         if max > 0.0 {
-            let body_h = self.body_h();
-            let content = body_h + max;
-            let thumb_h = (body_h * (body_h / content)).clamp(24.0, body_h);
-            let travel = body_h - thumb_h;
-            let top = HEADER_H + (self.scroll / max) * travel;
+            let view_h = self.view_h();
+            let content = view_h + max;
+            let thumb_h = (view_h * (view_h / content)).clamp(24.0, view_h);
+            let travel = view_h - thumb_h;
+            let top = HEADER_H + self.head_row_h() + (self.scroll / max) * travel;
             let thumb = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: w - 6.0,
@@ -2260,6 +2930,8 @@ struct LayoutConsts {
     pad: f32,
     icon_size: f32,
     name_size: f32,
+    list_row_h: f32,
+    list_icon: f32,
 }
 
 impl LayoutConsts {
@@ -2279,6 +2951,8 @@ impl LayoutConsts {
             pad: round(CELL_PAD * z).max(4.0),
             icon_size: round(ICON_BASE * z).max(16.0),
             name_size: round(11.0 * z).max(10.0),
+            list_row_h: round(LIST_ROW_H * z).max(20.0),
+            list_icon: round(LIST_ICON * z).max(12.0),
         }
     }
 }
@@ -2297,6 +2971,16 @@ fn header_px(scale: f32) -> u32 {
 
 /// 标题条右侧「更多」按钮的命中宽度（和 paint 里的三颗点对齐）。
 const DOTS_W: f32 = 34.0;
+/// 标题条右侧视图切换按钮的宽度（图标居中画在里面）。
+const VIEW_W: f32 = 44.0;
+/// 标题条右侧搜索按钮的宽度。
+const SEARCH_W: f32 = 34.0;
+
+/// 列表视图顶部那一行列名的高度。
+const LIST_HEAD_H: f32 = 22.0;
+/// 列表视图「修改时间」「大小」两列的宽度（100% 排版时；跟着 zoom 缩放）。
+const COL_TIME_W: f32 = 84.0;
+const COL_SIZE_W: f32 = 54.0;
 
 const MENU_OPEN: u32 = 1;
 const MENU_SORT_NAME: u32 = 2;
@@ -2306,6 +2990,9 @@ const MENU_DELETE: u32 = 5;
 const MENU_CHANGE_FOLDER: u32 = 6;
 const MENU_RUN_RULES: u32 = 7;
 const MENU_RENAME: u32 = 8;
+const MENU_LOCK: u32 = 9;
+const MENU_SORT_SIZE: u32 = 10;
+const MENU_SORT_TYPE: u32 = 11;
 
 /// 单行 `EDIT` 的两条消息：`Win32_UI_Controls` 这个 feature 没开，值写在本地。
 const EM_SETSEL_MSG: u32 = 0x00B1;
@@ -2363,6 +3050,10 @@ fn show_fence_menu(hwnd: HWND, fence: &FenceWindow, x: i32, y: i32) -> u32 {
         };
         item(MENU_SORT_NAME, &sort_label("按名称排序", "name"));
         item(MENU_SORT_MODIFIED, &sort_label("按修改时间排序", "modified"));
+        item(MENU_SORT_SIZE, &sort_label("按大小排序", "size"));
+        item(MENU_SORT_TYPE, &sort_label("按类型排序", "type"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        item(MENU_LOCK, if fence.locked { "解锁位置" } else { "锁定位置" });
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MENU_HIDE, "隐藏格子");
         item(MENU_DELETE, "删除格子");
@@ -2571,27 +3262,35 @@ unsafe extern "system" fn rename_wndproc(
     }
 }
 
-/// 在指定位置弹一个单行改名框。输入法、选区、剪贴板都交给系统 `EDIT`。
+/// 一个「弹层 + 单行 EDIT」的现成组合：输入法、选区、剪贴板都交给系统 `EDIT`。
+struct EditPopup {
+    popup: HWND,
+    edit: HWND,
+    font: HFONT,
+    brush: HBRUSH,
+    bg: COLORREF,
+    fg: COLORREF,
+    /// 弹层出现前的那个窗口：回车 / Esc 之后把前台还回去。
+    previous: HWND,
+}
+
+/// 建弹层和输入框（不显示、不给焦点，子类化和初始内容由调用方接）。
 #[allow(clippy::too_many_arguments)]
-fn show_rename_box(
+unsafe fn create_edit_popup(
+    class: PCWSTR,
     owner: HWND,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     text: &str,
-    select_to: Option<usize>,
     dark: bool,
-    target: RenameTarget,
-    sink: &EventSink,
-) {
+) -> Option<EditPopup> {
     unsafe {
-        let Ok(module) = GetModuleHandleW(None) else {
-            return;
-        };
-        let Ok(popup) = CreateWindowExW(
+        let module = GetModuleHandleW(None).ok()?;
+        let popup = CreateWindowExW(
             WS_EX_TOOLWINDOW,
-            w!("HexBenchNativeFenceRename"),
+            class,
             w!(""),
             WS_POPUP | WS_BORDER | WS_CLIPSIBLINGS,
             x,
@@ -2602,18 +3301,15 @@ fn show_rename_box(
             None,
             Some(module.into()),
             None,
-        ) else {
-            return;
-        };
+        )
+        .ok()?;
         let mut client = RECT::default();
         let _ = GetClientRect(popup, &mut client);
         let Ok(edit) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("EDIT"),
             &HSTRING::from(text),
-            WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | ES_LEFT as u32 | ES_AUTOHSCROLL as u32,
-            ),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | ES_LEFT as u32 | ES_AUTOHSCROLL as u32),
             2,
             2,
             (client.right - 4).max(24),
@@ -2624,7 +3320,7 @@ fn show_rename_box(
             None,
         ) else {
             let _ = DestroyWindow(popup);
-            return;
+            return None;
         };
         let font = CreateFontW(
             -(height * 3 / 5).max(12),
@@ -2648,8 +3344,62 @@ fn show_rename_box(
             (COLORREF(0x00FF_FFFF), COLORREF(0x001E_1E1E))
         };
         let brush = CreateSolidBrush(bg);
-        // 弹层出现前的那个窗口：回车 / Esc 之后把前台还回去。
         let previous = GetForegroundWindow();
+        let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        let _ = SendMessageW(
+            edit,
+            EM_SETMARGINS_MSG,
+            Some(WPARAM(0x0003)),
+            Some(LPARAM(EDIT_MARGINS)),
+        );
+        Some(EditPopup {
+            popup,
+            edit,
+            font,
+            brush,
+            bg,
+            fg,
+            previous,
+        })
+    }
+}
+
+/// 在指定位置弹一个单行改名框。
+#[allow(clippy::too_many_arguments)]
+fn show_rename_box(
+    owner: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    text: &str,
+    select_to: Option<usize>,
+    dark: bool,
+    target: RenameTarget,
+    sink: &EventSink,
+) {
+    unsafe {
+        let Some(parts) = create_edit_popup(
+            w!("HexBenchNativeFenceRename"),
+            owner,
+            x,
+            y,
+            width,
+            height,
+            text,
+            dark,
+        ) else {
+            return;
+        };
+        let EditPopup {
+            popup,
+            edit,
+            font,
+            brush,
+            bg,
+            fg,
+            previous,
+        } = parts;
         let state = Box::new(RenameEdit {
             popup,
             edit,
@@ -2670,16 +3420,236 @@ fn show_rename_box(
         let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(edit, GWLP_WNDPROC));
         (*ptr).old_proc = old;
         SetWindowLongPtrW(edit, GWLP_WNDPROC, rename_edit_proc as *const () as usize as isize);
-        let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-        let _ = SendMessageW(
-            edit,
-            EM_SETMARGINS_MSG,
-            Some(WPARAM(0x0003)),
-            Some(LPARAM(EDIT_MARGINS)),
-        );
         // 默认全选；文件把扩展名之前的部分选中，和资源管理器的改名一致。
         let end = select_to.map(|value| value as isize).unwrap_or(-1);
         let _ = SendMessageW(edit, EM_SETSEL_MSG, Some(WPARAM(0)), Some(LPARAM(end)));
+        let _ = ShowWindow(popup, SW_SHOWNA);
+        hexbench_core::sys::force_foreground(popup.0 as isize);
+        let _ = SetFocus(Some(edit));
+    }
+}
+
+/// 标题条搜索框的状态。
+struct SearchEdit {
+    popup: HWND,
+    edit: HWND,
+    /// 输入框属于哪一格：按它拿 `FenceWindow`，窗口没了就是空指针。
+    fence: HWND,
+    previous: HWND,
+    font: HFONT,
+    brush: HBRUSH,
+    bg: COLORREF,
+    fg: COLORREF,
+    old_proc: WNDPROC,
+    closing: bool,
+}
+
+/// 按窗口句柄找它自己的 `FenceWindow`：搜索框不属于格子窗口，得从宿主拿。
+unsafe fn window_fence(hwnd: HWND) -> Option<&'static mut FenceWindow> {
+    unsafe {
+        let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FenceWindow;
+        (!raw.is_null()).then(|| &mut *raw)
+    }
+}
+
+/// 把输入框里的字当成筛选词应用下去。
+unsafe fn apply_search(ptr: *mut SearchEdit) {
+    unsafe {
+        let text = window_text((*ptr).edit);
+        let Some(fence) = window_fence((*ptr).fence) else {
+            return;
+        };
+        if fence.filter == text {
+            return;
+        }
+        fence.filter = text;
+        fence.apply_filter();
+        let engine = ENGINE.with(|cell| cell.get());
+        if !engine.is_null() {
+            let _ = fence.render(&(*engine).gpu);
+        }
+    }
+}
+
+/// 关掉搜索框。`clear` 为真时顺手把筛选清掉（按 Esc）。
+unsafe fn close_search(ptr: *mut SearchEdit, clear: bool, restore_foreground: bool) {
+    unsafe {
+        let state = &mut *ptr;
+        if state.closing {
+            return;
+        }
+        if clear {
+            let _ = SetWindowTextW(state.edit, w!(""));
+            apply_search(ptr);
+        }
+        state.closing = true;
+        let popup = state.popup;
+        let previous = state.previous;
+        let _ = DestroyWindow(popup);
+        if restore_foreground && !previous.is_invalid() {
+            let _ = SetForegroundWindow(previous);
+        }
+    }
+}
+
+/// 输入框的子类过程：每次改字都同步筛选；回车保留、Esc 清空。
+unsafe extern "system" fn search_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SearchEdit;
+        if !ptr.is_null() {
+            match msg {
+                WM_KEYDOWN => {
+                    let key = wparam.0 as u16;
+                    if key == VK_RETURN.0 {
+                        close_search(ptr, false, true);
+                        return LRESULT(0);
+                    }
+                    if key == VK_ESCAPE.0 {
+                        close_search(ptr, true, true);
+                        return LRESULT(0);
+                    }
+                }
+                WM_CHAR if wparam.0 == 13 || wparam.0 == 27 => {
+                    // 回车 / Esc 上面已经处理过，别让 EDIT 再「叮」一声。
+                    return LRESULT(0);
+                }
+                WM_KILLFOCUS => {
+                    let result = if (*ptr).old_proc.is_some() {
+                        CallWindowProcW((*ptr).old_proc, hwnd, msg, wparam, lparam)
+                    } else {
+                        LRESULT(0)
+                    };
+                    close_search(ptr, false, false);
+                    return result;
+                }
+                _ => {}
+            }
+            if (*ptr).old_proc.is_some() {
+                let result = CallWindowProcW((*ptr).old_proc, hwnd, msg, wparam, lparam);
+                // 先让 EDIT 把字吞进去，再按最新内容筛。
+                if matches!(msg, WM_CHAR | WM_KEYUP | WM_PASTE | WM_CUT | WM_CLEAR) {
+                    apply_search(ptr);
+                }
+                return result;
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+/// 搜索弹层的窗口过程：配色跟卡片一致，销毁时释放状态。
+unsafe extern "system" fn search_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SearchEdit;
+        if !ptr.is_null() {
+            match msg {
+                WM_ERASEBKGND => {
+                    let dc = HDC(wparam.0 as *mut core::ffi::c_void);
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    let _ = FillRect(dc, &rect, (*ptr).brush);
+                    return LRESULT(1);
+                }
+                WM_CTLCOLOREDIT => {
+                    let dc = HDC(wparam.0 as *mut core::ffi::c_void);
+                    let _ = SetTextColor(dc, (*ptr).fg);
+                    let _ = SetBkColor(dc, (*ptr).bg);
+                    return LRESULT((*ptr).brush.0 as isize);
+                }
+                WM_NCDESTROY => {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    let state = Box::from_raw(ptr);
+                    if let Some(fence) = window_fence(state.fence) {
+                        fence.search_popup = None;
+                        let engine = ENGINE.with(|cell| cell.get());
+                        if !engine.is_null() {
+                            let _ = fence.render(&(*engine).gpu);
+                        }
+                    }
+                    if !state.font.0.is_null() {
+                        let _ = DeleteObject(HGDIOBJ(state.font.0));
+                    }
+                    if !state.brush.0.is_null() {
+                        let _ = DeleteObject(HGDIOBJ(state.brush.0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+/// 标题条上的搜索框：点放大镜弹出来，边打边筛；再点一次或按 Esc 收起。
+fn open_search(owner: HWND, fence: &mut FenceWindow) {
+    // 已经开着：再点一次就收起来（筛选留着）。
+    if let Some(popup) = fence.search_popup {
+        unsafe {
+            let _ = DestroyWindow(popup);
+        }
+        return;
+    }
+    unsafe {
+        let mut rect = RECT::default();
+        if GetWindowRect(owner, &mut rect).is_err() {
+            return;
+        }
+        let scale = fence.scale.max(0.5);
+        let height = (24.0 * scale).round().max(20.0) as i32;
+        let left = rect.left + (12.0 * scale).round() as i32;
+        let right = rect.left + ((fence.search_left() - 8.0) * scale).round() as i32;
+        let top = rect.top + (((HEADER_H - 24.0) / 2.0) * scale).round() as i32;
+        let width = (right - left).max(120);
+        let Some(parts) = create_edit_popup(
+            w!("HexBenchNativeFenceSearch"),
+            owner,
+            left,
+            top,
+            width,
+            height,
+            &fence.filter,
+            fence.dark,
+        ) else {
+            return;
+        };
+        let EditPopup {
+            popup,
+            edit,
+            font,
+            brush,
+            bg,
+            fg,
+            previous,
+        } = parts;
+        let ptr = Box::into_raw(Box::new(SearchEdit {
+            popup,
+            edit,
+            fence: owner,
+            previous,
+            font,
+            brush,
+            bg,
+            fg,
+            old_proc: None,
+            closing: false,
+        }));
+        SetWindowLongPtrW(popup, GWLP_USERDATA, ptr as isize);
+        SetWindowLongPtrW(edit, GWLP_USERDATA, ptr as isize);
+        let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(edit, GWLP_WNDPROC));
+        (*ptr).old_proc = old;
+        SetWindowLongPtrW(edit, GWLP_WNDPROC, search_edit_proc as *const () as usize as isize);
+        fence.search_popup = Some(popup);
+        let _ = SendMessageW(edit, EM_SETSEL_MSG, Some(WPARAM(0)), Some(LPARAM(-1)));
         let _ = ShowWindow(popup, SW_SHOWNA);
         hexbench_core::sys::force_foreground(popup.0 as isize);
         let _ = SetFocus(Some(edit));
@@ -2764,18 +3734,17 @@ fn start_rename_item(
 ///
 /// 菜单里的「重命名」是 `hexbench_core` 自己插的一项（资源管理器的视图层才有改名），
 /// 选中时返回路径，由调用方弹原生输入框。
-fn show_item_menu(hwnd: HWND, path: &str, x: i32, y: i32) -> Option<String> {
+fn show_item_menu(hwnd: HWND, paths: &[std::path::PathBuf], x: i32, y: i32) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let single = paths.len() == 1;
     let result = with_menu_focus(hwnd, || {
-        hexbench_core::sys::show_shell_context_menu(
-            std::path::Path::new(path),
-            x,
-            y,
-            hwnd.0 as isize,
-            || {},
-        )
+        hexbench_core::sys::show_shell_context_menu_for(paths, x, y, hwnd.0 as isize, || {})
     });
     match result {
-        Ok(Some("rename")) => Some(path.to_string()),
+        // 多选时菜单里没有「重命名」这一项，这里再兜一层。
+        Ok(Some("rename")) if single => Some(paths[0].to_string_lossy().into_owned()),
         Ok(_) => None,
         Err(error) => {
             log::warn!("native fence: 右键菜单失败: {error}");
@@ -2841,9 +3810,25 @@ unsafe extern "system" fn fence_wndproc(
                     }
                     return LRESULT(0);
                 }
+                // 框选：按住左键在空白处划过，实时更新选中。
+                if fence.band.is_some() && w.0 & MK_LBUTTON != 0 {
+                    let top = HEADER_H + fence.head_row_h();
+                    let (width, height) = (fence.logical_w, fence.logical_h);
+                    if let Some(band) = &mut fence.band {
+                        band.x1 = x.clamp(0.0, width);
+                        band.y1 = y.clamp(top, height);
+                    }
+                    fence.select_band();
+                    let _ = fence.render(&(*engine).gpu);
+                    return LRESULT(0);
+                }
                 // 在窗口外松手拿不到 WM_LBUTTONUP：按键状态自己清。
                 if w.0 & MK_LBUTTON == 0 {
                     fence.file_drag = None;
+                    if fence.band.take().is_some() || fence.collapse.take().is_some() {
+                        let _ = ReleaseCapture();
+                        let _ = fence.render(&(*engine).gpu);
+                    }
                 }
                 if let Some(pending) = fence.file_drag.take() {
                     let mut now = POINT::default();
@@ -2853,12 +3838,15 @@ unsafe extern "system" fn fence_wndproc(
                     if !moved {
                         // 还没拖起来：继续按着，等下一次移动。
                         fence.file_drag = Some(pending);
-                    } else if let Some(item) = fence.items.get(pending.index) {
-                        let path = std::path::PathBuf::from(&item.path);
+                    } else {
+                        let paths: Vec<std::path::PathBuf> =
+                            pending.paths.iter().map(std::path::PathBuf::from).collect();
+                        // 真拖起来了：多选「松手收窄成一项」不再生效。
+                        fence.collapse = None;
                         // DoDragDrop 要和自己窗口同一条线程的鼠标捕获：这里是渲染线程，
                         // 落点（自己的格子 / 别的程序）都由 OLE 处理。
                         SetCapture(hwnd);
-                        match hexbench_core::sys::start_file_drag(&[path]) {
+                        match hexbench_core::sys::start_file_drag(&paths) {
                             Ok(effect) => log::info!("native fence: 拖出 effect={effect}"),
                             Err(error) => log::warn!("native fence: 拖出失败: {error}"),
                         }
@@ -2883,9 +3871,21 @@ unsafe extern "system" fn fence_wndproc(
                     } else {
                         fence.tile_at(x, y)
                     };
-                    if hot != fence.nav_hot || next != fence.hover {
+                    let action = fence.head_action_at(x, y);
+                    let head = if y >= HEADER_H && y < HEADER_H + fence.head_row_h() {
+                        fence.head_key_at(x)
+                    } else {
+                        None
+                    };
+                    if hot != fence.nav_hot
+                        || next != fence.hover
+                        || action != fence.hot_action
+                        || head != fence.head_hot
+                    {
                         fence.nav_hot = hot;
                         fence.hover = next;
+                        fence.hot_action = action;
+                        fence.head_hot = head;
                         let _ = fence.render(&(*engine).gpu);
                     }
                 }
@@ -2897,7 +3897,9 @@ unsafe extern "system" fn fence_wndproc(
                 let fence = &mut *raw;
                 fence.tracking_leave = false;
                 let hot = fence.nav_hot.take().is_some();
-                if fence.hover.take().is_some() || hot {
+                let action = fence.hot_action.take().is_some();
+                let head = fence.head_hot.take().is_some();
+                if fence.hover.take().is_some() || hot || action || head {
                     let _ = fence.render(&(*engine).gpu);
                 }
             }
@@ -2908,25 +3910,42 @@ unsafe extern "system" fn fence_wndproc(
                 let fence = &mut *raw;
                 let x = ((l.0 & 0xffff) as u16 as i16) as f32 / fence.scale;
                 let y = ((((l.0 >> 16) & 0xffff) as u16 as i16) as f32) / fence.scale;
-                // 先认边角：拉边缩放不弹菜单、不动标题。
-                if let Some(edge) = fence.edge_at(x, y) {
-                    ((*engine).sink)(Event::BeginResize {
-                        id: fence.id.clone(),
-                        hwnd: hwnd.0 as isize,
-                        edge: edge.to_string(),
-                        scale: fence.scale,
-                    });
-                    SetCapture(hwnd);
-                    return LRESULT(0);
+                // 先认边角：拉边缩放不弹菜单、不动标题。锁定位置时边角不响应。
+                if !fence.locked {
+                    if let Some(edge) = fence.edge_at(x, y) {
+                        ((*engine).sink)(Event::BeginResize {
+                            id: fence.id.clone(),
+                            hwnd: hwnd.0 as isize,
+                            edge: edge.to_string(),
+                            scale: fence.scale,
+                        });
+                        SetCapture(hwnd);
+                        return LRESULT(0);
+                    }
                 }
                 if y < HEADER_H {
                     // 右侧三颗点是「更多」菜单，其余标题区起拖。
-                    if x >= fence.logical_w - DOTS_W {
+                    if x >= fence.dots_left() {
                         // 松手再弹：在 WM_LBUTTONDOWN 里弹菜单时左键还按着，
                         // 菜单的模态循环会把之后的鼠标输入当成同一次拖拽，点不动。
                         fence.dots_down = true;
                         fence.hover = None;
                         let _ = fence.render(&(*engine).gpu);
+                        return LRESULT(0);
+                    }
+                    // 视图按钮：点一下在图标网格和列表之间切换。
+                    if x >= fence.view_left() && x < fence.dots_left() - 6.0 {
+                        ((*engine).sink)(Event::View {
+                            id: fence.id.clone(),
+                            view: if fence.list { "grid" } else { "list" }.to_string(),
+                        });
+                        fence.hover = None;
+                        let _ = fence.render(&(*engine).gpu);
+                        return LRESULT(0);
+                    }
+                    // 搜索按钮：弹出一个贴着标题条的输入框，边打边筛。
+                    if x >= fence.search_left() && x < fence.view_left() - 6.0 {
+                        open_search(hwnd, fence);
                         return LRESULT(0);
                     }
                     // 进了子目录：左边的「‹」回上一层，面包屑的每一段都能跳。
@@ -2946,25 +3965,78 @@ unsafe extern "system" fn fence_wndproc(
                             return LRESULT(0);
                         }
                     }
-                    // 吸附、参考线、落盘都在后端那套循环里（和网页版共用）。
-                    ((*engine).sink)(Event::BeginMove {
-                        id: fence.id.clone(),
-                        hwnd: hwnd.0 as isize,
-                        scale: fence.scale,
-                    });
+                    // 吸附、参考线、落盘都在后端那套循环里。锁定时标题条不能拖，
+                    // 但双击卷起、面包屑和「更多」菜单照常可用。
+                    if !fence.locked {
+                        ((*engine).sink)(Event::BeginMove {
+                            id: fence.id.clone(),
+                            hwnd: hwnd.0 as isize,
+                            scale: fence.scale,
+                        });
+                    }
                     fence.hover = None;
                     let _ = fence.render(&(*engine).gpu);
                 } else {
-                    // 单击选中；点空白处清掉选中，和网页版一致。
-                    let next = fence.tile_at(x, y);
-                    if next != fence.pick {
-                        fence.pick = next;
-                        let _ = fence.render(&(*engine).gpu);
+                    // 列表顶部的列名：点一下按这一列排序（再点一次反方向）。
+                    if y < HEADER_H + fence.head_row_h() {
+                        if let Some(key) = fence.head_key_at(x) {
+                            ((*engine).sink)(Event::Sort {
+                                id: fence.id.clone(),
+                                key: key.to_string(),
+                            });
+                            return LRESULT(0);
+                        }
                     }
-                    // 按在条目上：拖出一段距离就发起文件拖拽（拖出格子 / 拖进子文件夹）。
-                    let mut origin = POINT::default();
-                    if GetCursorPos(&mut origin).is_ok() {
-                        fence.file_drag = next.map(|index| FileDrag { index, origin });
+                    let ctrl = w.0 & MK_CONTROL as usize != 0;
+                    let shift = w.0 & MK_SHIFT != 0;
+                    let next = fence.tile_at(x, y);
+                    match next.and_then(|position| {
+                        fence
+                            .shown_item(position)
+                            .map(|item| (position, item.path.clone()))
+                    }) {
+                        Some((_, path)) => {
+                            if shift {
+                                fence.select_through(path.clone());
+                            } else if ctrl {
+                                fence.toggle_pick(path.clone());
+                            } else if !fence.is_picked(&path) {
+                                fence.select_only(path.clone());
+                            } else if fence.picked.len() > 1 {
+                                // 按在已选中的一组上：先不缩成一格，拖起来带走整组；
+                                // 只是点一下才在松手时收窄。
+                                fence.collapse = Some(path.clone());
+                            }
+                            // 按在条目上：拖出一段距离就发起文件拖拽（拖出格子 / 拖进子文件夹）。
+                            let paths = if fence.picked.len() > 1 && fence.is_picked(&path) {
+                                fence.picked_paths()
+                            } else {
+                                vec![path]
+                            };
+                            let mut origin = POINT::default();
+                            if GetCursorPos(&mut origin).is_ok() {
+                                fence.file_drag = Some(FileDrag { paths, origin });
+                            }
+                            let _ = fence.render(&(*engine).gpu);
+                        }
+                        None => {
+                            // 空白处：清掉选中（按住 Ctrl 时保留），开始框选。
+                            if !ctrl && !shift {
+                                fence.picked.clear();
+                                fence.anchor = None;
+                            }
+                            fence.hover = None;
+                            fence.collapse = None;
+                            fence.band = Some(Band {
+                                x0: x,
+                                y0: y,
+                                x1: x,
+                                y1: y,
+                                base: fence.picked.clone(),
+                            });
+                            SetCapture(hwnd);
+                            let _ = fence.render(&(*engine).gpu);
+                        }
                     }
                 }
             }
@@ -2976,17 +4048,17 @@ unsafe extern "system" fn fence_wndproc(
                 let x = ((l.0 & 0xffff) as u16 as i16) as f32 / fence.scale;
                 let y = ((((l.0 >> 16) & 0xffff) as u16 as i16) as f32) / fence.scale;
                 if y < HEADER_H {
-                    // 双击标题条卷起 / 展开；「更多」按钮和面包屑除外。
+                    // 双击标题条卷起 / 展开；三个按钮和面包屑除外。
                     let on_crumb = !fence.crumbs.is_empty()
                         && (x < BACK_W || fence.nav_at(x).is_some());
-                    if x < fence.logical_w - DOTS_W && !on_crumb {
+                    if x < fence.search_left() - 4.0 && !on_crumb {
                         ((*engine).sink)(Event::Rolled {
                             id: fence.id.clone(),
                             rolled: !fence.rolled,
                         });
                     }
-                } else if let Some(index) = fence.tile_at(x, y) {
-                    if let Some(item) = fence.items.get(index) {
+                } else if let Some(position) = fence.tile_at(x, y) {
+                    if let Some(item) = fence.shown_item(position) {
                         if item.is_dir {
                             // 和网页版一致：文件夹在格子里进去，文件才交给系统打开。
                             ((*engine).sink)(Event::Navigate {
@@ -3037,9 +4109,21 @@ unsafe extern "system" fn fence_wndproc(
                         id: fence.id.clone(),
                         key: "name".to_string(),
                     }),
+                    MENU_LOCK => ((*engine).sink)(Event::Lock {
+                        id: fence.id.clone(),
+                        locked: !fence.locked,
+                    }),
                     MENU_SORT_MODIFIED => ((*engine).sink)(Event::Sort {
                         id: fence.id.clone(),
                         key: "modified".to_string(),
+                    }),
+                    MENU_SORT_SIZE => ((*engine).sink)(Event::Sort {
+                        id: fence.id.clone(),
+                        key: "size".to_string(),
+                    }),
+                    MENU_SORT_TYPE => ((*engine).sink)(Event::Sort {
+                        id: fence.id.clone(),
+                        key: "type".to_string(),
                     }),
                     MENU_HIDE => ((*engine).sink)(Event::Hide { id: fence.id.clone() }),
                     MENU_DELETE => ((*engine).sink)(Event::Delete { id: fence.id.clone() }),
@@ -3054,6 +4138,12 @@ unsafe extern "system" fn fence_wndproc(
                     fence.hover = fence.tile_at(x, y);
                     fence.nav_hot = if y < HEADER_H {
                         fence.nav_at(x)
+                    } else {
+                        None
+                    };
+                    fence.hot_action = fence.head_action_at(x, y);
+                    fence.head_hot = if y >= HEADER_H && y < HEADER_H + fence.head_row_h() {
+                        fence.head_key_at(x)
                     } else {
                         None
                     };
@@ -3125,32 +4215,44 @@ unsafe extern "system" fn fence_wndproc(
                 // 标题条上不弹菜单（和网页版一致）；空白处弹文件夹背景菜单。
                 if y >= HEADER_H && !fence.rolled {
                     let cursor = cursor_screen();
-                    let target = fence.tile_at(x, y);
-                    if let Some(index) = target {
-                        if fence.pick != Some(index) {
-                            fence.pick = Some(index);
+                    // 列表顶部的列名右键不弹文件菜单。
+                    if y < HEADER_H + fence.head_row_h() {
+                        return LRESULT(0);
+                    }
+                    let target = fence
+                        .tile_at(x, y)
+                        .and_then(|position| {
+                            fence
+                                .shown_item(position)
+                                .map(|item| (item.path.clone(), item.is_dir))
+                        });
+                    // 右键没点在选中的东西上：先把它选上；点在选中的一组上就
+                    // 对整组操作。
+                    if let Some((path, _)) = &target {
+                        if !fence.is_picked(path) {
+                            fence.select_only(path.clone());
                             let _ = fence.render(&(*engine).gpu);
                         }
                     }
                     // 菜单必须在窗口自己的线程上弹：TrackPopupMenuEx 要求调用
                     // 线程掌握鼠标捕获，换一条线程会立刻返回 0。菜单自己会跑
                     // 模态消息循环，滚轮钩子照常被回调，只是这一格暂时不重绘。
-                    if let Some(index) = target {
-                        let picked = fence
-                            .items
-                            .get(index)
-                            .map(|item| (item.path.clone(), item.is_dir));
-                        if let Some((path, is_dir)) = picked {
-                            if let Some(rename) = show_item_menu(hwnd, &path, cursor.x, cursor.y) {
-                                start_rename_item(
-                                    &(*engine).sink,
-                                    fence,
-                                    &rename,
-                                    is_dir,
-                                    cursor.x,
-                                    cursor.y,
-                                );
-                            }
+                    if let Some((path, is_dir)) = target {
+                        let mut paths = fence.picked_paths();
+                        if paths.is_empty() {
+                            paths.push(path);
+                        }
+                        let files: Vec<std::path::PathBuf> =
+                            paths.iter().map(std::path::PathBuf::from).collect();
+                        if let Some(rename) = show_item_menu(hwnd, &files, cursor.x, cursor.y) {
+                            start_rename_item(
+                                &(*engine).sink,
+                                fence,
+                                &rename,
+                                is_dir,
+                                cursor.x,
+                                cursor.y,
+                            );
                         }
                     } else if !fence.path.is_empty() {
                         show_background_menu(hwnd, &fence.path, cursor.x, cursor.y);
@@ -3181,6 +4283,18 @@ unsafe extern "system" fn fence_wndproc(
                     }
                     return LRESULT(0);
                 }
+                if fence.band.take().is_some() {
+                    let _ = ReleaseCapture();
+                    let _ = fence.render(&(*engine).gpu);
+                    return LRESULT(0);
+                }
+                // 按在已选中的一组上只是点了一下：收窄成这一项（和资源管理器一样）。
+                if let Some(path) = fence.collapse.take() {
+                    if fence.picked.len() > 1 {
+                        fence.select_only(path);
+                        let _ = fence.render(&(*engine).gpu);
+                    }
+                }
                 // 按着没拖起来的单击到此结束；真拖起来的已经交给主线程了。
                 fence.file_drag = None;
                 let _ = ReleaseCapture();
@@ -3203,6 +4317,17 @@ unsafe extern "system" fn fence_wndproc(
                                 _ => IDC_SIZENESW,
                             };
                             if let Ok(cursor) = LoadCursorW(None, name) {
+                                SetCursor(Some(cursor));
+                            }
+                            return LRESULT(1);
+                        }
+                        // 标题条上的按钮和列表列名都能点：手型光标。
+                        let clickable = fence.head_action_at(x, y).is_some()
+                            || (y >= HEADER_H
+                                && y < HEADER_H + fence.head_row_h()
+                                && fence.head_key_at(x).is_some());
+                        if clickable {
+                            if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
                                 SetCursor(Some(cursor));
                             }
                             return LRESULT(1);
@@ -3304,7 +4429,11 @@ unsafe extern "system" fn fence_wndproc(
             unsafe {
                 let was = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if was != 0 {
-                    let fence = Box::from_raw(was as *mut FenceWindow);
+                    let mut fence = Box::from_raw(was as *mut FenceWindow);
+                    // 搜索框是这一格的子弹层，格子没了它也得跟着走。
+                    if let Some(popup) = fence.search_popup.take() {
+                        let _ = DestroyWindow(popup);
+                    }
                     let id = fence.id.clone();
                     drop(fence);
                     let engine = &mut *engine;
@@ -3360,11 +4489,13 @@ fn register_classes() -> Result<()> {
             PCWSTR,
             unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
             bool,
-        ); 3] = [
+        ); 4] = [
             (w!("HexBenchNativeFence"), fence_wndproc, true),
             (w!("HexBenchNativeFenceNotify"), notify_wndproc, false),
             // 改名弹层：带边框的小窗口 + 系统 EDIT，输入法由控件自己处理。
             (w!("HexBenchNativeFenceRename"), rename_wndproc, false),
+            // 标题条搜索框：同一个做法，只是边打边筛。
+            (w!("HexBenchNativeFenceSearch"), search_wndproc, false),
         ];
         for (name, proc_, double_click) in classes {
             let mut class: WNDCLASSW = std::mem::zeroed();
@@ -3437,6 +4568,36 @@ fn make_layout(
     unsafe { dwrite.CreateTextLayout(&wide, format, width, height) }.ok()
 }
 
+/// 列表里的小字格式：`trailing` 是右对齐（时间 / 大小两列），否则左对齐（列名）。
+fn make_meta_format(
+    dwrite: &IDWriteFactory,
+    size: f32,
+    trailing: bool,
+) -> Option<IDWriteTextFormat> {
+    let format = unsafe {
+        dwrite.CreateTextFormat(
+            w!("Segoe UI Variable Text"),
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size,
+            w!("zh-CN"),
+        )
+    }
+    .ok()?;
+    unsafe {
+        let _ = format.SetTextAlignment(if trailing {
+            DWRITE_TEXT_ALIGNMENT_TRAILING
+        } else {
+            DWRITE_TEXT_ALIGNMENT_LEADING
+        });
+        let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    Some(format)
+}
+
 /// 布局实际画出来有多宽（带省略号之后），排版面包屑用。
 fn layout_width(layout: &IDWriteTextLayout) -> f32 {
     let mut metrics = DWRITE_TEXT_METRICS::default();
@@ -3445,6 +4606,77 @@ fn layout_width(layout: &IDWriteTextLayout) -> f32 {
         let _ = layout.GetMetrics(&mut metrics);
     }
     metrics.widthIncludingTrailingWhitespace
+}
+
+/// 本地时间相对 UTC 的偏移（秒）。时区在渲染层启动时取一次就够，
+/// 会话中途换时区 / 跨夏令时这种边缘情况不值得每次绘制都查一遍系统。
+fn local_offset_secs() -> i64 {
+    unsafe {
+        let mut zone = TIME_ZONE_INFORMATION::default();
+        // 1 = 标准时间，2 = 夏令时（windows crate 只导出了 ID_INVALID）。
+        let state = GetTimeZoneInformation(&mut zone);
+        let mut bias = zone.Bias;
+        if state == 2 {
+            bias += zone.DaylightBias;
+        } else if state == 1 {
+            bias += zone.StandardBias;
+        }
+        // `Bias` 按「UTC = 本地 + Bias」算，单位分钟；本地 = UTC - Bias。
+        -(bias as i64) * 60
+    }
+}
+
+fn this_year_local() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_secs() as i64)
+        .unwrap_or(0);
+    local_parts(secs, local_offset_secs()).0
+}
+
+/// Unix 秒 → 本地 (年, 月, 日, 时, 分)，纯算术（Howard Hinnant 的 civil_from_days）。
+fn local_parts(secs: i64, offset: i64) -> (i32, u32, u32, u32, u32) {
+    let local = secs + offset;
+    let days = local.div_euclid(86_400);
+    let rest = local.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (yoe + era * 400 + i64::from(month <= 2)) as i32;
+    (year, month, day, (rest / 3600) as u32, ((rest % 3600) / 60) as u32)
+}
+
+/// 列表里的修改时间：今年的只写「月-日 时:分」，往年的带上年份。
+fn format_time(secs: i64, offset: i64, this_year: i32) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    let (year, month, day, hour, minute) = local_parts(secs, offset);
+    if year == this_year {
+        format!("{month:02}-{day:02} {hour:02}:{minute:02}")
+    } else {
+        format!("{year}-{month:02}-{day:02}")
+    }
+}
+
+/// 列表里的大小：和资源管理器一样用 KB / MB / GB，只有超过 1 MB 才带小数。
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let value = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if value < KB * KB {
+        format!("{:.0} KB", value / KB)
+    } else if value < KB * KB * KB {
+        format!("{:.1} MB", value / (KB * KB))
+    } else {
+        format!("{:.1} GB", value / (KB * KB * KB))
+    }
 }
 
 fn rgb(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {

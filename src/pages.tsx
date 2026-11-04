@@ -7,6 +7,9 @@ import {
   FolderOpen,
   Inbox,
   LayoutGrid,
+  List,
+  Lock,
+  LockOpen,
   Plus,
   Rocket,
   SlidersHorizontal,
@@ -961,6 +964,8 @@ function HotkeyCapture({ onCapture }: { onCapture: (combo: string) => void }) {
       type="button"
       className="btn"
       onClick={() => setListening(true)}
+      // 点别处就去听别的控件了，别一直挂着「按下组合键…」。
+      onBlur={() => setListening(false)}
       aria-label="设置热键"
     >
       {listening ? "按下组合键…" : "设置"}
@@ -1437,6 +1442,26 @@ export function LauncherPage({
             />
           </Row>
 
+          <Row
+            label="跟着呼出面板走"
+            hint="开启后网页贴着呼出面板出现，面板移动时一起移动"
+          >
+            <Toggle
+              checked={config.launcher.siteFollowPanel ?? false}
+              onChange={(value) => update({ launcher: { siteFollowPanel: value } })}
+            />
+          </Row>
+
+          <Row
+            label="记住位置和大小"
+            hint="关掉则每次打开都按上面的宽度/高度重新摆"
+          >
+            <Toggle
+              checked={config.launcher.siteRememberPosition ?? true}
+              onChange={(value) => update({ launcher: { siteRememberPosition: value } })}
+            />
+          </Row>
+
           {(config.launcher.siteFollowPanel ?? false) ? null : (
             <Row label="固定在屏幕哪一侧">
               <Segmented
@@ -1721,6 +1746,9 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
   const save = (next: FenceRule[]) => {
     setDraft(next);
     setNote(null);
+    // 这份就是接下来会从 config 回来的内容：先记下，保存期间别的设置触发
+    // 刷新时就不会把用户正在敲的字换回旧的。
+    savedRef.current = JSON.stringify(next);
     void fenceUpdate(fence.id, { rules: next }).catch((problem) => setNote(String(problem)));
   };
 
@@ -2144,15 +2172,6 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
             onChange={(value) => update({ desktop: { snapGrid: value } })}
           />
         </Row>
-        <Row
-          label="原生渲染（Beta）"
-          hint="内存约为 WebView 版的十分之一；拖放、右键菜单、边角缩放、跟随桌面隐藏都已支持，还差 Alt+滚轮缩放；关掉即切回"
-        >
-          <Toggle
-            checked={desktop.native}
-            onChange={(value) => update({ desktop: { native: value } })}
-          />
-        </Row>
       </Card>
 
       <Card title="外观">
@@ -2236,12 +2255,37 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                         {fence.monitor || "主显示器"} ·{" "}
                         {`${Math.round(fence.w * 100)}% × ${Math.round(fence.h * 100)}%`}
                         {fence.zoom !== 100 ? ` · ${fence.zoom}% 排版` : ""}
+                        {fence.locked ? " · 位置已锁定" : ""}
                         {isBox && ruleCount > 0
                           ? ` · ${ruleCount} 条规则${fence.rulesAuto ? "（自动）" : "（手动）"}`
                           : ""}
                       </span>
                     </span>
                     <span className="fence-actions">
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title={fence.view === "list" ? "改成图标视图" : "改成列表视图"}
+                        onClick={() =>
+                          void fenceUpdate(fence.id, {
+                            view: fence.view === "list" ? "grid" : "list",
+                          }).catch((problem) => setError(String(problem)))
+                        }
+                      >
+                        {fence.view === "list" ? <LayoutGrid size={15} /> : <List size={15} />}
+                      </button>
+                      <button
+                        type="button"
+                        className={`icon-btn${fence.locked ? " active" : ""}`}
+                        title={fence.locked ? "解锁位置" : "锁定位置"}
+                        onClick={() =>
+                          void fenceUpdate(fence.id, { locked: !fence.locked }).catch((problem) =>
+                            setError(String(problem)),
+                          )
+                        }
+                      >
+                        {fence.locked ? <Lock size={15} /> : <LockOpen size={15} />}
+                      </button>
                       <EyeButton
                         hidden={!fence.visible}
                         onClick={() =>
@@ -2289,12 +2333,13 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
         )}
         <div className="row-hint" style={{ marginTop: 10 }}>
           桌面上：拖标题条移动，拖边缘 / 四角缩放，双击标题条卷起；右键文件用系统菜单；
-          双击文件夹进入，Alt+滚轮缩放排版。收纳盒里的文件拖出去也能放回桌面。
+          双击文件夹进入，Alt+滚轮缩放排版。标题条右侧的按钮切换列表 / 图标视图，
+          「⋯」菜单里可以锁定位置。收纳盒里的文件拖出去也能放回桌面。
         </div>
         {error && <div className="row-error">{error}</div>}
         {fences.length >= 8 && (
           <div className="row-hint" style={{ marginTop: 8 }}>
-            每多一个格子就多一个 WebView，最多 8 个。
+            最多 8 个格子。
           </div>
         )}
       </Card>

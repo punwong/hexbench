@@ -283,32 +283,17 @@ fn push_theme_to_windows(app: &AppHandle) {
             let _ = window.eval(&script);
         }
     }
-    // 桌面格子也是常驻窗口，跟着一起换主题。
-    let mut fences = 0;
-    for (label, window) in app.webview_windows() {
-        if label.starts_with("fence-") {
-            fences += 1;
-            let _ = window.eval(&script);
-        }
-    }
-    log::info!("theme: pushed {value} to launcher / web / {fences} fence(s)");
+    // 格子是原生窗口，主题进 `Frame`，由管理器按配置重推。
+    log::info!("theme: pushed {value} to launcher / web");
 }
 
 /// 手势设置和主题一样是常驻窗口的：设置页改完直接推给每个格子，
 /// 不用为了换开关去重开格子。面板走 `launcher-changed` 自己重读。
-fn push_gestures_to_windows(app: &AppHandle, settings: &hexbench_core::config::GestureSettings) {
-    let mut fences = 0;
-    for label in app.webview_windows().keys() {
-        if label.starts_with("fence-") {
-            fences += 1;
-            let _ = app.emit_to(label.as_str(), "gesture-settings", settings);
-        }
-    }
-    // 原生格子不是 WebView，直接投给渲染线程。
+fn push_gestures_to_windows(_app: &AppHandle, settings: &hexbench_core::config::GestureSettings) {
+    // 格子直接投给渲染线程。
     if let Some(host) = NATIVE_FENCES.lock().ok().and_then(|slot| slot.clone()) {
         host.set_gestures(settings.clone());
     }
-    log::info!("gestures: pushed to {fences} fence(s)");
 }
 
 #[tauri::command]
@@ -421,6 +406,30 @@ fn shortcut_matches(shortcut: &Shortcut, spec: &str) -> bool {
     Shortcut::from_str(spec)
         .map(|parsed| parsed == *shortcut)
         .unwrap_or(false)
+}
+
+/// 托盘「显示全部格子」：把配置里隐藏掉的格子一次性放回来。
+fn show_all_fences(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let changed = {
+        let mut shared = state.shared.lock().unwrap();
+        let mut changed = false;
+        for fence in shared.config.desktop.fences.iter_mut() {
+            if !fence.visible {
+                fence.visible = true;
+                changed = true;
+            }
+        }
+        changed
+    };
+    if !changed {
+        return;
+    }
+    let config = state.shared.lock().unwrap().config.clone();
+    if let Err(error) = config::save(&state.config_path, &config) {
+        log::warn!("tray: 显示全部格子保存失败: {error}");
+    }
+    apply_fence_windows(app);
 }
 
 /// Toggle the pause flag from outside the UI (tray, global shortcut).
@@ -1029,10 +1038,8 @@ fn hide_all_windows(app: &AppHandle) {
             let _ = window.hide();
         }
     }
-    for (label, window) in app.webview_windows() {
-        if label.starts_with("fence-") {
-            let _ = window.hide();
-        }
+    if let Some(host) = NATIVE_FENCES.lock().ok().and_then(|slot| slot.clone()) {
+        host.sync(Vec::new());
     }
 }
 
@@ -1228,15 +1235,25 @@ fn open_main_now(app: &AppHandle) {
         ),
         None => (980.0, 660.0),
     };
-    let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("HexBench")
-        .inner_size(width, height)
-        .min_inner_size(840.0, 560.0)
-        // The app draws its own title bar and window buttons.
-        .decorations(false)
-        .zoom_hotkeys_enabled(false)
-        .center()
-        .build();
+    if let Err(error) =
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("HexBench")
+            .inner_size(width, height)
+            .min_inner_size(840.0, 560.0)
+            // The app draws its own title bar and window buttons.
+            .decorations(false)
+            .zoom_hotkeys_enabled(false)
+            .center()
+            .build()
+    {
+        // 打不开设置窗口时不能只写日志：从托盘 / 热键点进来的用户会以为什么都没发生。
+        log::error!("main window: build failed: {error}");
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .message(format!("打不开设置窗口：{error}"))
+            .title("HexBench")
+            .show(|_| {});
+    }
 }
 
 /// 呼出面板：一个窗口装「分类侧栏 + 文件区」。
@@ -1338,7 +1355,12 @@ fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
                 if inside && !paths.is_empty() && !cancelled {
                     let _ = app.emit(
                         "launcher-dropped",
-                        serde_json::json!({ "x": client_x, "y": client_y, "paths": paths }),
+                        serde_json::json!({
+                            "x": client_x,
+                            "y": client_y,
+                            "paths": paths,
+                            "copy": hexbench_core::sys::ctrl_down(),
+                        }),
                     );
                 } else {
                     let _ = app.emit("launcher-drag-leave", ());
@@ -1428,7 +1450,7 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
                                     }
                                     let _ = app.emit("launcher-drag-leave", ());
                                 }
-                                DropEvent::Drop { paths, x, y, .. } => {
+                                DropEvent::Drop { paths, x, y, keys } => {
                                     let list: Vec<String> = paths
                                         .iter()
                                         .map(|path| path.to_string_lossy().to_string())
@@ -1436,7 +1458,13 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
                                     log::info!("launcher: dropped {} item(s)", list.len());
                                     let _ = app.emit(
                                         "launcher-dropped",
-                                        serde_json::json!({ "x": x, "y": y, "paths": list }),
+                                        serde_json::json!({
+                                            "x": x,
+                                            "y": y,
+                                            "paths": list,
+                                            // MK_CONTROL = 0x0008：按住 Ctrl 是复制。
+                                            "copy": keys & 0x0008 != 0,
+                                        }),
                                     );
                                 }
                             }
@@ -1750,6 +1778,11 @@ fn open_launcher(app: &AppHandle) {
     }
     if let Some(leftover) = app.get_window("launcher") {
         log::warn!("launcher: destroying leftover window before rebuild");
+        // 旧窗口的拖放登记要一起摘掉：句柄可能被新窗口复用，
+        // 留着会让新面板的「已登记」判断误以为已经挂过。
+        if let Ok(hwnd) = leftover.hwnd() {
+            hexbench_core::drop_target::detach(hwnd.0 as isize);
+        }
         let _ = leftover.destroy();
     }
     // Creating a WebView2 window re-enters the event loop: doing it on the UI
@@ -2224,8 +2257,16 @@ static WEB_PANEL_OPEN: AtomicBool = AtomicBool::new(false);
 static LAST_SITE_URL: Mutex<Option<String>> = Mutex::new(None);
 
 fn close_site_window(app: &AppHandle) {
+    // 现在的网页是挂在 `web` 窗口里的子 WebView，get_webview_window 找不到它；
+    // 旧的独立窗口还留着兜底。
+    if let Some(page) = app.get_webview(SITE_WEBVIEW) {
+        let _ = page.close();
+    }
     if let Some(window) = app.get_webview_window(SITE_WEBVIEW) {
         let _ = window.close();
+    }
+    if let Ok(mut last) = LAST_SITE_URL.lock() {
+        *last = None;
     }
 }
 
@@ -2478,16 +2519,19 @@ fn launcher_close_site(app: AppHandle) {
 
 #[tauri::command]
 fn launcher_site_nav(app: AppHandle, action: String) {
-    let Some(window) = app.get_webview_window(SITE_WEBVIEW) else {
-        return;
-    };
     let script = match action.as_str() {
         "back" => "history.back()",
         "forward" => "history.forward()",
         "reload" => "location.reload()",
         _ => return,
     };
-    let _ = window.eval(script);
+    if let Some(page) = app.get_webview(SITE_WEBVIEW) {
+        let _ = page.eval(script);
+        return;
+    }
+    if let Some(window) = app.get_webview_window(SITE_WEBVIEW) {
+        let _ = window.eval(script);
+    }
 }
 
 #[tauri::command]
@@ -3014,6 +3058,52 @@ fn launcher_move_into(dest: String, paths: Vec<String>, app: AppHandle) -> Resul
     let _ = app.emit("launcher-changed", ());
     Ok(moved)
 }
+/// 把文件复制进某个文件夹（按住 Ctrl 拖进来时用）。
+#[tauri::command(async)]
+fn launcher_copy_into(dest: String, paths: Vec<String>, app: AppHandle) -> Result<usize, String> {
+    let dir = PathBuf::from(&dest);
+    if !dir.is_dir() {
+        return Err("目标文件夹不存在".to_string());
+    }
+    let sources: Vec<PathBuf> = paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+    if sources.is_empty() {
+        log::warn!("launcher: nothing to copy, sources are gone: {paths:?}");
+        return Err("文件已经不在了".to_string());
+    }
+    let copied = hexbench_core::shell_ops::copy_into(&sources, &dir)?;
+    log::info!("launcher: copied {copied} item(s) into {}", dir.display());
+    let _ = app.emit("launcher-changed", ());
+    Ok(copied)
+}
+/// 删进回收站 / 撤销之后把键盘焦点抢回面板：系统处理回收站时会短暂抢走前台，
+/// 焦点没回来的话紧接着按 Ctrl+Z 就没反应。
+#[tauri::command]
+fn launcher_refocus(app: AppHandle) {
+    let Some(window) = app.get_webview_window("launcher") else {
+        return;
+    };
+    if !panel_visible(&window).unwrap_or(false) {
+        return;
+    }
+    // 回收站那一下是异步收尾的：立刻抢前台会被它随后再抢走，等一小会儿。
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(180));
+        let handle = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            if let Ok(hwnd) = handle.hwnd() {
+                let raw = hwnd.0 as isize;
+                hexbench_core::sys::force_foreground(raw);
+                // 光抢前台不够：系统操作会把键盘焦点留在顶层窗口上，页面
+                // 一个按键都收不到。还要把焦点交回 WebView2 子窗口。
+                hexbench_core::sys::focus_webview(raw);
+            }
+        });
+    });
+}
 /// 面板告诉后端「我现在在哪个目录」，拖进来的文件就放进这里。
 #[tauri::command]
 fn launcher_set_drop_target(path: Option<String>) {
@@ -3248,7 +3338,13 @@ fn launcher_create_dir(parent: String, name: String) -> Result<String, String> {
 #[tauri::command]
 fn launcher_new_folder(parent: String) -> Result<String, String> {
     let target = hexbench_core::sys::create_folder(std::path::Path::new(&parent), "新建文件夹")?;
-    push_undo(UndoOp::NewFolder(target.clone()));
+    let created = std::fs::metadata(&target)
+        .ok()
+        .and_then(|meta| meta.created().ok());
+    push_undo(UndoOp::NewFolder {
+        path: target.clone(),
+        created,
+    });
     Ok(target.to_string_lossy().to_string())
 }
 /// 某个分类（也就是某个子文件夹）里的条目。
@@ -3557,8 +3653,11 @@ enum UndoOp {
     Rename { path: PathBuf, previous: PathBuf },
     /// 移动：（新路径, 旧路径）成对
     Move(Vec<(PathBuf, PathBuf)>),
-    /// 新建文件夹
-    NewFolder(PathBuf),
+    /// 新建文件夹：（路径, 建的时候的创建时间，用来确认撤销时还是同一个）
+    NewFolder {
+        path: PathBuf,
+        created: Option<std::time::SystemTime>,
+    },
 }
 
 static UNDO_STACK: Mutex<Vec<UndoOp>> = Mutex::new(Vec::new());
@@ -3596,6 +3695,14 @@ fn launcher_undo(app: AppHandle) -> Result<String, String> {
             format!("已从回收站还原 {restored} 个文件")
         }
         UndoOp::Rename { path, previous } => {
+            // Windows 的 rename 会直接覆盖目标：先确认改过名的那个还在、
+            // 原来的位置已经腾出来了。否则可能把用户后来新建的同名文件盖掉。
+            if !path.exists() {
+                return Err("改过名的文件已经不在了".to_string());
+            }
+            if previous.exists() {
+                return Err(format!("{} 已经有同名文件了", previous.display()));
+            }
             std::fs::rename(&path, &previous).map_err(|error| error.to_string())?;
             format!("已还原名称：{}", previous.display())
         }
@@ -3615,7 +3722,25 @@ fn launcher_undo(app: AppHandle) -> Result<String, String> {
             }
             format!("已移回 {moved} 个文件")
         }
-        UndoOp::NewFolder(path) => {
+        UndoOp::NewFolder { path, created } => {
+            let meta = std::fs::metadata(&path)
+                .map_err(|_| "刚新建的文件夹已经不在了".to_string())?;
+            if !meta.is_dir() {
+                return Err("这个位置已经不是文件夹了".to_string());
+            }
+            // 同名文件夹可能已经被删掉又建了一个：创建时间对不上就别动它。
+            if let (Some(before), Ok(now)) = (created, meta.created()) {
+                if before != now {
+                    return Err("这个位置现在换成了另一个文件夹".to_string());
+                }
+            }
+            // 建完之后又往里面放了东西：撤销新建不该顺带把内容也删掉。
+            let empty = std::fs::read_dir(&path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                return Err("文件夹里已经有东西了，确认后再手动删除".to_string());
+            }
             hexbench_core::shell_ops::trash(&[path]).map_err(|error| error.to_string())?;
             "已删除刚新建的文件夹".to_string()
         }
@@ -4146,10 +4271,10 @@ fn spawn_launcher_watcher(app: AppHandle) {
             if wanted != current {
                 session = None;
                 let (sender, rx) = std::sync::mpsc::channel();
+                let mut watched = 0usize;
                 if let Ok(mut created) = notify::recommended_watcher(move |event| {
                     let _ = sender.send(event);
                 }) {
-                    let mut watched = 0usize;
                     for directory in &wanted {
                         if directory.is_dir()
                             && created.watch(directory, RecursiveMode::NonRecursive).is_ok()
@@ -4162,7 +4287,11 @@ fn spawn_launcher_watcher(app: AppHandle) {
                         session = Some((created, rx));
                     }
                 }
-                current = wanted;
+                // 一个都没挂上（磁盘 / 网络盘暂时不在）就不要记成「已监视」：
+                // 留到下一轮再试，盘回来之后才能自动刷新。
+                if watched > 0 || wanted.is_empty() {
+                    current = wanted;
+                }
             }
 
             match session.as_ref() {
@@ -4257,20 +4386,12 @@ fn dismiss_launcher(app: AppHandle) {
 /// 最小尺寸（逻辑像素）。
 const FENCE_MIN_W_LOGICAL: f64 = 240.0;
 const FENCE_MIN_H_LOGICAL: f64 = 160.0;
-/// 卷起后只剩标题条（逻辑像素，和 fence.tsx 的标题条高度一致）。
-const FENCE_HEADER_LOGICAL: f64 = 40.0;
-/// 每格一个 WebView2，软上限。
+/// 格子数量软上限。
 const FENCE_MAX: usize = 8;
 
 static FENCE_SEQ: AtomicU64 = AtomicU64::new(1);
 /// 命令改完配置后踢一下管理器，不用等下一轮 1s 轮询。
 static FENCE_WAKE: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
-/// 磨砂材质上没上（`sys::acrylic`）；页面据此决定卡片用半透明还是纯色。
-static FENCE_ACRYLIC: AtomicBool = AtomicBool::new(false);
-
-fn fence_label(id: &str) -> String {
-    format!("fence-{id}")
-}
 
 /// 收纳盒的幕后目录放在「文档」下：用户看得见、能备份，清理软件也不会
 /// 当成缓存删掉（放 %LOCALAPPDATA% 里迟早会丢用户文件）。
@@ -4379,108 +4500,11 @@ fn fence_expanded_rect(fence: &FenceSettings) -> Rect {
     Rect::new(left, top, left + width, top + height)
 }
 
-/// 摆位置 + 锚回桌面层。卷起时只给标题条那么高（宽度保留）。
-fn fence_apply_geometry(window: &tauri::WebviewWindow, fence: &FenceSettings) {
-    let Ok(hwnd) = window.hwnd() else { return };
-    let hwnd = hwnd.0 as isize;
-    let expanded = fence_expanded_rect(fence);
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let height = if fence.rolled {
-        (FENCE_HEADER_LOGICAL * scale).round() as i32
-    } else {
-        expanded.height()
-    };
-    let target = Rect::new(expanded.left, expanded.top, expanded.right, expanded.top + height);
-    // 松手时位置是从归一化比例换算回来的，可能和窗口现在的位置差一两个像素。
-    // 为了这 1px 再挪一次，拖完就会看见卡片「抖一下」——够近就别动。
-    if let Some(current) = hexbench_core::sys::window_rect(hwnd) {
-        let close = |a: i32, b: i32| (a - b).abs() <= 2;
-        if close(current.left, target.left)
-            && close(current.top, target.top)
-            && close(current.width(), target.width())
-            && close(current.height(), target.height())
-        {
-            return;
-        }
-    }
-    hexbench_core::sys::set_window_rect(hwnd, target);
-    hexbench_core::sys::anchor_above_desktop(hwnd);
-}
-
-fn emit_fence_drop(app: &AppHandle, label: &str, event: hexbench_core::drop_target::DropEvent) {
-    use hexbench_core::drop_target::DropEvent;
-    let paths = |paths: Vec<PathBuf>| -> Vec<String> {
-        paths
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect()
-    };
-    match event {
-        DropEvent::Enter {
-            paths: dropped,
-            x,
-            y,
-            ..
-        } => {
-            log::info!(
-                "fence {label}: drag entered with {} item(s)",
-                dropped.len()
-            );
-            let _ = app.emit_to(
-                label,
-                "fence-drag-over",
-                serde_json::json!({ "x": x, "y": y, "paths": paths(dropped) }),
-            );
-        }
-        DropEvent::Over { x, y, .. } => {
-            let _ = app.emit_to(
-                label,
-                "fence-drag-over",
-                serde_json::json!({ "x": x, "y": y }),
-            );
-        }
-        DropEvent::Leave => {
-            log::info!("fence {label}: drag left");
-            let _ = app.emit_to(label, "fence-drag-leave", ());
-        }
-        DropEvent::Drop {
-            paths: dropped,
-            x,
-            y,
-            ..
-        } => {
-            log::info!("fence {label}: dropped {} item(s)", dropped.len());
-            let _ = app.emit_to(
-                label,
-                "fence-dropped",
-                serde_json::json!({ "x": x, "y": y, "paths": paths(dropped) }),
-            );
-        }
-    }
-}
-
-/// 按设置给窗口上 / 撤磨砂材质。返回材质现在是不是真的在。
-///
-/// 关掉磨砂不是「把模糊调小」——DWM 的亚克力没有强度可调，只有有和没有；
-/// 关掉就是纯玻璃：壁纸原样从卡片底下透出来，模糊程度只受不透明度影响。
-fn fence_apply_backdrop(hwnd: isize, frosted: bool) -> bool {
-    if !frosted {
-        hexbench_core::sys::clear_acrylic(hwnd);
-        return false;
-    }
-    let on = hexbench_core::sys::acrylic(hwnd);
-    if !on {
-        log::info!("fence: acrylic unavailable, card falls back to a solid fill");
-    }
-    on
-}
-
-// ---------- 原生格子（Beta） ----------
+// ---------- 格子 ----------
 //
 // 渲染层在 `hexbench-fence`：一条自己的消息循环线程 + 一份 D3D11/D2D/DComp
-// 设备。这里只负责把「和 WebView 页面看到的一样」的数据整理成 `Frame`：
-// 目录枚举复用 `for_each_item`，排序按设置，图标走 `hexbench_core::icons`
-// 的同一份磁盘缓存。两层之间没有第二套配置或文件逻辑。
+// 设备。这里只负责把数据整理成 `Frame`：目录枚举复用 `for_each_item`，
+// 排序按设置，图标走 `hexbench_core::icons` 的同一份磁盘缓存。
 
 /// 当前活着的原生宿主。只有管理器线程会建 / 拆；watcher 线程只读克隆。
 static NATIVE_FENCES: Mutex<Option<Arc<hexbench_fence::NativeFences>>> = Mutex::new(None);
@@ -4495,16 +4519,6 @@ struct NativeNav {
     index: usize,
 }
 static NATIVE_NAV: Mutex<Vec<NativeNav>> = Mutex::new(Vec::new());
-
-/// 灰度开关：设置里的 Beta 项。`HEXBENCH_FENCE_NATIVE=1/0` 可以临时覆盖，
-/// 自动化测试用它在不改用户配置的情况下把 4 个真实格子切到原生。
-fn native_fences_enabled(desktop: &DesktopSettings) -> bool {
-    match std::env::var("HEXBENCH_FENCE_NATIVE").ok().as_deref() {
-        Some("1") | Some("true") | Some("on") => true,
-        Some("0") | Some("false") | Some("off") => false,
-        _ => desktop.native,
-    }
-}
 
 /// 「跟系统」时读注册表；AppsUseLightTheme = 0 表示深色。
 fn system_uses_dark_theme() -> bool {
@@ -4552,6 +4566,17 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
                     fence.sort_dir = 1;
                 }
             });
+        }
+        hexbench_fence::Event::Lock { id, locked } => {
+            native_edit_fence(&handle, &id, |fence| fence.locked = locked);
+        }
+        hexbench_fence::Event::View { id, view } => {
+            let view = if view == hexbench_core::config::FENCE_VIEW_LIST {
+                hexbench_core::config::FENCE_VIEW_LIST
+            } else {
+                hexbench_core::config::FENCE_VIEW_GRID
+            };
+            native_edit_fence(&handle, &id, |fence| fence.view = view.to_string());
         }
         hexbench_fence::Event::Rename { id, title } => {
             let title = title.trim().to_string();
@@ -4628,7 +4653,12 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             native_toast(&handle, &id, text);
             native_refresh(&handle, &id);
         }
-        hexbench_fence::Event::Drop { id, dest, paths } => {
+        hexbench_fence::Event::Drop {
+            id,
+            dest,
+            paths,
+            copy,
+        } => {
             // 和网页格子拖进去是同一条路：撞名自动编号、记撤销、广播刷新。
             if dest.trim().is_empty() || paths.is_empty() {
                 return;
@@ -4638,38 +4668,53 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             let dest_dir = Path::new(&dest)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&dest));
-            if paths.iter().all(|path| {
-                Path::new(path)
-                    .parent()
-                    .map(|parent| {
-                        parent
-                            .canonicalize()
-                            .unwrap_or_else(|_| parent.to_path_buf())
-                            == dest_dir
-                    })
-                    .unwrap_or(false)
-            }) {
+            if !copy
+                && paths.iter().all(|path| {
+                    Path::new(path)
+                        .parent()
+                        .map(|parent| {
+                            parent
+                                .canonicalize()
+                                .unwrap_or_else(|_| parent.to_path_buf())
+                                == dest_dir
+                        })
+                        .unwrap_or(false)
+                })
+            {
                 return;
             }
-            match launcher_move_into(dest, paths, handle.clone()) {
-                Ok(count) => {
-                    log::info!("native fence {id}: 拖入 {count} 项");
-                    native_toast(
-                        &handle,
-                        &id,
-                        if count > 0 {
-                            format!("已移入 {count} 项")
-                        } else {
-                            "没有移动".to_string()
-                        },
-                    );
+            // 这里还在 OLE 的 Drop 回调里（渲染线程）：Shell 操作和整格重读
+            // 都可能要几百毫秒，同步做会把所有格子卡住、也拖着资源管理器的
+            // 拖拽不放。放到工作线程，回调立刻返回。
+            let worker = handle.clone();
+            let fence_id = id.clone();
+            thread::spawn(move || {
+                let result = if copy {
+                    launcher_copy_into(dest, paths, worker.clone())
+                } else {
+                    launcher_move_into(dest, paths, worker.clone())
+                };
+                match result {
+                    Ok(count) => {
+                        log::info!("native fence {fence_id}: 拖入 {count} 项 copy={copy}");
+                        native_toast(
+                            &worker,
+                            &fence_id,
+                            match (count, copy) {
+                                (0, true) => "没有复制".to_string(),
+                                (0, false) => "没有移动".to_string(),
+                                (count, true) => format!("已复制 {count} 项"),
+                                (count, false) => format!("已移入 {count} 项"),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!("native fence {fence_id}: 拖入失败: {error}");
+                        native_toast(&worker, &fence_id, error);
+                    }
                 }
-                Err(error) => {
-                    log::warn!("native fence {id}: 拖入失败: {error}");
-                    native_toast(&handle, &id, error);
-                }
-            }
-            native_refresh(&handle, &id);
+                native_refresh(&worker, &fence_id);
+            });
         }
     });
     match hexbench_fence::NativeFences::start(sink) {
@@ -4966,6 +5011,8 @@ fn native_items(dir: &Path, sort_key: &str, sort_dir: i32) -> Vec<hexbench_fence
             // `D:/xxx`，混着的路径会让右键菜单直接 E_INVALIDARG。
             path: item.path.replace('/', "\\"),
             is_dir: item.is_dir,
+            modified: item.modified,
+            size: if item.is_dir { 0 } else { item.size },
         })
         .collect()
 }
@@ -5051,6 +5098,7 @@ fn native_frame(
     let dir = native_nav_dir(fence);
     let (back_count, forward_count) = native_history_counts(fence);
     native_watch_dir(&fence.id, &dir, &root);
+    let crumbs = native_crumbs(&root, &dir);
     hexbench_fence::Frame {
         id: fence.id.clone(),
         generation,
@@ -5061,7 +5109,7 @@ fn native_frame(
         },
         path: dir.clone(),
         root: root.clone(),
-        crumbs: native_crumbs(&root, &dir),
+        crumbs,
         rect: [
             expanded.left,
             expanded.top,
@@ -5071,6 +5119,7 @@ fn native_frame(
         rolled: fence.rolled,
         zoom: fence.zoom,
         opacity: desktop.opacity,
+        frosted: desktop.frosted,
         dark: ui_uses_dark_theme(app),
         items: native_items(Path::new(&dir), &fence.sort_key, fence.sort_dir),
         back_count,
@@ -5079,6 +5128,8 @@ fn native_frame(
         rule_count: fence.rules.len(),
         sort_key: fence.sort_key.clone(),
         sort_dir: fence.sort_dir,
+        locked: fence.locked,
+        list: fence.is_list(),
     }
 }
 
@@ -5170,128 +5221,7 @@ fn native_refresh(app: &AppHandle, id: &str) {
     }
 }
 
-fn close_webview_fences(app: &AppHandle) {
-    for (label, window) in app.webview_windows() {
-        if !label.starts_with("fence-") {
-            continue;
-        }
-        if let Ok(hwnd) = window.hwnd() {
-            let raw = hwnd.0 as isize;
-            let _ = app.run_on_main_thread(move || {
-                hexbench_core::drop_target::detach(raw);
-            });
-        }
-        log::info!("fence {label}: closing (native mode)");
-        let _ = window.destroy();
-    }
-}
-
-fn build_fence(app: &AppHandle, fence: &FenceSettings) -> Option<tauri::WebviewWindow> {
-    let label = fence_label(&fence.id);
-    if let Some(window) = app.get_webview_window(&label) {
-        return Some(window);
-    }
-    // 收纳盒的幕后目录被用户删掉了：建回来，别让格子变成一个空报错页。
-    if fence.is_bucket() && !PathBuf::from(&fence.path).is_dir() {
-        let _ = std::fs::create_dir_all(&fence.path);
-    }
-    // 在哪个线程建窗，就得在那个线程初始化 OLE 并挂拖放目标。
-    hexbench_core::sys::init_ole();
-    let url = format!("fence.html?id={}", fence.id);
-    let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
-        .title(&fence.title)
-        .inner_size(480.0, 400.0)
-        // 卷起时只有标题条那么高，系统的最小尺寸不能拦着（真正的下限在
-        // 移动 / 缩放线程里按逻辑像素卡）。
-        .min_inner_size(120.0, 30.0)
-        .decorations(false)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .shadow(false)
-        // 磨砂材质要靠透明窗口才看得见（材质由 DWM 画在窗口后面，页面用半透明色
-        // 透出来）。透明窗口 + 程序化改尺寸出过黑边（issue #13906 / PR #16192），
-        // 缩放 / 卷起时的表现要实测。
-        .transparent(true)
-        .always_on_top(false)
-        .skip_taskbar(true)
-        .focused(false)
-        .visible(false)
-        .zoom_hotkeys_enabled(false)
-        .build();
-    let window = match built {
-        Ok(window) => window,
-        Err(error) => {
-            log::warn!("fence {label}: build failed: {error}");
-            return None;
-        }
-    };
-    if let Ok(hwnd) = window.hwnd() {
-        let hwnd = hwnd.0 as isize;
-        hexbench_core::sys::round_window_corners(hwnd);
-        // 窗口是按透明建的：WebView 的白底也得拿掉，页面的半透明色才能透出
-        // 背后的壁纸（磨砂时是材质，关掉磨砂时就是壁纸本身）。
-        if let Err(error) = window
-            .as_ref()
-            .set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)))
-        {
-            log::warn!("fence {label}: transparent webview failed: {error}");
-        }
-        let frosted = desktop_snapshot(app).frosted;
-        FENCE_ACRYLIC.store(fence_apply_backdrop(hwnd, frosted), Ordering::Relaxed);
-        hexbench_core::sys::set_no_activate(hwnd, true);
-        let app_handle = app.clone();
-        let target = label.clone();
-        // OLE 的拖放回调只发到「注册目标的那条线程」，而那条线程必须有消息循环。格子窗口
-        // 属于主线程，这里却站在建窗的 worker 线程上；直接注册的话，从桌面拖文件进来时
-        // 资源管理器的 DragEnter 会一直等一条从不泵消息的线程——表现就是鼠标拖着文件
-        // 悬在收纳盒上，整个拖拽卡死。所以注册和稍后的补挂都排到主线程去做。
-        let install_label = label.clone();
-        let queue_label = label.clone();
-        if let Err(error) = app.run_on_main_thread(move || {
-            if let Err(error) = hexbench_core::drop_target::attach(
-                hwnd,
-                Box::new(move |event| {
-                    emit_fence_drop(&app_handle, &target, event);
-                    None
-                }),
-            ) {
-                log::warn!("fence {install_label}: drop target failed: {error}");
-            }
-        }) {
-            log::warn!("fence {queue_label}: could not queue the drop target: {error}");
-        }
-        // WebView2 的子窗口晚一步才出来，稍后把新出现的子窗口也挂上。
-        let late = app.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1200));
-            let _ = late.run_on_main_thread(move || {
-                if let Err(error) = hexbench_core::drop_target::attach_more(hwnd) {
-                    log::warn!("fence: attach_more failed: {error}");
-                }
-            });
-        });
-    }
-    fence_apply_geometry(&window, fence);
-    // 等 WebView2 第一帧再显示，否则会先闪一个白框。
-    let shown = window.clone();
-    let settings = fence.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(350));
-        let _ = shown.show();
-        if let Ok(hwnd) = shown.hwnd() {
-            let hwnd = hwnd.0 as isize;
-            // show() 之后 Tauri 会重新套一遍窗口样式，NOACTIVATE 要补回去。
-            hexbench_core::sys::set_no_activate(hwnd, true);
-            hexbench_core::sys::anchor_above_desktop(hwnd);
-        }
-        fence_apply_geometry(&shown, &settings);
-    });
-    log::info!("fence {label}: built");
-    Some(window)
-}
-
-/// 让实际窗口和配置对上：开关关了 / 隐藏 / 删除的销毁，其余的补建或重新摆放。
+/// 让实际窗口和配置对上：开关关了 / 隐藏 / 删除的收起，其余的原样留着。
 fn apply_fence_windows(app: &AppHandle) {
     let desktop = desktop_snapshot(app);
     let desired: Vec<FenceSettings> = if desktop.enabled {
@@ -5304,71 +5234,23 @@ fn apply_fence_windows(app: &AppHandle) {
     } else {
         Vec::new()
     };
-    let wanted: std::collections::HashSet<String> =
-        desired.iter().map(|fence| fence.id.clone()).collect();
-
-    // Beta：所有可见格子交给原生渲染层。启动失败就静默走回 WebView，
-    // 用户看到的仍是能用的格子，而不是空桌面。
-    if native_fences_enabled(&desktop) {
-        if let Some(host) = native_host(app) {
-            close_webview_fences(app);
-            native_sync(app, &desktop, &desired, &host);
-            // 建窗时用默认值，这里补上用户当前的手势设置。
-            host.set_gestures(
-                app.state::<AppState>()
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .config
-                    .launcher
-                    .gestures
-                    .clone(),
-            );
-            return;
-        }
-        log::warn!("fence: 原生渲染不可用，本次按 WebView 处理");
-    } else {
-        native_shutdown();
-    }
-
-    for (label, window) in app.webview_windows() {
-        let Some(id) = label.strip_prefix("fence-") else {
-            continue;
-        };
-        if wanted.contains(id) {
-            continue;
-        }
-        if let Ok(hwnd) = window.hwnd() {
-            // 登记（和撤销登记）都要在窗口所属、且泵消息的主线程上做。
-            let raw = hwnd.0 as isize;
-            let _ = app.run_on_main_thread(move || {
-                hexbench_core::drop_target::detach(raw);
-            });
-        }
-        log::info!("fence {label}: closing");
-        let _ = window.destroy();
-    }
-
-    for fence in desired {
-        let label = fence_label(&fence.id);
-        match app.get_webview_window(&label) {
-            Some(window) => {
-                let _ = window.set_title(&fence.title);
-                fence_apply_geometry(&window, &fence);
-                if !window.is_visible().unwrap_or(false) {
-                    let _ = window.show();
-                    if let Ok(hwnd) = window.hwnd() {
-                        let hwnd = hwnd.0 as isize;
-                        hexbench_core::sys::set_no_activate(hwnd, true);
-                        hexbench_core::sys::anchor_above_desktop(hwnd);
-                    }
-                }
-            }
-            None => {
-                build_fence(app, &fence);
-            }
-        }
-    }
+    // 原生宿主起不来（没有 D3D11 / 合成器）时桌面只能空着，日志里说清楚。
+    let Some(host) = native_host(app) else {
+        log::warn!("fence: 原生渲染不可用");
+        return;
+    };
+    native_sync(app, &desktop, &desired, &host);
+    // 建窗时用默认值，这里补上用户当前的手势设置。
+    host.set_gestures(
+        app.state::<AppState>()
+            .shared
+            .lock()
+            .unwrap()
+            .config
+            .launcher
+            .gestures
+            .clone(),
+    );
 }
 
 /// 管理器关心的变化：开关、增删、显隐、卷起、几何。内容（标题 / 路径 / 排序）
@@ -5376,16 +5258,15 @@ fn apply_fence_windows(app: &AppHandle) {
 /// 所以把会影响画面的项也放进签名，变了就重新推一帧。
 fn fence_signature(app: &AppHandle, desktop: &DesktopSettings) -> String {
     let mut signature = format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}",
         if desktop.enabled { '1' } else { '0' },
-        if native_fences_enabled(desktop) { 'N' } else { 'W' },
         desktop.opacity,
         desktop.frosted,
         if ui_uses_dark_theme(app) { 'D' } else { 'L' }
     );
     for fence in &desktop.fences {
         signature.push_str(&format!(
-            "|{}:{}:{}:{}:{}:{:.5}:{:.5}:{:.5}:{:.5}:{}:{}:{}",
+            "|{}:{}:{}:{}:{}:{:.5}:{:.5}:{:.5}:{:.5}:{}:{}:{}:{}:{}",
             fence.id,
             fence.visible,
             fence.rolled,
@@ -5397,7 +5278,9 @@ fn fence_signature(app: &AppHandle, desktop: &DesktopSettings) -> String {
             fence.h,
             fence.zoom,
             fence.sort_key,
-            fence.sort_dir
+            fence.sort_dir,
+            if fence.locked { 'L' } else { '-' },
+            fence.view
         ));
     }
     signature
@@ -5415,25 +5298,12 @@ fn describe_foreground() -> String {
     }
 }
 
-fn fence_watchdog(app: &AppHandle, desktop: &DesktopSettings, show_desktop: &mut bool) {
-    let hwnds: Vec<isize> = if native_fences_enabled(desktop) {
-        NATIVE_FENCES
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|host| host.hwnds()))
-            .unwrap_or_default()
-    } else {
-        desktop
-            .fences
-            .iter()
-            .filter(|fence| fence.visible)
-            .filter_map(|fence| {
-                app.get_webview_window(&fence_label(&fence.id))
-                    .and_then(|window| window.hwnd().ok())
-                    .map(|hwnd| hwnd.0 as isize)
-            })
-            .collect()
-    };
+fn fence_watchdog(_app: &AppHandle, desktop: &DesktopSettings, show_desktop: &mut bool) {
+    let hwnds: Vec<isize> = NATIVE_FENCES
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|host| host.hwnds()))
+        .unwrap_or_default();
 
     // Win+D / 「显示桌面」不是把窗口最小化，而是资源管理器把桌面窗口
     // （24H2 之后的 `Progman`，更早的 `WorkerW`）抬到所有窗口上面并拿走
@@ -5780,7 +5650,7 @@ struct FenceSnap {
 
 fn fence_snap_setup(app: &AppHandle, id: &str, start: Rect, scale: f64) -> FenceSnap {
     let desktop = desktop_snapshot(app);
-    // 其他格子现在在哪：原生格子和网页格子各查各的，参考线才能跨过去。
+    // 其他格子现在在哪：参考线要能跨过所有格子。
     let native: std::collections::HashMap<String, isize> = NATIVE_FENCES
         .lock()
         .ok()
@@ -5797,12 +5667,7 @@ fn fence_snap_setup(app: &AppHandle, id: &str, start: Rect, scale: f64) -> Fence
     {
         let rect = native
             .get(&fence.id)
-            .and_then(|hwnd| hexbench_core::sys::window_rect(*hwnd))
-            .or_else(|| {
-                app.get_webview_window(&fence_label(&fence.id))
-                    .and_then(|window| window.hwnd().ok())
-                    .and_then(|hwnd| hexbench_core::sys::window_rect(hwnd.0 as isize))
-            });
+            .and_then(|hwnd| hexbench_core::sys::window_rect(*hwnd));
         if let Some(rect) = rect {
             others.push(rect);
         }
@@ -5876,73 +5741,6 @@ fn fence_persist_rect(app: &AppHandle, id: &str, rect: Rect) {
     if let Err(error) = config::save(&state.config_path, &config) {
         log::warn!("fence {id}: geometry save failed: {error}");
     }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FenceStateDto {
-    fence: FenceSettings,
-    /// 展开状态的物理外框：`[x, y, w, h]`。
-    rect: [i32; 4],
-    scale: f64,
-    /// 和快捷面板共用的右键手势设置：打开时的值，之后由 `gesture-settings` 推送更新。
-    gestures: hexbench_core::config::GestureSettings,
-}
-
-/// 诊断用：格子窗口现在到底在哪儿、加载了没有。改不出东西时先看这个。
-#[tauri::command]
-fn fence_debug(id: String, app: AppHandle) -> serde_json::Value {
-    let label = fence_label(&id);
-    match app.get_webview_window(&label) {
-        Some(window) => serde_json::json!({
-            "label": label,
-            "url": window.url().map(|url| url.to_string()).ok(),
-            "title": window.title().ok(),
-            "visible": window.is_visible().ok(),
-            "size": window.inner_size().ok().map(|size| [size.width, size.height]),
-            "scale": window.scale_factor().ok(),
-            "rect": window
-                .hwnd()
-                .ok()
-                .and_then(|hwnd| hexbench_core::sys::window_rect(hwnd.0 as isize))
-                .map(|rect| [rect.left, rect.top, rect.width(), rect.height()]),
-            // 锚定是否正确：桌面宿主在格子上面就是错的。
-            "behind_desktop": window
-                .hwnd()
-                .ok()
-                .map(|hwnd| hexbench_core::sys::behind_desktop(hwnd.0 as isize)),
-            "host": hexbench_core::sys::shell_icon_host(),
-        }),
-        None => serde_json::json!({ "label": label, "missing": true }),
-    }
-}
-
-#[tauri::command]
-fn fence_state(id: String, app: AppHandle) -> Option<FenceStateDto> {
-    let fence = desktop_snapshot(&app)
-        .fences
-        .into_iter()
-        .find(|fence| fence.id == id)?;
-    let rect = fence_expanded_rect(&fence);
-    let scale = app
-        .get_webview_window(&fence_label(&id))
-        .and_then(|window| window.scale_factor().ok())
-        .unwrap_or(1.0);
-    let gestures = app
-        .state::<AppState>()
-        .shared
-        .lock()
-        .unwrap()
-        .config
-        .launcher
-        .gestures
-        .clone();
-    Some(FenceStateDto {
-        fence,
-        rect: [rect.left, rect.top, rect.width(), rect.height()],
-        scale,
-        gestures,
-    })
 }
 
 /// 新格子的 id。`now_millis` 撞上（同一毫秒建两个）就再补一个序号。
@@ -6357,16 +6155,6 @@ fn run_rule_box(app: &AppHandle, id: &str) -> RuleRunDto {
     }
     if moved > 0 {
         log::info!("fence {id}: rules collected {moved} item(s)");
-        let _ = app.emit_to(
-            fence_label(id),
-            "fence-rules",
-            serde_json::json!({ "moved": moved }),
-        );
-        let _ = app.emit_to(
-            fence_label(id),
-            "fence-changed",
-            serde_json::json!({ "path": fence.path }),
-        );
     }
     RuleRunDto { matched, moved }
 }
@@ -6483,34 +6271,7 @@ fn fence_set_enabled(enabled: bool, app: AppHandle) -> Result<(), String> {
     save_fence_config(&app)
 }
 
-/// 格子的外观设置，外加磨砂材质现在有没有真的上来（老系统上没材质，
-/// 页面据此不再留透明，免得卡片后面是 WebView 的白底）。
-#[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-struct FenceAppearanceDto {
-    opacity: u32,
-    frosted: bool,
-    backdrop: bool,
-}
-
-impl FenceAppearanceDto {
-    fn now(app: &AppHandle) -> Self {
-        let desktop = desktop_snapshot(app);
-        Self {
-            opacity: desktop.opacity,
-            frosted: desktop.frosted,
-            backdrop: FENCE_ACRYLIC.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[tauri::command]
-fn fence_appearance(app: AppHandle) -> FenceAppearanceDto {
-    FenceAppearanceDto::now(&app)
-}
-
-/// 设置页里的两个滑块 / 开关：改完立刻落到所有格子上（材质换掉 + 通知页面换色），
-/// 不等重启。
+/// 设置页里的两个滑块 / 开关：写进配置后由管理器重推一帧，不等重启。
 #[tauri::command]
 fn fence_set_appearance(opacity: u32, frosted: bool, app: AppHandle) -> Result<(), String> {
     {
@@ -6519,32 +6280,6 @@ fn fence_set_appearance(opacity: u32, frosted: bool, app: AppHandle) -> Result<(
         shared.config.desktop.opacity = opacity;
         shared.config.desktop.frosted = frosted;
         shared.config.desktop.clamp_opacity();
-    }
-    let desktop = desktop_snapshot(&app);
-    let mut windows = 0;
-    let mut backdrop = false;
-    for (label, window) in app.webview_windows() {
-        if !label.starts_with("fence-") {
-            continue;
-        }
-        windows += 1;
-        let applied = window
-            .hwnd()
-            .map(|hwnd| fence_apply_backdrop(hwnd.0 as isize, desktop.frosted))
-            .unwrap_or(false);
-        backdrop |= applied;
-        let _ = window.emit(
-            "fence-appearance",
-            serde_json::json!({
-                "opacity": desktop.opacity,
-                "frosted": desktop.frosted,
-                "backdrop": applied,
-            }),
-        );
-    }
-    // 一个格子都没开的时候别把材质状态冲成 false（下次建窗才知道真上没上）。
-    if windows > 0 {
-        FENCE_ACRYLIC.store(backdrop, Ordering::Relaxed);
     }
     save_fence_config(&app)
 }
@@ -6638,6 +6373,8 @@ fn fence_update(
     zoom: Option<u32>,
     sort_key: Option<String>,
     sort_dir: Option<i32>,
+    locked: Option<bool>,
+    view: Option<String>,
     rules: Option<Vec<FenceRule>>,
     rules_auto: Option<bool>,
     app: AppHandle,
@@ -6697,6 +6434,16 @@ fn fence_update(
         if let Some(sort_dir) = sort_dir {
             fence.sort_dir = sort_dir;
         }
+        if let Some(locked) = locked {
+            fence.locked = locked;
+        }
+        if let Some(view) = view {
+            fence.view = if view == hexbench_core::config::FENCE_VIEW_LIST {
+                hexbench_core::config::FENCE_VIEW_LIST.to_string()
+            } else {
+                hexbench_core::config::FENCE_VIEW_GRID.to_string()
+            };
+        }
         fence.clamp_zoom();
     }
     {
@@ -6704,48 +6451,6 @@ fn fence_update(
         state.shared.lock().unwrap().config.desktop = desktop;
     }
     save_fence_config(&app)?;
-    // 页面自己（可能改的是设置页）需要按新配置重画。
-    let _ = app.emit_to(fence_label(&id).as_str(), "fence-refresh", ());
-    Ok(())
-}
-
-/// 改名时要临时借键盘焦点：NOACTIVATE 的窗口收不到字符。
-#[tauri::command]
-fn fence_editing(id: String, editing: bool, app: AppHandle) {
-    let Some(window) = app.get_webview_window(&fence_label(&id)) else {
-        return;
-    };
-    let Ok(hwnd) = window.hwnd() else { return };
-    let hwnd = hwnd.0 as isize;
-    hexbench_core::sys::set_no_activate(hwnd, !editing);
-    if editing {
-        let _ = window.set_focus();
-    } else {
-        hexbench_core::sys::anchor_above_desktop(hwnd);
-    }
-}
-
-#[tauri::command]
-fn fence_begin_drag(id: String, paths: Vec<String>, app: AppHandle) -> Result<u32, String> {
-    let targets: Vec<PathBuf> = paths
-        .iter()
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .collect();
-    if targets.is_empty() {
-        return Err("文件已经不在了".to_string());
-    }
-    run_file_drag(&app, &fence_label(&id), &targets)
-}
-
-#[tauri::command]
-fn fence_begin_move(id: String, app: AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window(&fence_label(&id))
-        .ok_or("格子不在")?;
-    let hwnd = window.hwnd().map_err(|error| error.to_string())?.0 as isize;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    fence_run_move(app, id, hwnd, scale);
     Ok(())
 }
 
@@ -6826,16 +6531,6 @@ fn fence_run_move(app: AppHandle, id: String, hwnd: isize, scale: f64) {
     });
 }
 
-#[tauri::command]
-fn fence_begin_resize(id: String, edge: String, app: AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window(&fence_label(&id))
-        .ok_or("格子不在")?;
-    let hwnd = window.hwnd().map_err(|error| error.to_string())?.0 as isize;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    fence_run_resize(app, id, hwnd, &edge, scale)
-}
-
 /// 缩放循环：同上，两种窗口共用。
 fn fence_run_resize(
     app: AppHandle,
@@ -6914,7 +6609,7 @@ fn fence_run_resize(
                 hexbench_core::sys::set_window_rect(hwnd, rect);
                 last = Some(rect);
             }
-            // 同 fence_begin_move：每帧都交过去，靠 guides_update 的心跳补上早丢的事件。
+            // 每帧都交过去，靠 guides_update 的心跳补上早丢的事件。
             guides_update(&handle, snapped.guides);
             thread::sleep(Duration::from_millis(8));
         }
@@ -6928,12 +6623,21 @@ fn fence_run_resize(
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
     let test = MenuItem::with_id(app, "test", "测试模式", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "暂停 / 继续", true, None::<&str>)?;
+    let show_all = MenuItem::with_id(app, "show-all", "显示全部格子", true, None::<&str>)?;
     let separator_a = PredefinedMenuItem::separator(app)?;
     let separator_b = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &separator_a, &test, &pause, &separator_b, &quit],
+        &[
+            &open,
+            &separator_a,
+            &test,
+            &pause,
+            &show_all,
+            &separator_b,
+            &quit,
+        ],
     )?;
 
     let icon = match app.default_window_icon() {
@@ -6955,6 +6659,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::wi
                 shared.test_mode = !shared.test_mode;
             }
             "pause" => toggle_pause(app),
+            "show-all" => show_all_fences(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -7379,24 +7084,6 @@ fn spawn_ui_eval(app: AppHandle) {
                 let _ = std::fs::remove_file(&probe_path);
                 probe_state(&app);
             }
-            // 桌面格子的界面自动化：同一套 eval 机制，广播给每个格子窗口。
-            let fence_script_path = std::env::temp_dir().join("hexbench-ui-fence.js");
-            if fence_script_path.exists() {
-                if let Ok(script) = std::fs::read_to_string(&fence_script_path) {
-                    let _ = std::fs::remove_file(&fence_script_path);
-                    for (label, window) in app.webview_windows() {
-                        if label.starts_with("fence-") {
-                            let _ = window.eval(&script);
-                            log::info!(
-                                "ui-eval: fence script injected into {label} url={:?} title={:?} visible={:?}",
-                                window.url(),
-                                window.title(),
-                                window.is_visible()
-                            );
-                        }
-                    }
-                }
-            }
             // 吸附参考线画布的界面自动化：它没有可见内容，出问题时只能这么看。
             let guides_script_path = std::env::temp_dir().join("hexbench-ui-guides.js");
             if guides_script_path.exists() {
@@ -7483,50 +7170,6 @@ async fn debug_drop_targets(app: AppHandle) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-/// 调试自测通道（仅 debug 构建）：把一次拖放事件按 OLE 的样子投给某个格子。
-///
-/// 真实的 OLE 拖拽没法在自动化里发起（合成鼠标事件起不了 `DoDragDrop` 的模态
-/// 循环），这里跳过系统那一层，直接把事件发给页面，验证「事件 → 落点 → 移动
-/// 文件 → 刷新」这条下半段。
-#[tauri::command]
-async fn debug_fence_drag(
-    app: AppHandle,
-    id: String,
-    kind: String,
-    paths: Vec<String>,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    if !cfg!(debug_assertions) {
-        return Err("disabled".to_string());
-    }
-    use hexbench_core::drop_target::DropEvent;
-    let label = fence_label(&id);
-    if app.get_webview_window(&label).is_none() {
-        return Err(format!("没有这个格子：{id}"));
-    }
-    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    let event = match kind.as_str() {
-        "enter" => DropEvent::Enter {
-            paths,
-            x,
-            y,
-            keys: 0,
-        },
-        "over" => DropEvent::Over { x, y, keys: 0 },
-        "leave" => DropEvent::Leave,
-        "drop" => DropEvent::Drop {
-            paths,
-            x,
-            y,
-            keys: 0,
-        },
-        other => return Err(format!("不知道的拖放事件：{other}")),
-    };
-    emit_fence_drop(&app, &label, event);
-    Ok(())
-}
-
 /// 卡死诊断用：主线程回不回应、shared 锁有没有被占着。
 ///
 /// 必须是 async 命令（跑在异步线程池上）——同步命令本身就在主线程上执行，
@@ -7571,19 +7214,13 @@ fn probe_state(app: &AppHandle) -> String {
 
 /// 原生格子的窗口清单：给自动化验证用（没有 WebView 页面可注入脚本）。
 #[tauri::command]
-async fn debug_native_state(app: AppHandle) -> String {
+async fn debug_native_state(_app: AppHandle) -> String {
     if !cfg!(debug_assertions) {
         return String::new();
     }
-    let desktop = desktop_snapshot(&app);
-    let mode = if native_fences_enabled(&desktop) {
-        "native"
-    } else {
-        "webview"
-    };
     let host = NATIVE_FENCES.lock().ok().and_then(|slot| slot.clone());
     let mut out = format!(
-        "mode={mode} count={}\n",
+        "mode=native count={}\n",
         host.as_ref().map(|host| host.hwnds().len()).unwrap_or(0)
     );
     if let Some(host) = host {
@@ -7641,7 +7278,7 @@ async fn debug_native_drop_target(id: String, x: i32, y: i32) -> String {
     }
     let host = NATIVE_FENCES.lock().ok().and_then(|slot| slot.clone());
     let Some(host) = host else {
-        return "mode=webview".to_string();
+        return "mode=none".to_string();
     };
     match host.drop_target(&id, x as f32, y as f32) {
         Some(dest) => format!("dest={dest}"),
@@ -7724,9 +7361,6 @@ pub fn run() {
             tauri_plugin_window_state::Builder::default()
                 // 呼出面板和触发提示各自记几何，别让插件恢复旧尺寸。
                 .with_denylist(&["overlay", "launcher"])
-                // 桌面格子的 label 是 fence-<id>，denylist 只能精确匹配；
-                // 它们的几何由 config.desktop.fences 自己记，绝不能让插件恢复。
-                .with_filter(|label| !label.starts_with("fence-"))
                 // The window is frameless by design: restoring a saved
                 // "decorated" flag would bring the system title bar back.
                 .with_state_flags(
@@ -7861,7 +7495,6 @@ pub fn run() {
     selftest_report,
     debug_probe,
     debug_drop_targets,
-    debug_fence_drag,
     debug_native_state,
     debug_native_bench,
     debug_native_drop_target,
@@ -7870,6 +7503,8 @@ pub fn run() {
             launcher_save_view,
             launcher_usage,
             launcher_move_into,
+            launcher_copy_into,
+            launcher_refocus,
             cache_stats,
             cache_clear,
             launcher_clear_folder,
@@ -7884,7 +7519,6 @@ pub fn run() {
             update_download,
             update_install,
             pick_app,
-            fence_state,
             fence_create,
             fence_create_box,
             fence_delete,
@@ -7893,16 +7527,10 @@ pub fn run() {
             fence_rule_preview,
             fence_rule_run,
             fence_set_enabled,
-            fence_appearance,
             fence_set_appearance,
             fence_update,
-            fence_editing,
-            fence_begin_drag,
-            fence_begin_move,
-            fence_begin_resize,
             fence_watch_path,
-            fence_path_exists,
-            fence_debug
+            fence_path_exists
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -8076,6 +7704,7 @@ pub fn run() {
                                                 "x": client_x,
                                                 "y": client_y,
                                                 "paths": list,
+                                                "copy": hexbench_core::sys::ctrl_down(),
                                             }),
                                         );
                                     }

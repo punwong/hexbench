@@ -666,16 +666,23 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// 宁可多留一张，也不能把别处还在引用的图删了。
 fn gc_images(root: &Path) {
     let mut used: HashSet<String> = HashSet::new();
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_note_file(&path) {
-                continue;
+    // 连目录都读不出来时不能当成「没有任何笔记引用图片」——那样会把
+    // images/ 整个清空。宁可这次不回收。
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_note_file(&path) {
+            continue;
+        }
+        // 这里必须读整篇：列表预览可以截断，但回收判断不能——长笔记后半段
+        // 引用的图片会被当成没人用，然后被搬进回收站。
+        match fs::read(&path) {
+            Ok(bytes) => {
+                used.extend(image_refs(&String::from_utf8_lossy(&bytes)));
             }
-            match read_capped(&path, LIST_READ_CAP) {
-                Ok(body) => used.extend(image_refs(&body)),
-                Err(_) => return,
-            }
+            Err(_) => return,
         }
     }
     let Ok(entries) = fs::read_dir(root.join(IMAGES_DIR)) else {

@@ -345,9 +345,6 @@ pub struct DesktopSettings {
     pub opacity: u32,
     /// 背后要不要磨砂。关掉就是「透而不糊」：壁纸原样从卡片底下透出来。
     pub frosted: bool,
-    /// Beta：格子改由原生渲染层（Direct2D + DirectComposition）绘制。
-    /// 关掉立刻回到 WebView 实现，两条路径共用同一份配置和目录枚举。
-    pub native: bool,
     pub fences: Vec<FenceSettings>,
 }
 
@@ -365,7 +362,6 @@ impl Default for DesktopSettings {
             // 70% 是照壁纸调出来的：磨砂看得出来，字也清楚。
             opacity: 70,
             frosted: true,
-            native: false,
             fences: Vec::new(),
         }
     }
@@ -473,6 +469,10 @@ pub struct FenceSettings {
     pub zoom: u32,
     pub sort_key: String,
     pub sort_dir: i32,
+    /// 锁定位置：标题条拖不动、边角也拉不了（内容照常能点、能滚）。
+    pub locked: bool,
+    /// 视图：`grid`（图标网格，默认）或 `list`（一行一个）。
+    pub view: String,
 }
 
 impl Default for FenceSettings {
@@ -498,11 +498,22 @@ impl Default for FenceSettings {
             zoom: 100,
             sort_key: "name".to_string(),
             sort_dir: 1,
+            locked: false,
+            view: "grid".to_string(),
         }
     }
 }
 
+/// `view` 的两种取值；手改出来的别的值按图标网格处理。
+pub const FENCE_VIEW_GRID: &str = "grid";
+pub const FENCE_VIEW_LIST: &str = "list";
+
 impl FenceSettings {
+    /// 这一格当前是不是列表视图。
+    pub fn is_list(&self) -> bool {
+        self.view == FENCE_VIEW_LIST
+    }
+
     /// 收纳盒（幕后目录是应用自己建的）。
     pub fn is_bucket(&self) -> bool {
         self.kind.is_bucket()
@@ -850,7 +861,9 @@ pub fn save(path: &Path, config: &Config) -> io::Result<()> {
         file.write_all(&data)?;
         file.sync_all()?;
     }
-    if path.exists() {
+    // 只有主文件还能解析才留备份。主文件坏了、这次是从 .bak 启动的，
+    // 再把它抄到备份位置就等于把唯一的好备份毁掉。
+    if path.exists() && parse(path).is_some() {
         let _ = fs::copy(path, backup_path(path));
     }
     fs::rename(&tmp, path)?;

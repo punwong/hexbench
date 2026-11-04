@@ -84,6 +84,9 @@ export interface GestureSettings {
 /** 格子的来源：绑定的文件夹，还是应用自己建的收纳盒。 */
 export type FenceKind = "folder" | "bucket";
 
+/** 格子视图：图标网格 / 列表。 */
+export type FenceView = "grid" | "list";
+
 /** 一条整理规则：从源目录里挑符合条件的文件收进收纳盒。 */
 export interface FenceRule {
   id: string;
@@ -131,6 +134,10 @@ export interface FenceSettings {
   zoom: number;
   sortKey: string;
   sortDir: number;
+  /** 锁定位置：拖不动标题条、拉不了边角 */
+  locked: boolean;
+  /** 视图：图标网格 / 一行一个 */
+  view: FenceView;
 }
 
 export interface DesktopSettings {
@@ -144,8 +151,6 @@ export interface DesktopSettings {
   opacity: number;
   /** 背后要不要磨砂；关掉就是「透而不糊」 */
   frosted: boolean;
-  /** Beta：格子改由原生渲染层绘制（关掉回到 WebView） */
-  native: boolean;
   fences: FenceSettings[];
 }
 

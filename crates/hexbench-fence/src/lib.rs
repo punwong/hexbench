@@ -18,6 +18,10 @@ pub struct Item {
     /// 文件真实路径；图标按它从 `hexbench_core::icons` 的缓存里取。
     pub path: String,
     pub is_dir: bool,
+    /// 修改时间（Unix 秒）；0 = 读不到。
+    pub modified: i64,
+    /// 文件大小（字节）；文件夹是 0，列表里留空。
+    pub size: u64,
 }
 
 /// 面包屑的一段：从绑定目录往下，一层一个。
@@ -48,6 +52,8 @@ pub struct Frame {
     pub zoom: u32,
     /// 卡片不透明度百分比（30..=100）。
     pub opacity: u32,
+    /// 背后要不要磨砂（DWM 亚克力）：关掉就是「透而不糊」。
+    pub frosted: bool,
     pub dark: bool,
     pub items: Vec<Item>,
     /// 浏览历史里还能往回 / 往前走的层数：没有可去的地方时方向提示画淡一点。
@@ -59,6 +65,10 @@ pub struct Frame {
     /// 当前排序，菜单里标方向。
     pub sort_key: String,
     pub sort_dir: i32,
+    /// 锁定位置：拖不动标题条、拉不了边角。
+    pub locked: bool,
+    /// 列表视图（一行一个）；`false` 就是图标网格。
+    pub list: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -68,8 +78,12 @@ pub enum Event {
     Moved { id: String, rect: [i32; 4] },
     /// 标题条双击：卷起 / 展开。由上层写回配置，再推一帧新的回来。
     Rolled { id: String, rolled: bool },
-    /// 标题菜单「按名称 / 按修改时间排序」：上层和网页版一样，同键则反转方向。
+    /// 标题菜单「按名称 / 按修改时间排序」：同键则反转方向。
     Sort { id: String, key: String },
+    /// 标题菜单「锁定位置 / 解锁位置」。
+    Lock { id: String, locked: bool },
+    /// 标题菜单「列表视图 / 图标视图」切换。
+    View { id: String, view: String },
     /// 标题菜单「隐藏格子」。
     Hide { id: String },
     /// 标题菜单「删除格子」。
@@ -112,6 +126,8 @@ pub enum Event {
         id: String,
         dest: String,
         paths: Vec<String>,
+        /// 按住 Ctrl 拖进来 = 复制；否则移动。
+        copy: bool,
     },
 }
 

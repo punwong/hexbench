@@ -1028,6 +1028,70 @@ pub fn force_foreground(hwnd: isize) {
     }
 }
 
+/// 把键盘焦点还给窗口里的 WebView2 子窗口。
+///
+/// 回收站 / 撤销这类系统操作会把焦点从 WebView 收回到顶层的「Tauri Window」：
+/// 之后窗口虽然还在前台，按键却不再进页面（看起来就是紧接着按 Ctrl+Z 没反应）。
+/// 只对顶层 `SetFocus` 修不好，得直接给 WebView2 的 `Chrome_WidgetWin_1` 焦点。
+///
+/// 和 `force_foreground` 一样**必须在窗口自己的线程上调用**。
+pub fn focus_webview(parent: isize) {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, GetAncestor, GetClassNameW, GetWindowThreadProcessId, IsWindow,
+        IsWindowVisible, GA_ROOT,
+    };
+    // 内置网页也是同一个窗口类：记住上次真正用到的那个，别把焦点交给网页那一半。
+    static REMEMBERED: AtomicIsize = AtomicIsize::new(0);
+    if parent == 0 {
+        return;
+    }
+    // SAFETY: lparam 是调用方传进来的 &mut HWND，活到枚举结束。
+    extern "system" fn find(hwnd: HWND, lparam: isize) -> i32 {
+        let found = unsafe { &mut *(lparam as *mut HWND) };
+        let mut buffer = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        if len <= 0 {
+            return 1;
+        }
+        let name = String::from_utf16_lossy(&buffer[..len as usize]);
+        if name == "Chrome_WidgetWin_1" && unsafe { IsWindowVisible(hwnd) } != 0 {
+            *found = hwnd;
+            return 0;
+        }
+        1
+    }
+    // SAFETY: 标准窗口/线程 API，parent 由调用方保证是活着的窗口句柄。
+    unsafe {
+        let top = parent as HWND;
+        let remembered = REMEMBERED.load(Ordering::Relaxed) as HWND;
+        let mut found: HWND = std::ptr::null_mut();
+        if !remembered.is_null()
+            && IsWindow(remembered) != 0
+            && GetAncestor(remembered, GA_ROOT) == top
+        {
+            found = remembered;
+        } else {
+            EnumChildWindows(top, Some(find), &mut found as *mut HWND as isize);
+        }
+        if found.is_null() {
+            return;
+        }
+        REMEMBERED.store(found as isize, Ordering::Relaxed);
+        let target_thread = GetWindowThreadProcessId(found, std::ptr::null_mut());
+        let this_thread = GetCurrentThreadId();
+        let attached = target_thread != 0
+            && target_thread != this_thread
+            && AttachThreadInput(target_thread, this_thread, 1) != 0;
+        let _ = SetFocus(found);
+        if attached {
+            let _ = AttachThreadInput(target_thread, this_thread, 0);
+        }
+    }
+}
+
 /// 窗口现在**真的**可见吗。
 ///
 /// 不用 tao 的 `is_visible()`：那是它自己缓存的状态，一旦和真实窗口不一致
@@ -1267,6 +1331,12 @@ pub fn screen_to_client(hwnd: isize, x: i32, y: i32) -> (i32, i32) {
 pub fn left_button_down() -> bool {
     // SAFETY: GetAsyncKeyState 只读键盘状态。
     unsafe { GetAsyncKeyState(VK_LBUTTON as i32) < 0 }
+}
+
+/// Ctrl 按着吗？拖放松手时用来区分「复制」和「移动」。
+pub fn ctrl_down() -> bool {
+    // SAFETY: GetAsyncKeyState 只读键盘状态。
+    unsafe { GetAsyncKeyState(VK_CONTROL as i32) < 0 }
 }
 
 /// Alt 按着吗？按住 Alt 时暂停格子移动 / 缩放的吸附（和 PecoFence 一致）。
@@ -1530,55 +1600,102 @@ pub fn show_shell_context_menu(
     owner: isize,
     before_invoke: impl FnOnce(),
 ) -> Result<Option<&'static str>, String> {
+    show_shell_context_menu_for(&[path.to_path_buf()], x, y, owner, before_invoke)
+}
+
+/// 多选版：同一目录下的若干文件 / 文件夹共用一个系统菜单（剪切、复制、删除
+/// 一次作用到整组）。不在同一目录的路径会被跳过——格子里的条目本来同属一层。
+pub fn show_shell_context_menu_for(
+    paths: &[std::path::PathBuf],
+    x: i32,
+    y: i32,
+    owner: isize,
+    before_invoke: impl FnOnce(),
+) -> Result<Option<&'static str>, String> {
     /// 自己加的菜单项用高位 id，和 Shell 的 1..0x7FFF 区分开。
     const CMD_RENAME: u32 = 0x8000;
 
     use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
+    let Some(first) = paths.first() else {
+        return Ok(None);
+    };
+    // 只有同一个目录里的条目才能塞进一份菜单。
+    let parent = first
+        .parent()
+        .map(|dir| dir.to_string_lossy().to_lowercase());
+    let group: Vec<&std::path::PathBuf> = paths
+        .iter()
+        .filter(|path| path.parent().map(|dir| dir.to_string_lossy().to_lowercase()) == parent)
         .collect();
     let mut choice = None;
     // SAFETY: PIDL / IShellFolder / IContextMenu 都在本函数内释放；菜单句柄同理。
     unsafe {
         let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-        let mut attributes: u32 = 0;
-        let hr = SHParseDisplayName(
-            wide.as_ptr(),
-            std::ptr::null_mut(),
-            &mut pidl,
-            0,
-            &mut attributes,
-        );
-        if hr < 0 || pidl.is_null() {
-            return Err(format!("SHParseDisplayName 0x{hr:08x}"));
-        }
-
         let mut folder: *mut c_void = std::ptr::null_mut();
-        let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
-        let hr = SHBindToParent(pidl, &IID_ISHELLFOLDER, &mut folder, &mut child);
-        if hr < 0 {
-            CoTaskMemFree(pidl as *const c_void);
-            return Err(format!("SHBindToParent 0x{hr:08x}"));
+        // 绝对 pidl 要自己释放；`children` 指向它们内部，所以得等菜单对象
+        // 建好之后才能一起放掉。
+        let mut parsed: Vec<*mut ITEMIDLIST> = Vec::with_capacity(group.len());
+        let mut children: Vec<*const ITEMIDLIST> = Vec::with_capacity(group.len());
+        for path in &group {
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            let mut attributes: u32 = 0;
+            let hr = SHParseDisplayName(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut pidl,
+                0,
+                &mut attributes,
+            );
+            if hr < 0 || pidl.is_null() {
+                log::warn!(
+                    "context menu: 解析路径失败 0x{hr:08x}: {}",
+                    path.display()
+                );
+                continue;
+            }
+            parsed.push(pidl);
+            let mut parent_folder: *mut c_void = std::ptr::null_mut();
+            let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+            let hr = SHBindToParent(pidl, &IID_ISHELLFOLDER, &mut parent_folder, &mut child);
+            if hr < 0 {
+                log::warn!("context menu: SHBindToParent 0x{hr:08x}");
+                continue;
+            }
+            if folder.is_null() {
+                folder = parent_folder;
+            } else {
+                release_object(parent_folder);
+            }
+            children.push(child as *const ITEMIDLIST);
+        }
+        if folder.is_null() || children.is_empty() {
+            for pidl in &parsed {
+                CoTaskMemFree(*pidl as *const c_void);
+            }
+            return Err("这些条目打不开系统菜单".to_string());
         }
 
         let folder_vtbl = *(folder as *mut *const ShellFolderVtbl);
         let mut menu_object: *mut c_void = std::ptr::null_mut();
         let mut reserved: u32 = 0;
-        let children: [*const ITEMIDLIST; 1] = [child as *const ITEMIDLIST];
         let hr = ((*folder_vtbl).get_ui_object_of)(
             folder,
             std::ptr::null_mut(),
-            1,
+            children.len() as u32,
             children.as_ptr() as *mut *const ITEMIDLIST,
             &IID_ICONTEXTMENU,
             &mut reserved,
             &mut menu_object,
         );
         release_object(folder);
-        CoTaskMemFree(pidl as *const c_void);
+        for pidl in &parsed {
+            CoTaskMemFree(*pidl as *const c_void);
+        }
         if hr < 0 || menu_object.is_null() {
             return Err(format!("GetUIObjectOf 0x{hr:08x}"));
         }
@@ -1623,24 +1740,27 @@ pub fn show_shell_context_menu(
             }
             found
         };
-        match anchor {
-            Some(index) => {
-                InsertMenuW(
-                    popup,
-                    index,
-                    MF_BYPOSITION | MF_STRING,
-                    CMD_RENAME as usize,
-                    windows_sys::core::w!("重命名(&M)"),
-                );
-            }
-            None => {
-                AppendMenuW(popup, MF_SEPARATOR, 0, std::ptr::null());
-                AppendMenuW(
-                    popup,
-                    MF_STRING,
-                    CMD_RENAME as usize,
-                    windows_sys::core::w!("重命名(&M)"),
-                );
+        // 批量选择时没有「重命名」：一次只能改一个名字。
+        if children.len() == 1 {
+            match anchor {
+                Some(index) => {
+                    InsertMenuW(
+                        popup,
+                        index,
+                        MF_BYPOSITION | MF_STRING,
+                        CMD_RENAME as usize,
+                        windows_sys::core::w!("重命名(&M)"),
+                    );
+                }
+                None => {
+                    AppendMenuW(popup, MF_SEPARATOR, 0, std::ptr::null());
+                    AppendMenuW(
+                        popup,
+                        MF_STRING,
+                        CMD_RENAME as usize,
+                        windows_sys::core::w!("重命名(&M)"),
+                    );
+                }
             }
         }
 

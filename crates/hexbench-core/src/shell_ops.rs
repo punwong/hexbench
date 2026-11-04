@@ -274,6 +274,7 @@ fn open_clipboard_with_retry() -> bool {
 ///
 /// 这样我们自己的粘贴、以及资源管理器的粘贴都能用同一份数据。
 pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::GlobalFree;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
@@ -307,6 +308,7 @@ pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
         let handle = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(|error| error.to_string())?;
         let pointer = GlobalLock(handle) as *mut u8;
         if pointer.is_null() {
+            let _ = GlobalFree(Some(handle));
             return Err("GlobalLock 失败".to_string());
         }
         let drop_files = DropFiles {
@@ -328,14 +330,17 @@ pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
         );
         let _ = GlobalUnlock(handle);
         if !open_clipboard_with_retry() {
+            let _ = GlobalFree(Some(handle));
             return Err("剪贴板被其他程序占用，稍后再试".to_string());
         }
         let _ = EmptyClipboard();
         if let Err(error) =
             SetClipboardData(CF_HDROP.0 as u32, Some(windows::Win32::Foundation::HANDLE(handle.0)))
         {
-            // 失败也要把剪贴板交还，否则会把其他程序挡在外面。
+            // 失败也要把剪贴板交还，否则会把其他程序挡在外面；失败时
+            // SetClipboardData 不会接管这块内存，得自己释放。
             let _ = CloseClipboard();
+            let _ = GlobalFree(Some(handle));
             return Err(error.to_string());
         }
         // 剪切标记：Preferred DropEffect。
@@ -353,8 +358,11 @@ pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
                     SetClipboardData(format, Some(windows::Win32::Foundation::HANDLE(extra.0)));
                 if let Err(error) = &written {
                     log::warn!("clipboard: drop effect 写入失败 format={format}: {error}");
+                    let _ = GlobalFree(Some(extra));
                 }
                 log::debug!("clipboard: wrote effect={effect} format={format} ok={}", written.is_ok());
+            } else {
+                let _ = GlobalFree(Some(extra));
             }
         }
         let _ = CloseClipboard();
@@ -503,6 +511,9 @@ pub fn restore_trashed(original: &std::path::Path) -> Result<(), String> {
     let Ok(sids) = std::fs::read_dir(&bin) else {
         return Err("读不到回收站".to_string());
     };
+    // 同一路径可能删过不止一次（删掉、重建、再删）：回收站里会有多条记录。
+    // 按 $I 里的删除时间挑最新的一条，否则可能把旧版本还原回来。
+    let mut best: Option<(u64, std::path::PathBuf, std::path::PathBuf)> = None;
     for sid in sids.flatten() {
         let Ok(entries) = std::fs::read_dir(sid.path()) else {
             continue;
@@ -522,6 +533,8 @@ pub fn restore_trashed(original: &std::path::Path) -> Result<(), String> {
             if version != 2 {
                 continue;
             }
+            // 8 字节版本、8 字节大小、8 字节删除时间（FILETIME）。
+            let deleted = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0; 8]));
             let length = u32::from_le_bytes(bytes[24..28].try_into().unwrap_or([0; 4])) as usize;
             if length == 0 || bytes.len() < 28 + length * 2 {
                 continue;
@@ -539,20 +552,25 @@ pub fn restore_trashed(original: &std::path::Path) -> Result<(), String> {
             if !payload.exists() {
                 continue;
             }
-            if let Some(parent) = original.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            if best.as_ref().is_none_or(|(seen, _, _)| deleted > *seen) {
+                best = Some((deleted, entry.path(), payload));
             }
-            std::fs::rename(&payload, original)
-                .map_err(|error| format!("还原 {}: {error}", original.display()))?;
-            let _ = std::fs::remove_file(entry.path());
-            log::info!("restore: {} 已还原", original.display());
-            return Ok(());
         }
     }
-    Err(format!(
-        "回收站里找不到 {}（可能已经被清空）",
-        original.display()
-    ))
+    let Some((_, metadata, payload)) = best else {
+        return Err(format!(
+            "回收站里找不到 {}（可能已经被清空）",
+            original.display()
+        ));
+    };
+    if let Some(parent) = original.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::rename(&payload, original)
+        .map_err(|error| format!("还原 {}: {error}", original.display()))?;
+    let _ = std::fs::remove_file(&metadata);
+    log::info!("restore: {} 已还原", original.display());
+    Ok(())
 }
 /// 只从**系统缩略图缓存**里取，不触发抽取：命中就立刻返回，没命中也是立刻
 /// 放弃。资源管理器用的是同一份缓存，所以它显示过的图这里多半也有。

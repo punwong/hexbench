@@ -227,6 +227,10 @@ export default function App() {
 
   const configRef = useRef<Config | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
+  const saveInFlight = useRef(false);
+  // 保存期间后端发来的 config-changed 不能直接丢掉：存完要把后端那份重读回来，
+  // 否则下一次保存还会拿旧快照把同步设置之类的字段盖回去。
+  const configDirty = useRef(false);
 
   useEffect(() => {
     let alive = true;
@@ -266,7 +270,10 @@ export default function App() {
     let dispose: (() => void) | undefined;
     void listen("config-changed", () => {
       // 自己刚改的还没落盘：等这笔存完再说，别把正在输入的盖掉。
-      if (saveTimer.current !== undefined) return;
+      if (saveTimer.current !== undefined || saveInFlight.current) {
+        configDirty.current = true;
+        return;
+      }
       void getSnapshot()
         .then((next) => {
           if (!alive) return;
@@ -310,9 +317,25 @@ export default function App() {
     window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       saveTimer.current = undefined;
+      saveInFlight.current = true;
+      const settle = () => {
+        saveInFlight.current = false;
+        // 保存期间又确认了一次更新：等下一笔保存结束时再重读，
+        // 免得把用户正在输的内容换掉。
+        if (!configDirty.current || saveTimer.current !== undefined) return;
+        configDirty.current = false;
+        void getSnapshot()
+          .then((fresh) => {
+            configRef.current = fresh.config;
+            setConfig(fresh.config);
+            setSnap(fresh);
+          })
+          .catch(() => {});
+      };
       void saveConfig(next)
         .then(() => setError(null))
-        .catch((reason) => setError(String(reason)));
+        .catch((reason) => setError(String(reason)))
+        .then(settle);
     }, 300);
   }, []);
 
@@ -365,6 +388,12 @@ export default function App() {
   const finishOnboarding = () => {
     update({ ui: { onboarded: true } });
     void setTestMode(true);
+  };
+
+  // 「跳过」只是别再挡着设置窗口，不该顺手把测试模式打开——
+  // 测试模式会让光标在屏幕边缘被反复吸走，看起来像电脑出了毛病。
+  const skipOnboarding = () => {
+    update({ ui: { onboarded: true } });
   };
 
   const status = snap
@@ -559,7 +588,7 @@ export default function App() {
           step={step}
           onNext={() => setStep((value) => value + 1)}
           onFinish={finishOnboarding}
-          onSkip={finishOnboarding}
+          onSkip={skipOnboarding}
         />
       )}
     </div>

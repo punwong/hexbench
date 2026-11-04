@@ -662,7 +662,9 @@ unsafe fn drop_paths(data: *mut c_void) -> Vec<PathBuf> {
 use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetWindowThreadProcessId};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, GetWindowThreadProcessId, IsWindow,
+};
 
 #[link(name = "ole32")]
 unsafe extern "system" {
@@ -686,9 +688,14 @@ static ATTACHED: Mutex<Vec<(isize, isize, u32)>> = Mutex::new(Vec::new());
 
 /// 挂一个窗口（子窗口也要挂）。已经挂过就直接返回。
 fn register_one(hwnd: isize, route: isize) -> Result<(), String> {
-    if let Ok(list) = ATTACHED.lock() {
-        if list.iter().any(|(child, _, _)| *child == hwnd) {
-            return Ok(());
+    if let Ok(mut list) = ATTACHED.lock() {
+        if let Some(index) = list.iter().position(|(child, _, _)| *child == hwnd) {
+            // 窗口还活着才算挂过。句柄会被系统回收：旧窗口销毁后同一个值
+            // 可能落到新窗口上，这时跳过登记，拖放会悄悄失效。
+            if unsafe { IsWindow(hwnd as *mut c_void) } != 0 {
+                return Ok(());
+            }
+            list.remove(index);
         }
     }
     let target = Box::new(Target {

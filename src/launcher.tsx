@@ -201,6 +201,9 @@ function Launcher() {
   // 已经淡入过的图标：滚动把它重新挂出来时直接给成品，别又淡一次。
   const iconReady = useRef<Set<string>>(new Set());
   const viewToken = useRef(0);
+  // 上一次真正换了目录时的 scope/path：刷新（文件监听、拖拽结束）只重读内容，
+  // 不该把用户滚到的位置弹回顶部。
+  const viewKeyRef = useRef("");
   // 虚拟滚动：只渲染视口里的几行，几千项的目录也不会把 DOM 撑爆。
   const [viewport, setViewport] = useState({ width: 0, height: 0, scrollTop: 0 });
 
@@ -579,7 +582,7 @@ function Launcher() {
       return node?.closest<HTMLElement>("[data-crumb]")?.dataset.crumb ?? null;
     };
     /** 松手：落在侧边栏分类或文件夹格子上就移进去，落在空白就放进当前目录。 */
-    const dropInto = (x: number, y: number, paths: string[]) => {
+    const dropInto = (x: number, y: number, paths: string[], copy: boolean) => {
       // 同一次拖放有可能被两条路径报回来（拖拽结束时的兜底判断、面板自己的
       // 拖放目标）。只认第一次：第二次的源文件已经不在了，会白弹一个错误。
       const key = paths.join("|");
@@ -603,7 +606,7 @@ function Launcher() {
       const dest =
         crumbAtClient(point.x, point.y) || side?.path || folder?.path || currentDirRef.current;
       if (!dest) return;
-      void invoke("launcher_move_into", { dest, paths })
+      void invoke(copy ? "launcher_copy_into" : "launcher_move_into", { dest, paths })
         .then(() => {
           // 移走的文件不在这个目录了：选中集合里的旧路径要去掉，
           // 否则接着按 Delete / 复制会拿已经不存在的位置去操作。
@@ -639,8 +642,8 @@ function Launcher() {
         if (switchTo) switchTo();
       }
     });
-    on<{ x: number; y: number; paths: string[] }>("launcher-drag-drop", (event) =>
-      dropInto(event.payload.x, event.payload.y, event.payload.paths),
+    on<{ x: number; y: number; paths: string[]; copy?: boolean }>("launcher-drag-drop", (event) =>
+      dropInto(event.payload.x, event.payload.y, event.payload.paths, !!event.payload.copy),
     );
     // 后端收起面板（切到别的应用）时，把网页状态一起清掉。
     on<null>("launcher-drag-leave", () => {
@@ -650,8 +653,8 @@ function Launcher() {
       setDropCrumb(null);
       setNoteDrop(null);
     });
-    on<{ x: number; y: number; paths: string[] }>("launcher-dropped", (event) =>
-      dropInto(event.payload.x, event.payload.y, event.payload.paths),
+    on<{ x: number; y: number; paths: string[]; copy?: boolean }>("launcher-dropped", (event) =>
+      dropInto(event.payload.x, event.payload.y, event.payload.paths, !!event.payload.copy),
     );
     return () => {
       disposed = true;
@@ -698,6 +701,20 @@ function Launcher() {
     let alive = true;
     viewToken.current += 1;
     const token = viewToken.current;
+    const viewKey = `${scope.kind}|${scope.kind === "folder" ? scope.base : ""}|${path}`;
+    const newView = viewKey !== viewKeyRef.current;
+    viewKeyRef.current = viewKey;
+    // 刷新时清空列表会让内容高度塌掉、滚动位置被浏览器夹回顶上；先把位置记下来，
+    // 第一页回来后放回去（分页没撑够高度就下一页再试，直到放到位）。
+    const keepScroll = newView ? 0 : Math.max(0, gridRef.current?.scrollTop ?? 0);
+    let scrollRestored = keepScroll === 0;
+    const restoreScroll = () => {
+      if (scrollRestored) return;
+      const element = gridRef.current;
+      if (!element) return;
+      element.scrollTop = keepScroll;
+      if (Math.abs(element.scrollTop - keepScroll) <= 2) scrollRestored = true;
+    };
     // 「这次没取到」只算这一次：切目录、刷新时清掉，下次可见再问一遍 Shell，
     // 别让一次卡顿变成永久回退。
     for (const [iconPath, key] of Object.entries(iconRef.current)) {
@@ -724,8 +741,8 @@ function Launcher() {
         setItems(cached);
         setLoading(false);
         // 和下面现读一样从顶上开始：换了目录还停在上一个目录的滚动位置上很怪，
-        // 而且拖拽预览的缩略图只备了头一屏。
-        if (gridRef.current) gridRef.current.scrollTop = 0;
+        // 而且拖拽预览的缩略图只备了头一屏。只是刷新就保持原位置。
+        if (newView && gridRef.current) gridRef.current.scrollTop = 0;
         return;
       }
       // 没缓存又正在拖：保持原样，别转圈，松手后再补。
@@ -738,7 +755,7 @@ function Launcher() {
       // 先清空：否则切目录时上一个目录的内容会留在屏幕上，搜索就会「搜到别处」。
       setItems([]);
       setLoading(true);
-      if (gridRef.current) gridRef.current.scrollTop = 0;
+      if (newView && gridRef.current) gridRef.current.scrollTop = 0;
       const channel = new Channel<LauncherPage>();
       channel.onmessage = (page) => {
         if (!alive || token !== viewToken.current) return;
@@ -751,6 +768,7 @@ function Launcher() {
             const fresh = page.items.filter((item) => !known.has(item.path));
             return fresh.length ? [...previous, ...fresh] : previous;
           });
+          requestAnimationFrame(restoreScroll);
         }
         if (page.done) setLoading(false);
       };
@@ -917,11 +935,10 @@ function Launcher() {
     return () => window.removeEventListener("pointerdown", close);
   }, [sortMenu]);
 
-  // 改名进行中的标记：窗口重新获得焦点时不能把焦点抢回搜索框。
-  const renamingRef = useRef(false);
-  useEffect(() => {
-    renamingRef.current = editing !== null;
-  }, [editing]);
+  // 键盘焦点一直停在搜索框（这样呼出就能直接打字），但「焦点在搜索框」和
+  // 「正在编辑搜索词」是两回事：点过条目 / 按方向键选文件之后，Delete 和
+  // Ctrl+C 之类的快捷键该作用在文件上；点回搜索框或开始打字才回到编辑文字。
+  const inputEditingRef = useRef(true);
   // 改名框出现时聚焦并选中主名（扩展名不选）。放在 effect 里而不是 ref 回调里：
   // ref 回调每次渲染都会重新执行，那样每敲一个字都会重新全选。
   useEffect(() => {
@@ -942,14 +959,42 @@ function Launcher() {
 
   // 每次呼出都能直接打字。
   useEffect(() => {
+    let disposed = false;
+    let stopFocus: (() => void) | undefined;
     const focusInput = () => {
-      // 正在改名时别把焦点抢走：直接看当前焦点在不在文本域上。
-      if (document.activeElement?.tagName === "TEXTAREA") return;
+      // 正在别处输入（改名、笔记标题、分类名）时别把焦点抢走。
+      const active = document.activeElement as HTMLElement | null;
+      if (
+        active &&
+        (active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+      // 只把焦点交给搜索框，不动「正在编辑」：窗口焦点回来时如果用户刚点过
+      // 文件，Delete / Ctrl+Z 该作用在文件上；真开始打字时 onChange 会自己置位。
       inputRef.current?.focus();
     };
     focusInput();
     window.addEventListener("focus", focusInput);
-    return () => window.removeEventListener("focus", focusInput);
+    // 删文件 / 回收站这类系统操作会让窗口短暂失活再回来，DOM 的 focus 事件
+    // 不一定补发；焦点丢了之后紧接着按 Ctrl+Z 就落空。窗口一回来就把焦点还给
+    // 搜索框（这是我们自己窗口的事件，不是来抢用户别处的前台）。
+    void getCurrentWindow()
+      .onFocusChanged(({ payload }) => {
+        if (payload) focusInput();
+      })
+      .then((stop) => {
+        if (disposed) stop();
+        else stopFocus = stop;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", focusInput);
+      stopFocus?.();
+    };
   }, []);
 
   // ---------- 导航 ----------
@@ -960,6 +1005,7 @@ function Launcher() {
     setPicked(new Set());
     anchor.current = -1;
     hoverArmed.current = false;
+    inputEditingRef.current = true;
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
 
@@ -1231,6 +1277,11 @@ function Launcher() {
   useEffect(() => {
     noteHoverRef.current = (x, y) => {
       if (scope.kind !== "notes") return false;
+      if (draft) {
+        // 编辑器遮罩盖在卡片上面，这里没有可高亮的卡片。
+        setNoteDrop((previous) => (previous === null ? previous : null));
+        return true;
+      }
       const card = document
         .elementFromPoint(x, y)
         ?.closest<HTMLElement>("[data-note-id]");
@@ -1240,11 +1291,28 @@ function Launcher() {
     };
     noteDropRef.current = (x, y, paths) => {
       if (scope.kind !== "notes") return false;
-      const card = document
-        .elementFromPoint(x, y)
-        ?.closest<HTMLElement>("[data-note-id]");
-      const noteId = card?.dataset.noteId || null;
-      void invoke<ImportOutcome>("notes_import_images", { noteId, paths })
+      // 编辑器开着时一律追加到正在编辑的这条；新建还没保存的笔记就先把它
+      // 建出来，免得图片落到一条另外新建的空笔记上。
+      let target: Promise<string | null>;
+      if (draft) {
+        target = draft.id
+          ? Promise.resolve(draft.id)
+          : invoke<NoteSummary>("notes_create", {
+              title: draft.title.trim() || "未命名笔记",
+            }).then((created) => {
+              setDraft((current) =>
+                current && current.id === null ? { ...current, id: created.id } : current,
+              );
+              return created.id;
+            });
+      } else {
+        const card = document
+          .elementFromPoint(x, y)
+          ?.closest<HTMLElement>("[data-note-id]");
+        target = Promise.resolve(card?.dataset.noteId || null);
+      }
+      void target
+        .then((noteId) => invoke<ImportOutcome>("notes_import_images", { noteId, paths }))
         .then((outcome) => {
           setNotes((previous) => [
             outcome.note,
@@ -1263,7 +1331,7 @@ function Launcher() {
         .catch((error) => showToastRef.current(String(error)));
       return true;
     };
-  }, [scope]);
+  }, [scope, draft]);
 
   const openNotes = useCallback(() => go({ scope: { kind: "notes" }, path: "" }), [go]);
 
@@ -1300,6 +1368,11 @@ function Launcher() {
       if (!id) {
         const created = await invoke<NoteSummary>("notes_create", { title });
         id = created.id;
+        // 空笔记已经在磁盘上了：先把 id 记进草稿，后面 notes_save 失败时
+        // 再点保存是接着写这条，而不是又建一条。
+        setDraft((current) =>
+          current && current.id === null ? { ...current, id: created.id } : current,
+        );
       }
       await invoke<NoteSummary>("notes_save", { id, title, body: draft.body });
       setDraft(null);
@@ -1790,11 +1863,13 @@ function Launcher() {
     if (fileShortcuts(event)) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
+      inputEditingRef.current = false;
       setSelected((current) =>
         current < 0 ? 0 : Math.min(current + 1, Math.max(shown.length - 1, 0)),
       );
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
+      inputEditingRef.current = false;
       setSelected((current) => (current <= 0 ? 0 : current - 1));
     } else if (event.key === "Enter") {
       event.preventDefault();
@@ -1814,7 +1889,14 @@ function Launcher() {
     // 收藏视图不操作文件：Delete / Ctrl+V / Ctrl+Z 都不该落到文件逻辑上。
     if (scope.kind === "notes") return false;
     const target = event.target as HTMLElement;
-    const renaming = target.tagName === "TEXTAREA";
+    // 在输入框里打字时，Delete / Ctrl+C / Ctrl+X / Ctrl+Z 归文字。
+    // 搜索框是个例外：焦点一直停在它上面是为了随时能打字，只有真的在编辑
+    // 搜索词时才让键归文字；点过条目、按方向键选文件之后要作用在文件上。
+    const editing =
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable ||
+      (target.tagName === "INPUT" &&
+        (target !== inputRef.current || inputEditingRef.current));
     const ctrl = event.ctrlKey || event.metaKey;
     const key = event.key.toLowerCase();
     // 一次按键只能执行一次：这里 stopPropagation，根的 keydown 和 document 上的
@@ -1824,14 +1906,18 @@ function Launcher() {
       event.preventDefault();
       event.stopPropagation();
     };
-    if (event.key === "Delete" && picked.size > 0 && !renaming) {
+    if (event.key === "Delete" && picked.size > 0 && !editing) {
       take();
       void invoke<number>("launcher_trash", { paths: [...picked] })
-        .then(() => afterFileChange())
+        .then(() => {
+          afterFileChange();
+          // 回收站操作可能把前台抢走；马上按 Ctrl+Z 得还能落在面板上。
+          void invoke("launcher_refocus").catch(() => {});
+        })
         .catch((error) => showToastRef.current(String(error)));
       return true;
     }
-    if (ctrl && (key === "c" || key === "x") && picked.size > 0 && !renaming) {
+    if (ctrl && (key === "c" || key === "x") && picked.size > 0 && !editing) {
       take();
       void invoke("launcher_clipboard_copy", { paths: [...picked], cut: key === "x" }).catch(
         (error) => showToastRef.current(String(error)),
@@ -1839,18 +1925,19 @@ function Launcher() {
       return true;
     }
     // Ctrl+Z：撤销上一步（删进回收站 / 重命名 / 移动 / 新建文件夹）
-    if (ctrl && key === "z" && !renaming) {
+    if (ctrl && key === "z" && !editing) {
       take();
       void invoke<string>("launcher_undo")
         .then((message) => {
           afterFileChange();
+          void invoke("launcher_refocus").catch(() => {});
           showToastRef.current(message);
         })
         .catch((error) => showToastRef.current(String(error)));
       return true;
     }
 
-    if (ctrl && key === "v" && !renaming) {
+    if (ctrl && key === "v") {
       const dir = currentDir || root.root;
       if (!dir) return false;
       take();
@@ -1865,6 +1952,7 @@ function Launcher() {
   // Ctrl+Z 用 document 级监听兜底：焦点落在没有自己的按键处理的地方时也能撤销。
   // 输入框里除外——那里 Ctrl+Z 该撤销打的字，不是撤销文件操作。
   useEffect(() => {
+    if (scope.kind === "notes") return;
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z") return;
       if (event.defaultPrevented) return;
@@ -1874,13 +1962,14 @@ function Launcher() {
       void invoke<string>("launcher_undo")
         .then((message) => {
           afterFileChange();
+          void invoke("launcher_refocus").catch(() => {});
           showToastRef.current(message);
         })
         .catch((error) => showToastRef.current(String(error)));
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [afterFileChange]);
+  }, [afterFileChange, scope.kind]);
 
   // 主题跟随设置（不只是系统）：面板要跟设置窗口、桌面格子一致
   useEffect(() => watchTheme(), []);
@@ -2342,7 +2431,13 @@ function Launcher() {
             <input
               ref={inputRef}
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                inputEditingRef.current = true;
+                setQuery(event.target.value);
+              }}
+              onPointerDown={() => {
+                inputEditingRef.current = true;
+              }}
               onKeyDown={onInputKeyDown}
               placeholder=""
               spellCheck={false}
@@ -2370,6 +2465,8 @@ function Launcher() {
             );
           }}
           onPointerDown={(event) => {
+            // 点条目 / 空白处：之后的 Delete、Ctrl+C 作用在文件上。
+            inputEditingRef.current = false;
             gesture.begin(event);
             beginMarquee(event);
           }}
