@@ -567,16 +567,69 @@
         max-width: none;
       }
 
-      .row-meta {
+      /* 列表的列名：和下面的行同一套列宽，点一下按这一列排序。 */
+      .list-head {
         flex: 0 0 auto;
-        min-width: calc(62px * var(--zoom, 1));
+        display: flex;
+        align-items: center;
+        gap: calc(10px * var(--zoom, 1));
+        height: calc(22px * var(--zoom, 1));
+        box-sizing: border-box;
+        padding: 0 calc(11px * var(--zoom, 1));
+        border-bottom: 1px solid var(--line);
+      }
+
+      .head-cell {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        min-width: 0;
+        height: 100%;
+        padding: 0;
+        border: none;
+        border-radius: calc(6px * var(--zoom, 1));
+        background: transparent;
+        color: var(--muted);
+        font: inherit;
+        font-size: calc(11.5px * var(--zoom, 1));
+        line-height: 1;
+        cursor: default;
+      }
+
+      /* 和格子那边一致：悬停只亮底，方向靠列名后面的箭头。 */
+      .head-cell:hover {
+        background: var(--surface-2);
+      }
+
+      /* 名称列让开图标：和行里「图标 + 间距」同宽，日期 / 大小两列右对齐。 */
+      .head-cell.name {
+        flex: 1 1 auto;
+        padding-left: calc(32px * var(--zoom, 1));
+      }
+
+      .head-cell.modified,
+      .head-cell.size {
+        flex: 0 0 auto;
+        justify-content: flex-end;
+      }
+
+      .head-cell.modified {
+        width: calc(96px * var(--zoom, 1));
+      }
+
+      .head-cell.size {
+        width: calc(62px * var(--zoom, 1));
+      }
+
+      .row-meta {
+        flex: 0 0 calc(62px * var(--zoom, 1));
         text-align: right;
         color: var(--muted);
         font-size: calc(11.5px * var(--zoom, 1));
       }
 
       .row-meta.date {
-        min-width: calc(96px * var(--zoom, 1));
+        flex: 0 0 calc(96px * var(--zoom, 1));
       }
       .grid {
         position: relative;

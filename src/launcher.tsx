@@ -13,6 +13,9 @@ import ReactDOM from "react-dom/client";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+// 界面图标统一用 lucide：设置页、呼出面板、桌面格子（原生层由
+// `scripts/gen-icons.mjs` 从同一套图标生成）都是这一套形状。
+import { ArrowDownWideNarrow, LayoutGrid, List, Search } from "lucide-react";
 import {
   GRID_CELL_W,
   GRID_GAP,
@@ -401,6 +404,15 @@ function Launcher() {
   // 后端那套显示方式读进来之前不保存：否则开 panel 时的默认 100% 会把存着的缩放盖掉。
   const restoredRef = useRef(false);
   const [sortMenu, setSortMenu] = useState(false);
+  // 排序菜单和列表列名共用：点同一列反转方向，换一列从升序开始。
+  const chooseSort = useCallback((key: SortKey) => {
+    setSort((previous) =>
+      previous.key === key
+        ? { ...previous, dir: previous.dir === 1 ? -1 : 1 }
+        : // 使用频率默认降序：最常打开的排最前面。
+          { key, dir: key === "frequent" ? -1 : 1 },
+    );
+  }, []);
 
   // 视口尺寸变化（切网格/列表、窗口拉大、滚动条出现）都要重新算可视范围。
   useEffect(() => {
@@ -2357,21 +2369,7 @@ function Launcher() {
               onClick={() => setSortMenu((open) => !open)}
               title={`排序：${SORT_LABELS[sort.key]} ${sort.dir === 1 ? "升序" : "降序"}`}
             >
-              <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
-                <path
-                  d="M2 3.5h7M2 7.5h4.5M2 11.5h2"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="M12 2.5v9m0 0 2-2m-2 2-2-2"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
+              <ArrowDownWideNarrow size={16} strokeWidth={2} aria-hidden="true" />
             </button>
             {sortMenu && (
               <div className="sort-menu">
@@ -2381,12 +2379,7 @@ function Launcher() {
                     key={key}
                     className={`sort-item${sort.key === key ? " active" : ""}`}
                     onClick={() => {
-                      setSort((previous) =>
-                        previous.key === key
-                          ? { ...previous, dir: previous.dir === 1 ? -1 : 1 }
-                          // 使用频率默认降序：最常打开的排最前面。
-                          : { key, dir: key === "frequent" ? -1 : 1 },
-                      );
+                      chooseSort(key);
                       setSortMenu(false);
                     }}
                   >
@@ -2404,30 +2397,15 @@ function Launcher() {
             title={view === "grid" ? "切换到列表" : "切换到图标"}
           >
             {view === "grid" ? (
-              <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
-                <path d="M2 3.5h11M2 7.5h11M2 11.5h11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-              </svg>
+              <List size={16} strokeWidth={2} aria-hidden="true" />
             ) : (
-              <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
-                <rect x="2" y="2" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3" />
-                <rect x="8.5" y="2" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3" />
-                <rect x="2" y="8.5" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3" />
-                <rect x="8.5" y="8.5" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3" />
-              </svg>
+              <LayoutGrid size={16} strokeWidth={2} aria-hidden="true" />
             )}
           </button>
             </>
           )}
           <div className="search">
-            <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
-              <circle cx="7.2" cy="7.2" r="5.2" stroke="currentColor" strokeWidth="1.6" />
-              <path
-                d="M11.2 11.2 15 15"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                strokeLinecap="round"
-              />
-            </svg>
+            <Search size={16} strokeWidth={2} aria-hidden="true" />
             <input
               ref={inputRef}
               value={query}
@@ -2445,6 +2423,38 @@ function Launcher() {
             />
           </div>
         </div>
+        {/* 列表视图的列名：和格子那边一样，点一下按这一列排序。 */}
+        {view === "list" && scope.kind !== "notes" && (
+          <div
+            className="list-head"
+            style={
+              {
+                "--zoom": metrics.factor,
+                marginLeft: metrics.listPad,
+                marginRight: metrics.listPad,
+              } as React.CSSProperties
+            }
+          >
+            {(["name", "modified", "size"] as const).map((key) => (
+              <button
+                type="button"
+                key={key}
+                className={`head-cell ${key}`}
+                // 点列名不该把键盘焦点从搜索框抢走：排序完快捷键还能用。
+                onPointerDown={(event) => {
+                  event.preventDefault();
+                  requestAnimationFrame(() => inputRef.current?.focus());
+                }}
+                onClick={() => chooseSort(key)}
+              >
+                <span>{SORT_LABELS[key]}</span>
+                {sort.key === key && (
+                  <span aria-hidden="true">{sort.dir === 1 ? "↑" : "↓"}</span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
         <div
           className={view === "grid" ? "grid" : "list"}
           ref={gridRef}
@@ -2686,8 +2696,9 @@ function Launcher() {
               )}
               {view === "list" && (
                 <>
-                  <span className="row-meta">{item.isDir ? "" : formatSize(item.size)}</span>
+                  {/* 列的顺序和表头、桌面格子一致：名称、修改时间、大小。 */}
                   <span className="row-meta date">{formatDate(item.modified)}</span>
+                  <span className="row-meta">{item.isDir ? "" : formatSize(item.size)}</span>
                 </>
               )}
             </div>

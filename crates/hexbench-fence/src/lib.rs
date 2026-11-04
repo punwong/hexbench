@@ -143,6 +143,8 @@ pub struct Bench {
 pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
 
 #[cfg(windows)]
+mod icons;
+#[cfg(windows)]
 mod win;
 
 #[cfg(windows)]

@@ -1215,9 +1215,14 @@ fn scale_at_cursor(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// 设置窗口每显示一次就加一。关窗后延迟回收的线程拿它判断这中间是不是又打开过，
+/// 免得恰好在回收那一刻打开的窗口被销毁掉。
+static MAIN_SHOW_GEN: AtomicU64 = AtomicU64::new(0);
+
 fn open_main_now(app: &AppHandle) {
     check_update_if_stale(app);
     if let Some(window) = app.get_webview_window("main") {
+        MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -1235,24 +1240,28 @@ fn open_main_now(app: &AppHandle) {
         ),
         None => (980.0, 660.0),
     };
-    if let Err(error) =
-        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title("HexBench")
-            .inner_size(width, height)
-            .min_inner_size(840.0, 560.0)
-            // The app draws its own title bar and window buttons.
-            .decorations(false)
-            .zoom_hotkeys_enabled(false)
-            .center()
-            .build()
+    match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("HexBench")
+        .inner_size(width, height)
+        .min_inner_size(840.0, 560.0)
+        // The app draws its own title bar and window buttons.
+        .decorations(false)
+        .zoom_hotkeys_enabled(false)
+        .center()
+        .build()
     {
-        // 打不开设置窗口时不能只写日志：从托盘 / 热键点进来的用户会以为什么都没发生。
-        log::error!("main window: build failed: {error}");
-        use tauri_plugin_dialog::DialogExt;
-        app.dialog()
-            .message(format!("打不开设置窗口：{error}"))
-            .title("HexBench")
-            .show(|_| {});
+        Ok(_) => {
+            MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(error) => {
+            // 打不开设置窗口时不能只写日志：从托盘 / 热键点进来的用户会以为什么都没发生。
+            log::error!("main window: build failed: {error}");
+            use tauri_plugin_dialog::DialogExt;
+            app.dialog()
+                .message(format!("打不开设置窗口：{error}"))
+                .title("HexBench")
+                .show(|_| {});
+        }
     }
 }
 
@@ -2952,6 +2961,7 @@ fn launcher_save_location(
 #[tauri::command]
 fn open_settings(page: String, tab: Option<String>, app: AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -7837,16 +7847,23 @@ pub fn run() {
             // The app lives in the tray, so closing the window must not quit.
             // See below: it is hidden now and destroyed a little later.
             api.prevent_close();
-            // Hide, never destroy on the spot: destroying a WebView2 can block
-            // the event loop for a noticeable moment, and rebuilding it on the
-            // next open costs even more. The window is torn down later, once it
-            // is clear the user is not coming straight back.
+            // Hide first so the click feels instant. The window itself (and its
+            // renderer, ~40–50 MB) is torn down a moment later: destroying a
+            // WebView2 can block the event loop for a noticeable moment, but
+            // keeping it around forever wastes the memory the close was meant
+            // to free. Rebuilding takes ~400 ms, so a quick reopen keeps the
+            // warm window; the launcher WebView is never touched.
             let _ = window.hide();
+            let generation = MAIN_SHOW_GEN.load(Ordering::SeqCst);
             let window = window.clone();
             thread::spawn(move || {
-                thread::sleep(Duration::from_secs(30));
-                if window.is_visible().unwrap_or(false) {
-                    return; // reopened meanwhile, keep the warm window
+                thread::sleep(Duration::from_secs(5));
+                // Reopened meanwhile. The generation also covers a show that is
+                // already on its way through the event loop.
+                if window.is_visible().unwrap_or(false)
+                    || MAIN_SHOW_GEN.load(Ordering::SeqCst) != generation
+                {
+                    return;
                 }
                 let started = Instant::now();
                 let _ = window.destroy();

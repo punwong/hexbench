@@ -442,6 +442,23 @@ cargo test -p hexbench-core drop_target
 日志里应看到 `invoked shell command` 之后**没有**紧跟着 `hide`，压缩结束后才收。
 自动化可以用 `%TEMP%\menutest.ps1`（弹菜单、按 Down×N + Enter 选中）。
 
+## 图标（lucide 一套）
+
+界面图标（不含文件类型图标）只有一个来源：**lucide**。
+
+- 网页部分直接用 `lucide-react`：设置窗口、呼出面板都是。
+- 桌面格子是 Direct2D 画的，用不了 SVG：`node scripts/gen-icons.mjs` 会读
+  `node_modules/lucide-react` 里的图标定义，把 path / circle / rect 图元采样成折线，
+  写进 `crates/hexbench-fence/src/icons.rs`（**生成文件，别手改**）。换图标或升级
+  lucide 之后重跑一次；CI 会重跑并比对，文件过期会直接失败。
+- 原生层按 `size / 24` 缩放、描边宽度随之变成 `2 / 24 * size`，和网页里
+  `<Icon size={n} />` 的比例一致；圆头、圆角连接（`gpu.stroke`）。
+- 尺寸只有三档：工具条 / 标题条按钮 **16**（`size={16}`、`*_ICON = 16.0`），
+  前进 / 后退箭头和卡片头图标 **18**，文字按钮旁的小图标 **14**。三处要一起改。
+- 新增图标：在 `scripts/gen-icons.mjs` 的 `ICONS` 里加一行（Rust 常量名 → lucide
+  文件名），重跑脚本，再在 `win.rs` 里 `bake_icon` 并按需 `draw_icon`。
+- 文件 / 文件夹图标是系统图标（`hbicon://`），不属于这套，不要试图替换。
+
 ## 调试版 exe 的前端来源
 
 `cargo build` 出来的 debug exe **不内嵌前端**：主界面、面板这些 WebView 窗口都从

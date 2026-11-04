@@ -35,6 +35,13 @@ jobs:
       - name: 类型检查 + 前端构建
         run: pnpm build
 
+      # 原生格子的图标是从 lucide 生成的；升级 lucide 后忘了重跑，两边的形状
+      # 就会悄悄分叉。这里重跑一遍，生成结果和工作区不一致就算失败。
+      - name: 图标数据是最新的
+        run: |
+          node scripts/gen-icons.mjs
+          git diff --exit-code -- crates/hexbench-fence/src/icons.rs
+
       - name: Rust 测试
         run: cargo test --workspace
 

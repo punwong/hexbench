@@ -25,17 +25,17 @@ use windows::Win32::Foundation::{
     COLORREF, GENERIC_READ, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
-    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_RECT_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
     D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1,
-    ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1PathGeometry,
-    ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    ID2D1Bitmap1, ID2D1Brush, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
+    ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -736,6 +736,45 @@ fn bench(engine: &Engine, fence: &mut FenceWindow, frames: usize) -> Option<Benc
 
 // ---------- GPU ----------
 
+// 标题条图标的显示尺寸：lucide 的 24 网格按这个大小缩放，描边随之变成
+// 2 / 24 * size，和网页里 `size={n}` 的 lucide 图标是同一个比例。
+/// 标题条按钮的图标尺寸：网页里工具条按钮也用 16，三处（设置、面板、格子）一致。
+const FOLDER_ICON: f32 = 16.0;
+/// 前进 / 后退箭头属于导航图标，比按钮图标大一号。
+const CHEVRON_ICON: f32 = 18.0;
+const SEARCH_ICON: f32 = 16.0;
+const VIEW_ICON: f32 = 16.0;
+const DOTS_ICON: f32 = 16.0;
+
+/// 把 `icons.rs` 里的 24×24 折线烘成以原点为中心、按 `size` 缩放的几何体。
+fn bake_icon(
+    factory: &ID2D1Factory1,
+    icon: &crate::icons::Icon,
+    size: f32,
+) -> Result<ID2D1PathGeometry> {
+    let scale = size / 24.0;
+    let geometry = unsafe { factory.CreatePathGeometry()? };
+    let sink = unsafe { geometry.Open()? };
+    let at = |point: (f32, f32)| Vector2 {
+        X: (point.0 - 12.0) * scale,
+        Y: (point.1 - 12.0) * scale,
+    };
+    for path in icon.paths {
+        let Some((first, rest)) = path.split_first() else {
+            continue;
+        };
+        unsafe {
+            sink.BeginFigure(at(*first), D2D1_FIGURE_BEGIN_HOLLOW);
+            for point in rest {
+                sink.AddLine(at(*point));
+            }
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        }
+    }
+    unsafe { sink.Close()? };
+    Ok(geometry.into())
+}
+
 struct Gpu {
     _d3d: ID3D11Device,
     _ctx: ID3D11DeviceContext,
@@ -756,7 +795,14 @@ struct Gpu {
     /// 本地时区相对 UTC 的偏移（秒）和今年的年份：列表里的时间按本地时间画。
     tz_offset: i64,
     this_year: i32,
-    folder: ID2D1PathGeometry,
+    /// 界面图标：和网页那边同一套 lucide 形状（见 `icons.rs`），
+    /// 按各自的显示尺寸烘成几何体、以原点为中心，画的时候只平移。
+    icon_folder: ID2D1PathGeometry,
+    icon_chevron: ID2D1PathGeometry,
+    icon_search: ID2D1PathGeometry,
+    icon_grid: ID2D1PathGeometry,
+    icon_list: ID2D1PathGeometry,
+    icon_dots: ID2D1PathGeometry,
     /// 手势轨迹：圆头圆角，点再密也看不到接缝。
     stroke: ID2D1StrokeStyle,
 }
@@ -867,23 +913,14 @@ impl Gpu {
             fmt_empty.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             fmt_empty.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
-            // 标题条左边的文件夹轮廓：20×20 viewBox 的 SVG 路径，圆角换成直角折线。
-            // 坐标直接按「17px 大小、左上角在 (9.5, 11.5)」烘进几何体里——传给
-            // `DrawGeometry` 的只有当前变换（含 DComp 图集偏移），不再自己拼矩阵。
-            let folder = factory.CreatePathGeometry()?;
-            let sink = folder.Open()?;
-            let at = |x: f32, y: f32| Vector2 {
-                X: 9.5 + x * (17.0 / 20.0),
-                Y: 11.5 + y * (17.0 / 20.0),
-            };
-            sink.BeginFigure(at(3.8, 5.4), D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(at(6.9, 5.4));
-            sink.AddLine(at(8.4, 7.0));
-            sink.AddLine(at(16.2, 7.0));
-            sink.AddLine(at(16.2, 15.2));
-            sink.AddLine(at(3.8, 15.2));
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink.Close()?;
+            // 标题条图标：全部来自 lucide（网页那边用的是同一个图标集），
+            // 按各自的显示尺寸烘成以原点为中心的几何体，画的时候只做平移。
+            let icon_folder = bake_icon(&factory, &crate::icons::FOLDER, FOLDER_ICON)?;
+            let icon_chevron = bake_icon(&factory, &crate::icons::CHEVRON_LEFT, CHEVRON_ICON)?;
+            let icon_search = bake_icon(&factory, &crate::icons::SEARCH, SEARCH_ICON)?;
+            let icon_grid = bake_icon(&factory, &crate::icons::LAYOUT_GRID, VIEW_ICON)?;
+            let icon_list = bake_icon(&factory, &crate::icons::LIST, VIEW_ICON)?;
+            let icon_dots = bake_icon(&factory, &crate::icons::ELLIPSIS, DOTS_ICON)?;
 
             Ok(Gpu {
                 _d3d: d3d,
@@ -901,7 +938,12 @@ impl Gpu {
                 fmt_empty,
                 tz_offset: local_offset_secs(),
                 this_year: this_year_local(),
-                folder: folder.into(),
+                icon_folder,
+                icon_chevron,
+                icon_search,
+                icon_grid,
+                icon_list,
+                icon_dots,
                 stroke: stroke.into(),
             })
         }
@@ -2237,7 +2279,7 @@ impl FenceWindow {
             self.dc.SetTransform(&base);
             let transparent = rgb(0, 0, 0, 0.0);
             self.dc.Clear(Some(&transparent));
-            self.paint(gpu);
+            self.paint(gpu, &base);
             self.dc.EndDraw(None, None)?;
             self.dc.SetTarget(None::<&ID2D1Image>);
         }
@@ -2248,7 +2290,32 @@ impl FenceWindow {
         Ok(())
     }
 
-    fn paint(&self, gpu: &Gpu) {
+    /// 画一个标题条图标。几何体已经按显示尺寸烘好、以原点为中心，这里只平移。
+    fn draw_icon(
+        &self,
+        gpu: &Gpu,
+        icon: &ID2D1PathGeometry,
+        stroke: f32,
+        center: Vector2,
+        brush: &ID2D1Brush,
+        base: &Matrix3x2,
+    ) {
+        let transform = Matrix3x2 {
+            M11: 1.0,
+            M12: 0.0,
+            M21: 0.0,
+            M22: 1.0,
+            M31: base.M31 + center.X,
+            M32: base.M32 + center.Y,
+        };
+        unsafe {
+            self.dc.SetTransform(&transform);
+            self.dc.DrawGeometry(icon, brush, stroke, Some(&gpu.stroke));
+            self.dc.SetTransform(base);
+        }
+    }
+
+    fn paint(&self, gpu: &Gpu, base: &Matrix3x2) {
         let w = self.logical_w;
         let h = self.logical_h;
         let dc = &self.dc;
@@ -2301,14 +2368,17 @@ impl FenceWindow {
 
         if self.crumbs.is_empty() {
             // 根目录：文件夹轮廓 + 标题。
-            //
-            // 几何体在构造时就已经按 17px 缩放、平移到标题条上了，这里直接用
-            // `base` 画。以前是 `*base * 局部变换` 叠一次：`base` 带着 DComp
-            // 图集给的偏移，矩阵乘法顺序一变，图形就画到窗口外面去了——
-            // 鼠标扫过重绘时一帧有一帧没有，看着就是标题前的小图标在闪。
-            unsafe {
-                dc.DrawGeometry(&gpu.folder, &self.brushes.muted, 1.1, None);
-            }
+            self.draw_icon(
+                gpu,
+                &gpu.icon_folder,
+                2.0 * FOLDER_ICON / 24.0,
+                Vector2 {
+                    X: 18.0,
+                    Y: HEADER_H / 2.0,
+                },
+                &self.brushes.muted,
+                base,
+            );
             if let Some(layout) = &self.title_layout {
                 unsafe {
                     dc.DrawTextLayout(
@@ -2321,23 +2391,17 @@ impl FenceWindow {
             }
         } else {
             // 子目录：左边「‹」返回，右边面包屑，最后一段是当前目录。
-            unsafe {
-                let mid = HEADER_H / 2.0;
-                dc.DrawLine(
-                    Vector2 { X: 21.0, Y: mid - 5.0 },
-                    Vector2 { X: 15.0, Y: mid },
-                    &self.brushes.muted,
-                    1.3,
-                    None,
-                );
-                dc.DrawLine(
-                    Vector2 { X: 15.0, Y: mid },
-                    Vector2 { X: 21.0, Y: mid + 5.0 },
-                    &self.brushes.muted,
-                    1.3,
-                    None,
-                );
-            }
+            self.draw_icon(
+                gpu,
+                &gpu.icon_chevron,
+                2.0 * CHEVRON_ICON / 24.0,
+                Vector2 {
+                    X: 18.0,
+                    Y: HEADER_H / 2.0,
+                },
+                &self.brushes.muted,
+                base,
+            );
             if let Some(layout) = &self.nav_more {
                 if self.nav_elided {
                     unsafe {
@@ -2427,92 +2491,44 @@ impl FenceWindow {
             } else {
                 &self.brushes.text
             };
-            let ring = D2D1_ELLIPSE {
-                point: Vector2 {
-                    X: cx - 1.5,
-                    Y: cy - 1.5,
-                },
-                radiusX: 4.4,
-                radiusY: 4.4,
-            };
-            unsafe {
-                dc.DrawEllipse(&ring, ink, 1.3, None);
-                dc.DrawLine(
-                    Vector2 {
-                        X: cx + 1.8,
-                        Y: cy + 1.8,
-                    },
-                    Vector2 {
-                        X: cx + 5.0,
-                        Y: cy + 5.0,
-                    },
-                    ink,
-                    1.4,
-                    None,
-                );
-            }
+            self.draw_icon(
+                gpu,
+                &gpu.icon_search,
+                2.0 * SEARCH_ICON / 24.0,
+                Vector2 { X: cx, Y: cy },
+                ink,
+                base,
+            );
         }
         // 视图切换按钮：图标画的是「点了会变成什么样」——
         // 现在是图标网格就画列表，现在是列表就画网格。
-        {
-            let cx = self.view_left() + VIEW_W / 2.0;
-            let cy = HEADER_H / 2.0;
-            let ink = &self.brushes.muted;
-            unsafe {
-                if self.list {
-                    for (dx, dy) in [(-6.0f32, -6.0f32), (1.0, -6.0), (-6.0, 1.0), (1.0, 1.0)] {
-                        let cell = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: cx + dx,
-                                top: cy + dy,
-                                right: cx + dx + 5.0,
-                                bottom: cy + dy + 5.0,
-                            },
-                            radiusX: 1.2,
-                            radiusY: 1.2,
-                        };
-                        dc.FillRoundedRectangle(&cell, ink);
-                    }
-                } else {
-                    for dy in [-5.5f32, 0.0, 5.5] {
-                        let line = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: cx - 1.0,
-                                top: cy + dy - 1.0,
-                                right: cx + 7.0,
-                                bottom: cy + dy + 1.0,
-                            },
-                            radiusX: 1.0,
-                            radiusY: 1.0,
-                        };
-                        dc.FillRoundedRectangle(&line, ink);
-                        let dot = D2D1_ELLIPSE {
-                            point: Vector2 {
-                                X: cx - 5.0,
-                                Y: cy + dy,
-                            },
-                            radiusX: 1.0,
-                            radiusY: 1.0,
-                        };
-                        dc.FillEllipse(&dot, ink);
-                    }
-                }
-            }
-        }
+        self.draw_icon(
+            gpu,
+            if self.list {
+                &gpu.icon_grid
+            } else {
+                &gpu.icon_list
+            },
+            2.0 * VIEW_ICON / 24.0,
+            Vector2 {
+                X: self.view_left() + VIEW_W / 2.0,
+                Y: HEADER_H / 2.0,
+            },
+            &self.brushes.muted,
+            base,
+        );
         // 右侧「更多」的三颗点。
-        for index in 0..3 {
-            let dot = D2D1_ELLIPSE {
-                point: Vector2 {
-                    X: self.dots_left() + DOTS_W / 2.0 - 4.2 + index as f32 * 4.2,
-                    Y: HEADER_H / 2.0,
-                },
-                radiusX: 1.15,
-                radiusY: 1.15,
-            };
-            unsafe {
-                dc.FillEllipse(&dot, &self.brushes.text);
-            }
-        }
+        self.draw_icon(
+            gpu,
+            &gpu.icon_dots,
+            2.0 * DOTS_ICON / 24.0,
+            Vector2 {
+                X: self.dots_left() + DOTS_W / 2.0,
+                Y: HEADER_H / 2.0,
+            },
+            &self.brushes.text,
+            base,
+        );
 
         if self.rolled || h <= HEADER_H {
             return;
@@ -2999,6 +3015,8 @@ const EM_SETSEL_MSG: u32 = 0x00B1;
 const EM_SETMARGINS_MSG: u32 = 0x00D3;
 /// 左右各留 3px，字不要贴着边框。
 const EDIT_MARGINS: isize = 0x0003_0003;
+/// 搜索框左右各留 8px，和呼出面板搜索框的 padding 一致。
+const FIELD_MARGINS: isize = 0x0008_0008;
 
 fn cursor_screen() -> POINT {
     let mut point = POINT::default();
@@ -3285,14 +3303,21 @@ unsafe fn create_edit_popup(
     height: i32,
     text: &str,
     dark: bool,
+    // 搜索框那种「填充块」样式：圆角、不画边框、左右留白和面板里一致。
+    field: bool,
 ) -> Option<EditPopup> {
     unsafe {
         let module = GetModuleHandleW(None).ok()?;
+        let style = if field {
+            WS_POPUP | WS_CLIPSIBLINGS
+        } else {
+            WS_POPUP | WS_BORDER | WS_CLIPSIBLINGS
+        };
         let popup = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class,
             w!(""),
-            WS_POPUP | WS_BORDER | WS_CLIPSIBLINGS,
+            style,
             x,
             y,
             width,
@@ -3338,19 +3363,27 @@ unsafe fn create_edit_popup(
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             w!("Microsoft YaHei UI"),
         );
-        let (bg, fg) = if dark {
-            (COLORREF(0x0032_3235), COLORREF(0x00F0_F0F0))
-        } else {
-            (COLORREF(0x00FF_FFFF), COLORREF(0x001E_1E1E))
+        // 搜索框用面板里那套填充色（浅色 #EFEFF1 / 深色 #232323）；
+        // 改名框还是白底黑字，压在文件名上更好认。
+        let (bg, fg) = match (field, dark) {
+            (true, true) => (COLORREF(0x0023_2323), COLORREF(0x00EC_ECEC)),
+            // COLORREF 是 0x00BBGGRR：#EFEFF1 写成 0x00F1EFEF。
+            (true, false) => (COLORREF(0x00F1_EFEF), COLORREF(0x000D_0D0D)),
+            (false, true) => (COLORREF(0x0032_3235), COLORREF(0x00F0_F0F0)),
+            (false, false) => (COLORREF(0x00FF_FFFF), COLORREF(0x001E_1E1E)),
         };
         let brush = CreateSolidBrush(bg);
+        if field {
+            // 和呼出面板的搜索框一样是圆角：系统按普通窗口那套 8px 剪。
+            hexbench_core::sys::round_window_corners(popup.0 as isize);
+        }
         let previous = GetForegroundWindow();
         let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
         let _ = SendMessageW(
             edit,
             EM_SETMARGINS_MSG,
             Some(WPARAM(0x0003)),
-            Some(LPARAM(EDIT_MARGINS)),
+            Some(LPARAM(if field { FIELD_MARGINS } else { EDIT_MARGINS })),
         );
         Some(EditPopup {
             popup,
@@ -3388,6 +3421,7 @@ fn show_rename_box(
             height,
             text,
             dark,
+            false,
         ) else {
             return;
         };
@@ -3605,10 +3639,11 @@ fn open_search(owner: HWND, fence: &mut FenceWindow) {
             return;
         }
         let scale = fence.scale.max(0.5);
-        let height = (24.0 * scale).round().max(20.0) as i32;
+        // 高度 26、圆角、填充底色都对着呼出面板的搜索框来。
+        let height = (26.0 * scale).round().max(20.0) as i32;
         let left = rect.left + (12.0 * scale).round() as i32;
         let right = rect.left + ((fence.search_left() - 8.0) * scale).round() as i32;
-        let top = rect.top + (((HEADER_H - 24.0) / 2.0) * scale).round() as i32;
+        let top = rect.top + (((HEADER_H - 26.0) / 2.0) * scale).round() as i32;
         let width = (right - left).max(120);
         let Some(parts) = create_edit_popup(
             w!("HexBenchNativeFenceSearch"),
@@ -3619,6 +3654,7 @@ fn open_search(owner: HWND, fence: &mut FenceWindow) {
             height,
             &fence.filter,
             fence.dark,
+            true,
         ) else {
             return;
         };

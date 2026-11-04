@@ -1147,7 +1147,7 @@ function EyeButton({ hidden, onClick }: { hidden: boolean; onClick: () => void }
       title={hidden ? "在面板里隐藏：点一下显示" : "在面板里显示：点一下隐藏"}
       onClick={onClick}
     >
-      {hidden ? <EyeOff size={15} /> : <Eye size={15} />}
+      {hidden ? <EyeOff size={16} /> : <Eye size={16} />}
     </button>
   );
 }
@@ -2272,7 +2272,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                           }).catch((problem) => setError(String(problem)))
                         }
                       >
-                        {fence.view === "list" ? <LayoutGrid size={15} /> : <List size={15} />}
+                        {fence.view === "list" ? <LayoutGrid size={16} /> : <List size={16} />}
                       </button>
                       <button
                         type="button"
@@ -2284,7 +2284,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                           )
                         }
                       >
-                        {fence.locked ? <Lock size={15} /> : <LockOpen size={15} />}
+                        {fence.locked ? <Lock size={16} /> : <LockOpen size={16} />}
                       </button>
                       <EyeButton
                         hidden={!fence.visible}
@@ -2303,7 +2303,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                             setOpenRules((current) => (current === fence.id ? null : fence.id))
                           }
                         >
-                          <SlidersHorizontal size={15} />
+                          <SlidersHorizontal size={16} />
                         </button>
                       )}
                       <button
@@ -2313,7 +2313,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                         disabled={!fence.path}
                         onClick={() => void openPath(fence.path)}
                       >
-                        <FolderOpen size={15} />
+                        <FolderOpen size={16} />
                       </button>
                       <button
                         type="button"
@@ -2321,7 +2321,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                         title="删除这个格子"
                         onClick={() => void askDelete(fence)}
                       >
-                        <Trash2 size={15} />
+                        <Trash2 size={16} />
                       </button>
                     </span>
                   </div>
