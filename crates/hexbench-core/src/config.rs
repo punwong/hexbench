@@ -617,6 +617,9 @@ pub struct NotesSettings {
     pub folder: String,
     /// 发送后是否再按一次回车（表单输入一般不要，聊天 / 搜索才要）。
     pub send_enter: bool,
+    /// 钉在桌面上的笔记窗口。`id` 跟着改文件名走，`label` 是窗口标签，
+    /// 改名时只换 `id`，窗口不重建。
+    pub pinned: Vec<NotePin>,
 }
 
 impl Default for NotesSettings {
@@ -625,8 +628,28 @@ impl Default for NotesSettings {
             enabled: true,
             folder: String::new(),
             send_enter: false,
+            pinned: Vec::new(),
         }
     }
+}
+
+/// 一条钉住的笔记：窗口标签 + 屏幕位置（物理像素）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotePin {
+    /// 当前的笔记文件名（含 `.md`）；标题改名后会更新。
+    pub id: String,
+    /// 窗口标签（`note-<n>`），钉住期间不变。
+    pub label: String,
+    /// 窗口左上角，物理像素。
+    pub x: i32,
+    pub y: i32,
+    /// 窗口大小，物理像素。收起时这里仍是展开后的大小。
+    pub w: u32,
+    pub h: u32,
+    /// 收起到只剩标题栏（和桌面格子一样）。旧配置里没有这一项，按展开算。
+    #[serde(default)]
+    pub rolled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

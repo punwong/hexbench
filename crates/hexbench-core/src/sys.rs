@@ -1118,6 +1118,18 @@ pub fn show_window(hwnd: isize) {
     }
 }
 
+/// 显示窗口但**不抢焦点**：便签从面板里钉出来时，用户还在面板上，键盘焦点不该跳走。
+pub fn show_window_no_activate(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 标准窗口操作。
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
+    }
+}
+
 pub fn hide_window(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     if hwnd == 0 {
@@ -1362,6 +1374,37 @@ pub fn open_path(path: &std::path::Path) -> Result<(), String> {
             SW_SHOWNORMAL,
         );
         // ShellExecuteW 返回值 > 32 才算成功（老 API 的约定）。
+        if result as isize <= 32 {
+            return Err(format!("ShellExecuteW {}", result as isize));
+        }
+    }
+    Ok(())
+}
+
+/// 用系统默认浏览器打开一个网页链接（便签里的 Markdown 链接）。
+pub fn open_url(url: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:"))
+    {
+        return Err("只支持 http / https / mailto 链接".to_string());
+    }
+    let target: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe {
+        let result = ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
         if result as isize <= 32 {
             return Err(format!("ShellExecuteW {}", result as isize));
         }

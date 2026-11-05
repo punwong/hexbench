@@ -15,7 +15,15 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 // 界面图标统一用 lucide：设置页、呼出面板、桌面格子（原生层由
 // `scripts/gen-icons.mjs` 从同一套图标生成）都是这一套形状。
-import { ArrowDownWideNarrow, LayoutGrid, List, Search } from "lucide-react";
+import {
+  ArrowDownWideNarrow,
+  LayoutGrid,
+  List,
+  Pin,
+  Redo2,
+  Search,
+  Undo2,
+} from "lucide-react";
 import {
   GRID_CELL_W,
   GRID_GAP,
@@ -40,6 +48,7 @@ import {
   type SortKey,
 } from "./fileview";
 import { watchTheme } from "./theme";
+import { useTextHistory } from "./notehistory";
 import { GESTURE_DEFAULT, useMouseGestures, type GestureSettings } from "./gesture";
 
 /** "top:0;left:8px" → { top: "0", left: "8px" }，省得写 8 组 style 对象。 */
@@ -74,6 +83,8 @@ type LauncherRoot = {
   webEnabled: boolean;
   /** 设置里的「收藏」开关：关掉就不显示收藏那一栏 */
   notesEnabled: boolean;
+  /** 已经钉在桌面上的笔记 id */
+  notesPinned: string[];
   view: string;
   sortKey: string;
   sortDir: number;
@@ -117,8 +128,8 @@ type NoteSummary = {
 type NoteFile = { id: string; title: string; body: string; modified: number };
 type ImportOutcome = { note: NoteSummary; imported: number; skipped: number };
 
-/** 正在编辑的笔记：`id` 为 null 表示还没落盘的新笔记。 */
-type NoteDraft = { id: string | null; title: string; body: string };
+/** 正在编辑的笔记：`id` 为 null 表示还没落盘的新笔记。正文在撤销记录里。 */
+type NoteDraft = { id: string | null; title: string };
 
 type Snapshot = { scope: Scope; path: string };
 
@@ -178,6 +189,7 @@ function Launcher() {
     sites: [],
     webEnabled: false,
     notesEnabled: false,
+    notesPinned: [],
     view: "grid",
     sortKey: "name",
     sortDir: 1,
@@ -346,7 +358,15 @@ function Launcher() {
   // 编辑器是什么时候打开的：单击卡片就编辑，双击的第二下会落到刚出来的遮罩上，
   // 刚打开的这一小会儿不认「点外面关闭」，不然一双击编辑器就闪没了。
   const draftOpenedAt = useRef(0);
-  const [savingNote, setSavingNote] = useState(false);
+  // 正文的撤销 / 重做：编辑器没有保存按钮，撤销就是唯一的退路。
+  const noteBody = useTextHistory("");
+  const noteBodyRef = useRef("");
+  noteBodyRef.current = noteBody.value;
+  // 正在保存到哪个 id。新建笔记第一次保存后才落盘，后续排队的保存都接着它写。
+  const noteSaveIdRef = useRef<string | null>(null);
+  const noteSavedRef = useRef({ title: "", body: "" });
+  const noteSaveChain = useRef<Promise<void>>(Promise.resolve());
+  const [noteSave, setNoteSave] = useState<"saved" | "saving" | "error">("saved");
   // 发送中的笔记 id：按钮上转圈，避免连点发两遍。
   const [sendingNote, setSendingNote] = useState<string | null>(null);
   // 拖着图片悬在哪张卡片上；null = 空白处（新建）。
@@ -1267,6 +1287,10 @@ function Launcher() {
   useEffect(() => {
     const stop = listen("notes-changed", () => {
       void loadNotes();
+      // 便签自己取消钉住、或者改名之后，图钉状态也要跟着对。
+      void invoke<string[]>("notes_pinned")
+        .then((ids) => setRoot((current) => ({ ...current, notesPinned: ids })))
+        .catch(() => undefined);
     });
     return () => {
       void stop.then((unlisten) => unlisten());
@@ -1354,8 +1378,13 @@ function Launcher() {
   const newNote = useCallback(() => {
     setConfirmDelete(null);
     draftOpenedAt.current = Date.now();
-    setDraft({ id: null, title: "", body: "" });
-  }, []);
+    noteBody.reset("");
+    noteBodyRef.current = "";
+    noteSaveIdRef.current = null;
+    noteSavedRef.current = { title: "", body: "" };
+    setNoteSave("saved");
+    setDraft({ id: null, title: "" });
+  }, [noteBody.reset]);
 
   const editNote = useCallback(
     async (note: NoteSummary) => {
@@ -1363,38 +1392,134 @@ function Launcher() {
       try {
         const file = await invoke<NoteFile>("notes_read", { id: note.id });
         draftOpenedAt.current = Date.now();
-        setDraft({ id: file.id, title: file.title, body: file.body });
+        noteBody.reset(file.body);
+        noteBodyRef.current = file.body;
+        noteSaveIdRef.current = file.id;
+        noteSavedRef.current = { title: file.title, body: file.body };
+        setNoteSave("saved");
+        setDraft({ id: file.id, title: file.title });
       } catch (error) {
         showToast(String(error));
       }
     },
-    [showToast],
+    [noteBody.reset, showToast],
   );
 
-  const saveDraft = useCallback(async () => {
-    if (!draft || savingNote) return;
-    const title = draft.title.trim() || "未命名笔记";
-    setSavingNote(true);
-    try {
-      let id = draft.id;
-      if (!id) {
-        const created = await invoke<NoteSummary>("notes_create", { title });
-        id = created.id;
-        // 空笔记已经在磁盘上了：先把 id 记进草稿，后面 notes_save 失败时
-        // 再点保存是接着写这条，而不是又建一条。
-        setDraft((current) =>
-          current && current.id === null ? { ...current, id: created.id } : current,
-        );
-      }
-      await invoke<NoteSummary>("notes_save", { id, title, body: draft.body });
-      setDraft(null);
-      await loadNotes();
-    } catch (error) {
-      showToast(String(error));
-    } finally {
-      setSavingNote(false);
+  /**
+   * 自动保存：没有保存按钮，正文和标题停下来就写盘。
+   *
+   * 排成一条链：连着改了好几处时，后写出的正文一定不会比先写出的旧。
+   * 新建的笔记在第一次真正有内容时才落盘——打开又关掉的空编辑器不该
+   * 在收藏里留下一个「未命名笔记」。
+   */
+  const persistDraft = useCallback(() => {
+    const current = draftRef.current;
+    if (!current) return Promise.resolve();
+    const body = noteBodyRef.current;
+    const typed = current.title;
+    if (!noteSaveIdRef.current && !typed.trim() && !body) {
+      return Promise.resolve();
     }
-  }, [draft, savingNote, loadNotes, showToast]);
+    const title = typed.trim() || "未命名笔记";
+    if (
+      noteSaveIdRef.current &&
+      title === noteSavedRef.current.title &&
+      body === noteSavedRef.current.body
+    ) {
+      return Promise.resolve();
+    }
+    setNoteSave("saving");
+    const run = async () => {
+      try {
+        let id = noteSaveIdRef.current;
+        if (!id) {
+          const created = await invoke<NoteSummary>("notes_create", { title });
+          id = created.id;
+          noteSaveIdRef.current = id;
+          setDraft((open) => (open && open.id === null ? { ...open, id } : open));
+        }
+        const previousId = id;
+        const saved = await invoke<NoteSummary>("notes_save", {
+          id: previousId,
+          title,
+          body,
+        });
+        if (saved.id !== previousId) {
+          noteSaveIdRef.current = saved.id;
+          setDraft((open) =>
+            open && open.id === previousId ? { ...open, id: saved.id } : open,
+          );
+          // 改名会换 id：图钉状态跟着换，不然面板上的「已钉」就丢了。
+          setRoot((current) =>
+            current.notesPinned.includes(previousId)
+              ? {
+                  ...current,
+                  notesPinned: current.notesPinned.map((entry) =>
+                    entry === previousId ? saved.id : entry,
+                  ),
+                }
+              : current,
+          );
+        }
+        noteSavedRef.current = { title, body };
+        setNotes((previous) => [
+          saved,
+          ...previous.filter((note) => note.id !== saved.id && note.id !== id),
+        ]);
+        setNoteSave("saved");
+      } catch (error) {
+        setNoteSave("error");
+        showToastRef.current(String(error));
+      }
+    };
+    noteSaveChain.current = noteSaveChain.current.then(run, run);
+    return noteSaveChain.current;
+  }, []);
+
+  /** 关编辑器：先把最后这一下改动排进保存队列，再收起遮罩。 */
+  const closeDraft = useCallback(() => {
+    if (draftRef.current) void persistDraft();
+    setDraft(null);
+  }, [persistDraft]);
+
+  // 自动保存：停手 500ms 写一次；空的新笔记不落盘。
+  useEffect(() => {
+    if (!draft) return;
+    if (!draft.id && !draft.title.trim() && !noteBody.value) return;
+    const timer = window.setTimeout(() => {
+      void persistDraft();
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [draft, noteBody.value, persistDraft]);
+
+  /** 图钉：在桌面上开一个始终置顶的便签窗口（再点一次收回）。 */
+  const togglePin = useCallback(
+    (note: NoteSummary) => {
+      const pinned = root.notesPinned.includes(note.id);
+      if (pinned) {
+        void invoke("notes_unpin", { id: note.id })
+          .then(() => {
+            setRoot((current) => ({
+              ...current,
+              notesPinned: current.notesPinned.filter((entry) => entry !== note.id),
+            }));
+            showToast("已取消钉住");
+          })
+          .catch((error) => showToast(String(error)));
+        return;
+      }
+      void invoke("notes_pin", { id: note.id })
+        .then(() => {
+          setRoot((current) => ({
+            ...current,
+            notesPinned: [...current.notesPinned, note.id],
+          }));
+          showToast("已钉到桌面：可以拖动、随时编辑");
+        })
+        .catch((error) => showToast(String(error)));
+    },
+    [root.notesPinned, showToast],
+  );
 
   const sendNote = useCallback(
     (note: NoteSummary) => {
@@ -1429,9 +1554,13 @@ function Launcher() {
       }
       setConfirmDelete(null);
       void invoke("notes_delete", { id: note.id })
-        .then(() =>
-          setNotes((previous) => previous.filter((entry) => entry.id !== note.id)),
-        )
+        .then(() => {
+          setNotes((previous) => previous.filter((entry) => entry.id !== note.id));
+          setRoot((current) => ({
+            ...current,
+            notesPinned: current.notesPinned.filter((entry) => entry !== note.id),
+          }));
+        })
         .catch((error) => showToast(String(error)));
     },
     [confirmDelete, showToast],
@@ -2772,6 +2901,20 @@ function Launcher() {
                   >
                     <button
                       type="button"
+                      className={`note-pin${
+                        root.notesPinned.includes(note.id) ? " on" : ""
+                      }`}
+                      onClick={() => togglePin(note)}
+                      title={
+                        root.notesPinned.includes(note.id)
+                          ? "取消钉住（收回桌上的便签）"
+                          : "钉在桌面上，随时查看 / 编辑"
+                      }
+                    >
+                      <Pin size={13} strokeWidth={2.2} />
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => sendNote(note)}
                       disabled={sendingNote !== null}
                       title="收起面板，把文字输入到呼出前的窗口"
@@ -2801,30 +2944,37 @@ function Launcher() {
           <div
             className="note-shade"
             onMouseDown={(event) => {
-              if (event.target !== event.currentTarget || savingNote) return;
+              if (event.target !== event.currentTarget) return;
               // 双击卡片打开编辑时，第二下正好落在遮罩上；刚打开就忽略一下。
               if (Date.now() - draftOpenedAt.current < 350) return;
-              setDraft(null);
+              closeDraft();
             }}
           >
             <div
               className="note-editor"
               onKeyDown={(event) => {
                 if (event.nativeEvent.isComposing) return;
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  if (!savingNote) setDraft(null);
-                  return;
+                // 撤销 / 重做走自己的记录：受控 textarea 的原生撤销不可靠。
+                if (event.ctrlKey || event.metaKey) {
+                  const key = event.key.toLowerCase();
+                  if (key === "z") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (event.shiftKey) noteBody.redo();
+                    else noteBody.undo();
+                    return;
+                  }
+                  if (key === "y") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    noteBody.redo();
+                    return;
+                  }
                 }
-                if (
-                  (event.ctrlKey || event.metaKey) &&
-                  event.key.toLowerCase() === "s"
-                ) {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  void saveDraft();
-                }
+                if (event.key !== "Escape") return;
+                event.preventDefault();
+                event.stopPropagation();
+                closeDraft();
               }}
             >
               <div className="note-editor-head">
@@ -2836,30 +2986,38 @@ function Launcher() {
                   spellCheck={false}
                   onChange={(event) => setDraft({ ...draft, title: event.target.value })}
                 />
+                {/* 没有保存按钮：写下去就存，这里只说现在是不是写完了。 */}
+                <span
+                  className={`note-save-state${noteSave === "error" ? " error" : ""}`}
+                >
+                  {noteSave === "saving"
+                    ? "保存中…"
+                    : noteSave === "error"
+                      ? "保存失败"
+                      : "已保存"}
+                </span>
                 <button
                   type="button"
                   className="note-close"
-                  title="关闭"
+                  title="关闭（自动保存，不会丢）"
                   // Tab 从标题直接到正文，别停在关闭按钮上；关掉用 Esc 或点。
                   tabIndex={-1}
-                  onClick={() => {
-                    if (!savingNote) setDraft(null);
-                  }}
+                  onClick={closeDraft}
                 >
                   ✕
                 </button>
               </div>
               <textarea
                 className="note-body"
-                value={draft.body}
+                value={noteBody.value}
                 placeholder="写点什么…支持 Markdown。发送时只发送文字，图片会被去掉。"
                 spellCheck={false}
                 onKeyDown={(event) => {
-                  // 这里单独拦 Tab / Ctrl+A 之类的默认行为以外不用做事：
-                  // 真正的 Esc / Ctrl+S 由外层编辑器处理。
-                  if (event.key === "Escape") event.stopPropagation();
+                  if (event.nativeEvent.isComposing) return;
+                  if (event.key !== "Escape") return;
+                  event.stopPropagation();
                 }}
-                onChange={(event) => setDraft({ ...draft, body: event.target.value })}
+                onChange={(event) => noteBody.set(event.target.value)}
               />
               {editingImages.length > 0 && (
                 <div className="note-editor-images">
@@ -2888,24 +3046,27 @@ function Launcher() {
                 </div>
               )}
               <div className="note-editor-foot">
-                <span className="note-editor-hint">Ctrl+S 保存 · Esc 取消</span>
                 <button
                   type="button"
-                  className="note-btn"
-                  onClick={() => {
-                    if (!savingNote) setDraft(null);
-                  }}
+                  className="note-icon-btn"
+                  title="撤销（Ctrl+Z）"
+                  disabled={!noteBody.canUndo}
+                  onClick={noteBody.undo}
                 >
-                  取消
+                  <Undo2 size={14} strokeWidth={2} />
                 </button>
                 <button
                   type="button"
-                  className="note-btn primary"
-                  disabled={savingNote}
-                  onClick={() => void saveDraft()}
+                  className="note-icon-btn"
+                  title="重做（Ctrl+Y）"
+                  disabled={!noteBody.canRedo}
+                  onClick={noteBody.redo}
                 >
-                  {savingNote ? "保存中…" : "保存"}
+                  <Redo2 size={14} strokeWidth={2} />
                 </button>
+                <span className="note-editor-hint">
+                  自动保存：写下去就存，Ctrl+Z 撤销 · Esc 关闭
+                </span>
               </div>
             </div>
           </div>

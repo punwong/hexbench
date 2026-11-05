@@ -619,6 +619,42 @@ pub fn image_paths(root: &Path, id: &str) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
+/// 便签窗口通过自定义协议取原图：只认 `images/` 下的合法图片名，
+/// 解析后的真实路径必须还在 `images/` 里（挡住符号链接之类的花招）。
+pub fn image_file(root: &Path, name: &str) -> Option<PathBuf> {
+    if !valid_image_name(name) {
+        return None;
+    }
+    let images = root.join(IMAGES_DIR);
+    let file = images.join(name);
+    if !file.is_file() {
+        return None;
+    }
+    let canonical = file.canonicalize().ok()?;
+    let base = images.canonicalize().ok()?;
+    canonical.starts_with(&base).then_some(canonical)
+}
+
+/// 图片扩展名对应的 MIME。协议里不写对的话，`<img>` 会在部分格式上不显示。
+pub fn image_mime(name: &str) -> &'static str {
+    match Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        _ => "image/png",
+    }
+}
+
 pub fn resolve_note(root: &Path, id: &str) -> Result<PathBuf, String> {
     let name = id.trim();
     if name.is_empty()

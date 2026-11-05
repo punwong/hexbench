@@ -20,7 +20,7 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 use hexbench_core::config::{
-    self, Config, DesktopSettings, FenceKind, FenceRule, FenceSettings,
+    self, Config, DesktopSettings, FenceKind, FenceRule, FenceSettings, NotePin,
 };
 use hexbench_core::engine::Engine;
 use hexbench_core::geometry::Region;
@@ -283,6 +283,12 @@ fn push_theme_to_windows(app: &AppHandle) {
             let _ = window.eval(&script);
         }
     }
+    // 钉住的便签是常驻窗口，改深浅主题也要当场跟上。
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("note-") {
+            let _ = window.eval(&script);
+        }
+    }
     // 格子是原生窗口，主题进 `Frame`，由管理器按配置重推。
     log::info!("theme: pushed {value} to launcher / web");
 }
@@ -332,6 +338,9 @@ fn save_config(
         launcher.pinned_sort_dir = live.pinned_sort_dir;
         launcher.view_zoom = live.view_zoom;
         launcher.pinned_view_zoom = live.pinned_view_zoom;
+        // 钉住的便签由后端自己维护（钉 / 取消 / 拖动），设置页拿的是旧快照，
+        // 不能把它覆盖成「什么都没钉」。
+        config.notes.pinned = shared.config.notes.pinned.clone();
         config.sync.last_push = shared.config.sync.last_push;
         config.sync.last_pull = shared.config.sync.last_pull;
         // 桌面格子的位置 / 尺寸 / 缩放 / 卷起都是窗口自己写的，设置页的旧快照
@@ -2696,6 +2705,8 @@ struct LauncherRoot {
     web_enabled: bool,
     /// 设置里的「收藏」开关：关掉就不显示收藏那一栏。
     notes_enabled: bool,
+    /// 已经钉在桌面上的笔记 id（面板据此把图钉按钮显示成「已钉」）。
+    notes_pinned: Vec<String>,
     /// 上次用的视图和排序（快速启动 / 分类这一组）。
     view: String,
     sort_key: String,
@@ -2797,6 +2808,7 @@ async fn launcher_categories(app: AppHandle) -> LauncherRoot {
             sites: Vec::new(),
             web_enabled: false,
             notes_enabled: false,
+            notes_pinned: Vec::new(),
             view: "grid".to_string(),
             sort_key: "name".to_string(),
             sort_dir: 1,
@@ -2860,6 +2872,13 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
     let pinned_view_set = !shared.config.launcher.pinned_view.is_empty();
     let web_enabled = shared.config.launcher.web_enabled;
     let notes_enabled = shared.config.notes.enabled;
+    let notes_pinned: Vec<String> = shared
+        .config
+        .notes
+        .pinned
+        .iter()
+        .map(|pin| pin.id.clone())
+        .collect();
     let gestures = shared.config.launcher.gestures.clone();
     drop(shared);
     let all_visible = !hidden.iter().any(|entry| entry == "__all__");
@@ -2871,6 +2890,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         sites: sites.clone(),
         web_enabled,
         notes_enabled,
+        notes_pinned: notes_pinned.clone(),
         view: view.clone(),
         sort_key: sort_key.clone(),
         sort_dir,
@@ -2903,6 +2923,7 @@ fn launcher_root(app: &AppHandle) -> LauncherRoot {
         sites,
         web_enabled,
         notes_enabled,
+        notes_pinned,
         view,
         sort_key,
         sort_dir,
@@ -3154,6 +3175,17 @@ fn reshow_launcher(app: &AppHandle) {
     }
 }
 
+/// 收藏变化广播。
+///
+/// `id` 是变化后的笔记（删除时是被删掉的那条），窗口据此决定要不要重读；
+/// `source` 是写进磁盘的便签窗口标签 —— 自己保存不该再收一遍自己的回声，
+/// 否则正在输入的正文会被重读覆盖、撤销记录也会被清掉。
+#[derive(Clone, Serialize)]
+struct NotesChanged {
+    id: Option<String>,
+    source: Option<String>,
+}
+
 #[tauri::command(async)]
 fn notes_list(state: State<'_, AppState>) -> Result<Vec<hexbench_core::notes::NoteSummary>, String> {
     let root = notes_root(&state)?;
@@ -3177,7 +3209,13 @@ fn notes_create(
 ) -> Result<hexbench_core::notes::NoteSummary, String> {
     let root = notes_root(&state)?;
     let note = hexbench_core::notes::create(&root, title.as_deref())?;
-    let _ = app.emit("notes-changed", ());
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id: Some(note.id.clone()),
+            source: None,
+        },
+    );
     Ok(note)
 }
 
@@ -3186,12 +3224,24 @@ fn notes_save(
     id: String,
     title: String,
     body: String,
+    source: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<hexbench_core::notes::NoteSummary, String> {
     let root = notes_root(&state)?;
     let note = hexbench_core::notes::save(&root, &id, &title, &body)?;
-    let _ = app.emit("notes-changed", ());
+    // 标题变了文件会改名：钉住的便签要跟着改 id，否则下一次自动保存
+    // 会写到旧文件名上（文件已经不在，保存失败）。
+    if note.id != id {
+        let _ = rename_pin_id(&app, &id, &note.id);
+    }
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id: Some(note.id.clone()),
+            source,
+        },
+    );
     Ok(note)
 }
 
@@ -3199,7 +3249,15 @@ fn notes_save(
 fn notes_delete(id: String, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     let root = notes_root(&state)?;
     hexbench_core::notes::delete(&root, &id)?;
-    let _ = app.emit("notes-changed", ());
+    // 钉着的时候删掉：窗口跟着关，别在桌面上留一张读不到文件的便签。
+    let _ = unpin_id(&app, &id);
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id: Some(id),
+            source: None,
+        },
+    );
     Ok(())
 }
 
@@ -3220,7 +3278,13 @@ fn notes_import_images(
         outcome.skipped,
         outcome.note.id
     );
-    let _ = app.emit("notes-changed", ());
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id: Some(outcome.note.id.clone()),
+            source: None,
+        },
+    );
     Ok(outcome)
 }
 
@@ -3234,6 +3298,18 @@ fn notes_copy_images(id: String, state: State<'_, AppState>) -> Result<usize, St
     }
     hexbench_core::shell_ops::clipboard_set_files(&paths, false)?;
     Ok(paths.len())
+}
+
+/// 面板刷新图钉状态用：只回 id，不重新扫分类（自动保存会频繁触发这个）。
+#[tauri::command]
+fn notes_pinned(app: AppHandle) -> Vec<String> {
+    note_pins(&app).into_iter().map(|pin| pin.id).collect()
+}
+
+/// 便签里的链接交给系统浏览器：点在预览里不该把便签窗口本身导航走。
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    hexbench_core::sys::open_url(&url)
 }
 
 #[tauri::command(async)]
@@ -3259,8 +3335,515 @@ fn notes_open_folder(state: State<'_, AppState>) -> Result<(), String> {
 fn notes_clear_all(state: State<'_, AppState>, app: AppHandle) -> Result<usize, String> {
     let root = notes_root(&state)?;
     let count = hexbench_core::notes::clear_all(&root)?;
-    let _ = app.emit("notes-changed", ());
+    let _ = unpin_all(&app);
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id: None,
+            source: None,
+        },
+    );
     Ok(count)
+}
+
+// ---------- 便签：钉在桌面上的笔记窗口 ----------
+
+const NOTE_LABEL_PREFIX: &str = "note-";
+const NOTE_DEFAULT_W: u32 = 340;
+const NOTE_DEFAULT_H: u32 = 380;
+const NOTE_MIN_W: f64 = 220.0;
+const NOTE_MIN_H: f64 = 160.0;
+const NOTE_MAX_W: u32 = 2400;
+const NOTE_MAX_H: u32 = 1800;
+/// 收起后只剩顶栏：note.html 里 `.note` 的上下边框 + 36px 顶栏。
+const NOTE_HEADER_H: f64 = 38.0;
+
+/// 收起高度按当前缩放算成物理像素（配置里存的是物理像素）。
+fn note_header_px(window: &tauri::WebviewWindow) -> u32 {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    (NOTE_HEADER_H * scale).round() as u32
+}
+
+/// 自定义协议的路径是百分号编码的：图片文件名里有中文 / 空格时先还原。
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn note_pins(app: &AppHandle) -> Vec<NotePin> {
+    app.state::<AppState>()
+        .shared
+        .lock()
+        .unwrap()
+        .config
+        .notes
+        .pinned
+        .clone()
+}
+
+/// 把钉住的列表写回配置。内存先改，磁盘失败也只影响下次启动的恢复。
+fn write_note_pins(app: &AppHandle, pins: Vec<NotePin>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let config = {
+        let mut shared = state.shared.lock().unwrap();
+        shared.config.notes.pinned = pins;
+        shared.config.clone()
+    };
+    config::save(&state.config_path, &config).map_err(|error| error.to_string())
+}
+
+/// 笔记改名（文件换名）时，把钉住它的便签指向新文件名。
+fn rename_pin_id(app: &AppHandle, old_id: &str, new_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let config = {
+        let mut shared = state.shared.lock().unwrap();
+        let mut changed = false;
+        for pin in &mut shared.config.notes.pinned {
+            if pin.id == old_id {
+                pin.id = new_id.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        shared.config.clone()
+    };
+    config::save(&state.config_path, &config).map_err(|error| error.to_string())
+}
+
+/// 取消某个标签的钉住：只改配置，窗口由调用方关。
+fn unpin_label(app: &AppHandle, label: &str) -> Option<String> {
+    let removed = {
+        let state = app.state::<AppState>();
+        let mut shared = state.shared.lock().unwrap();
+        let index = shared
+            .config
+            .notes
+            .pinned
+            .iter()
+            .position(|pin| pin.label == label)?;
+        let pin = shared.config.notes.pinned.remove(index);
+        let config = shared.config.clone();
+        drop(shared);
+        if let Err(error) = config::save(&state.config_path, &config) {
+            log::warn!("note: save pins after unpin failed: {error}");
+        }
+        pin
+    };
+    Some(removed.id)
+}
+
+/// 取消某条笔记的所有钉住，并把窗口关掉（删除 / 面板上点取消时用）。
+fn unpin_id(app: &AppHandle, id: &str) -> Result<(), String> {
+    let labels: Vec<String> = note_pins(app)
+        .into_iter()
+        .filter(|pin| pin.id == id)
+        .map(|pin| pin.label)
+        .collect();
+    if labels.is_empty() {
+        return Ok(());
+    }
+    let pins: Vec<NotePin> = note_pins(app)
+        .into_iter()
+        .filter(|pin| pin.id != id)
+        .collect();
+    write_note_pins(app, pins)?;
+    for label in labels {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
+    }
+    Ok(())
+}
+
+/// 全部取消（清空收藏时用）。
+fn unpin_all(app: &AppHandle) -> Result<(), String> {
+    let pins = note_pins(app);
+    if pins.is_empty() {
+        return Ok(());
+    }
+    write_note_pins(app, Vec::new())?;
+    for pin in pins {
+        if let Some(window) = app.get_webview_window(&pin.label) {
+            let _ = window.close();
+        }
+    }
+    Ok(())
+}
+
+/// 找一个没被占用的窗口标签：配置里的、以及还没关干净的窗口都算占用。
+fn next_note_label(app: &AppHandle) -> String {
+    let pins = note_pins(app);
+    for index in 1..=u32::MAX {
+        let label = format!("{NOTE_LABEL_PREFIX}{index}");
+        if !pins.iter().any(|pin| pin.label == label)
+            && app.get_webview_window(&label).is_none()
+        {
+            return label;
+        }
+    }
+    format!("{NOTE_LABEL_PREFIX}{}", std::process::id())
+}
+
+/// 钉住的矩形：尺寸夹到合理范围，位置拉回可见的工作区（拔掉副屏、
+/// 分辨率改了以后，别让便签落在屏幕外面找不回来）。
+fn note_rect(pin: &NotePin) -> (i32, i32, u32, u32) {
+    let w = pin.w.clamp(NOTE_MIN_W as u32, NOTE_MAX_W);
+    let h = pin.h.clamp(NOTE_MIN_H as u32, NOTE_MAX_H);
+    let (x, y) = hexbench_core::sys::clamp_to_work_area(pin.x, pin.y, w as i32, h as i32);
+    (x, y, w, h)
+}
+
+fn rects_overlap(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    ax < bx + bw as i32
+        && bx < ax + aw as i32
+        && ay < by + bh as i32
+        && by < ay + ah as i32
+}
+
+/// 新便签放哪儿：正常放在光标右下；如果会压住正开着的呼出面板，就挪到
+/// 面板旁边——用户刚点完钉子，还要继续用面板，不能被自己的便签挡住。
+fn pin_initial_rect(app: &AppHandle, w: u32, h: u32) -> (i32, i32, u32, u32) {
+    let (cursor_x, cursor_y) = hexbench_core::sys::cursor_pos().unwrap_or((240, 160));
+    let mut x = cursor_x + 40;
+    let mut y = cursor_y + 40;
+    let panel = app.get_webview_window("launcher").and_then(|window| {
+        if !window.is_visible().unwrap_or(false) {
+            return None;
+        }
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        Some((position.x, position.y, size.width, size.height))
+    });
+    if let Some((px, py, pw, ph)) = panel {
+        if rects_overlap((x, y, w, h), (px, py, pw, ph)) {
+            let fits = |fx: i32, fy: i32| {
+                hexbench_core::sys::work_area_at(fx, fy)
+                    .map(|(wx, wy, ww, wh)| {
+                        fx >= wx
+                            && fy >= wy
+                            && fx + w as i32 <= wx + ww
+                            && fy + h as i32 <= wy + wh
+                    })
+                    .unwrap_or(false)
+            };
+            let right = px + pw as i32 + 16;
+            let left = px - w as i32 - 16;
+            let below = py + ph as i32 + 16;
+            if fits(right, py) {
+                x = right;
+                y = py;
+            } else if fits(left, py) {
+                x = left;
+                y = py;
+            } else if fits(px, below) {
+                x = px;
+                y = below;
+            } else {
+                x = right;
+                y = below;
+            }
+        }
+    }
+    let (x, y) = hexbench_core::sys::clamp_to_work_area(x, y, w as i32, h as i32);
+    (x, y, w, h)
+}
+
+/// 建一个便签窗口（先藏着，页面画好了自己叫 `note_ready` 显示）。
+fn build_note_window(app: &AppHandle, pin: &NotePin) -> Result<tauri::WebviewWindow, String> {
+    let (x, y, w, h) = note_rect(pin);
+    let window = WebviewWindowBuilder::new(
+        app,
+        &pin.label,
+        WebviewUrl::App("note.html".into()),
+    )
+    .title("HexBench 便签")
+    .inner_size(w as f64, h as f64)
+    .min_inner_size(NOTE_MIN_W, NOTE_MIN_H)
+    .decorations(false)
+    .resizable(!pin.rolled)
+    .zoom_hotkeys_enabled(false)
+    .transparent(false)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .visible(false)
+    .build()
+    .map_err(|error| format!("打开便签失败：{error}"))?;
+    // 配置里存的是物理像素，builder 的 inner_size 收的是逻辑尺寸：缩放不是
+    // 100% 的机器上会差一截，这里按物理像素再摆一次（窗口还藏着，看不到跳）。
+    let height = if pin.rolled {
+        note_header_px(&window)
+    } else {
+        h
+    };
+    if pin.rolled {
+        let _ = window
+            .set_min_size(Some(PhysicalSize::new(NOTE_MIN_W as u32, height)));
+    }
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+    let _ = window.set_size(PhysicalSize::new(w, height));
+    if let Ok(hwnd) = window.hwnd() {
+        hexbench_core::sys::round_window_corners(hwnd.0 as isize);
+    }
+    // 页面万一没跑起来（打包漏文件之类），两秒后也要让窗口露出来，
+    // 否则用户只看到「点了钉子，什么都没发生」。
+    let probe = window.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        if let Ok(hwnd) = probe.hwnd() {
+            if !hexbench_core::sys::window_visible(hwnd.0 as isize) {
+                hexbench_core::sys::show_window_no_activate(hwnd.0 as isize);
+            }
+        }
+    });
+    Ok(window)
+}
+
+/// 启动时把上次钉住的便签重新摆出来。桌面上的窗口全在后台线程建，
+/// 不拖慢启动；文件已经没了的钉子直接清掉。
+fn restore_note_pins(app: AppHandle) {
+    let pins = note_pins(&app);
+    if pins.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        let root = match notes_root(&app.state::<AppState>()) {
+            Ok(root) => root,
+            Err(error) => {
+                log::warn!("note: restore skipped: {error}");
+                return;
+            }
+        };
+        let mut kept = Vec::new();
+        let mut changed = false;
+        for pin in pins {
+            if hexbench_core::notes::resolve_note(&root, &pin.id).is_err() {
+                log::info!("note: {} is gone, dropping pin {}", pin.id, pin.label);
+                changed = true;
+                continue;
+            }
+            match build_note_window(&app, &pin) {
+                Ok(_) => kept.push(pin),
+                Err(error) => {
+                    log::warn!("note: restore {} failed: {error}", pin.label);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let _ = write_note_pins(&app, kept);
+        }
+    });
+}
+
+/// 便签页面加载完读一次：标签 → 当前笔记。改名之后页面靠它重新对上 id。
+#[tauri::command(async)]
+fn note_state(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+) -> Result<hexbench_core::notes::NoteFile, String> {
+    let label = window.label().to_string();
+    let pin = note_pins(&app)
+        .into_iter()
+        .find(|pin| pin.label == label)
+        .ok_or_else(|| "这条便签已经取消了".to_string())?;
+    let root = notes_root(&app.state::<AppState>())?;
+    hexbench_core::notes::read(&root, &pin.id)
+}
+
+/// 页面画好了：显示窗口，但不抢焦点（钉的时候用户多半还在面板上打字）。
+#[tauri::command]
+fn note_ready(window: tauri::WebviewWindow) {
+    if !window.label().starts_with(NOTE_LABEL_PREFIX) {
+        return;
+    }
+    if let Ok(hwnd) = window.hwnd() {
+        hexbench_core::sys::show_window_no_activate(hwnd.0 as isize);
+    }
+}
+
+/// 钉住一条笔记。已经钉着就把它拿到前面来，不再建第二个窗口。
+#[tauri::command]
+async fn notes_pin(id: String, app: AppHandle) -> Result<NotePin, String> {
+    let root = notes_root(&app.state::<AppState>())?;
+    // 文件得真的在：钉一个读不到的便签没有意义。
+    hexbench_core::notes::read(&root, &id)?;
+    if let Some(existing) = note_pins(&app).into_iter().find(|pin| pin.id == id) {
+        if let Some(window) = app.get_webview_window(&existing.label) {
+            let _ = window.show();
+        }
+        return Ok(existing);
+    }
+    let label = next_note_label(&app);
+    let (x, y, w, h) = pin_initial_rect(&app, NOTE_DEFAULT_W, NOTE_DEFAULT_H);
+    let pin = NotePin {
+        id,
+        label,
+        x,
+        y,
+        w,
+        h,
+        rolled: false,
+    };
+    let mut pins = note_pins(&app);
+    pins.push(pin.clone());
+    write_note_pins(&app, pins)?;
+    let handle = app.clone();
+    let build_pin = pin.clone();
+    let built = tauri::async_runtime::spawn_blocking(move || {
+        build_note_window(&handle, &build_pin)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Err(error) = built {
+        // 建不出来就把刚写进配置的钉子撤掉，别留下一个永远不出现的窗口。
+        let pins: Vec<NotePin> = note_pins(&app)
+            .into_iter()
+            .filter(|entry| entry.label != pin.label)
+            .collect();
+        let _ = write_note_pins(&app, pins);
+        return Err(error);
+    }
+    log::info!("note: pinned {} as {}", pin.id, pin.label);
+    Ok(pin)
+}
+
+/// 面板上取消钉住。
+#[tauri::command(async)]
+fn notes_unpin(id: String, app: AppHandle) -> Result<(), String> {
+    unpin_id(&app, &id)?;
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id: Some(id),
+            source: None,
+        },
+    );
+    Ok(())
+}
+
+/// 便签窗口上的「取消钉住」。
+#[tauri::command]
+fn note_unpin(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+    let label = window.label().to_string();
+    let id = unpin_label(&app, &label);
+    let _ = app.emit(
+        "notes-changed",
+        NotesChanged {
+            id,
+            source: None,
+        },
+    );
+    let _ = window.close();
+    Ok(())
+}
+
+/// 移动 / 改大小后记下几何（页面那边做了防抖）。
+#[tauri::command(async)]
+fn note_geometry(
+    window: tauri::WebviewWindow,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    app: AppHandle,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let mut pins = note_pins(&app);
+    let Some(pin) = pins.iter_mut().find(|pin| pin.label == label) else {
+        return Ok(());
+    };
+    // 收起时窗口只有标题栏高：这时收到的尺寸是「收起后」的，不能拿来覆盖
+    // 展开后的高度，只记位置；展开以后 h 会重新报一次。
+    let next_w = if pin.rolled { pin.w } else { w };
+    let next_h = if pin.rolled { pin.h } else { h };
+    if pin.x == x && pin.y == y && pin.w == next_w && pin.h == next_h {
+        return Ok(());
+    }
+    pin.x = x;
+    pin.y = y;
+    pin.w = next_w;
+    pin.h = next_h;
+    write_note_pins(&app, pins)
+}
+
+/// 便签窗收起到只剩标题栏 / 再展开。
+#[tauri::command]
+fn note_roll(window: tauri::WebviewWindow, rolled: bool, app: AppHandle) -> Result<(), String> {
+    let label = window.label().to_string();
+    let mut pins = note_pins(&app);
+    let Some(pin) = pins.iter_mut().find(|pin| pin.label == label) else {
+        return Ok(());
+    };
+    if pin.rolled == rolled {
+        return Ok(());
+    }
+    pin.rolled = rolled;
+    let (w, h) = (pin.w, pin.h);
+    write_note_pins(&app, pins)?;
+
+    // 收起的高度比最小高度还小，先放宽下限再改尺寸；展开时按相反顺序。
+    let header = note_header_px(&window);
+    let result = if rolled {
+        let _ = window.set_min_size(Some(PhysicalSize::new(NOTE_MIN_W as u32, header)));
+        let _ = window.set_resizable(false);
+        window
+            .set_size(PhysicalSize::new(w, header))
+            .map_err(|error| error.to_string())
+    } else {
+        let _ = window.set_resizable(true);
+        let _ = window.set_min_size(Some(PhysicalSize::new(
+            NOTE_MIN_W as u32,
+            (NOTE_MIN_H * window.scale_factor().unwrap_or(1.0)).round() as u32,
+        )));
+        window
+            .set_size(PhysicalSize::new(w, h))
+            .map_err(|error| error.to_string())
+    };
+    // 便签窗是用 ShowWindow(SW_SHOWNOACTIVATE) 显示的，tao 内部仍当它是隐藏的；
+    // 一改窗口样式（set_resizable 会整份重设样式位），WS_VISIBLE 就被抹掉了。
+    // 所以改完再按不抢焦点的方式显示一次。
+    if let Ok(hwnd) = window.hwnd() {
+        let raw = hwnd.0 as isize;
+        hexbench_core::sys::show_window_no_activate(raw);
+        // 样式是在 tao 的事件线程上排队的，可能比这一下还晚；稍后再露一次。
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            hexbench_core::sys::show_window_no_activate(raw);
+        });
+    }
+    result
+}
+
+/// 便签窗打开时问一下自己是不是收起的（配置里记着）。
+#[tauri::command]
+fn note_rolled(window: tauri::WebviewWindow, app: AppHandle) -> bool {
+    let label = window.label();
+    note_pins(&app)
+        .into_iter()
+        .find(|pin| pin.label == label)
+        .map(|pin| pin.rolled)
+        .unwrap_or(false)
 }
 
 /// 发送一条笔记：收起面板 → 把焦点还给呼出前的窗口 → 逐字输入。
@@ -7369,8 +7952,13 @@ pub fn run() {
         )
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                // 呼出面板和触发提示各自记几何，别让插件恢复旧尺寸。
-                .with_denylist(&["overlay", "launcher"])
+                // 呼出面板和触发提示各自记几何，别让插件恢复旧尺寸；
+                // 便签的几何存在配置的 notes.pinned 里，也不需要插件插手。
+                .with_filter(|label| {
+                    label != "overlay"
+                        && label != "launcher"
+                        && !label.starts_with(NOTE_LABEL_PREFIX)
+                })
                 // The window is frameless by design: restoring a saved
                 // "decorated" flag would bring the system title bar back.
                 .with_state_flags(
@@ -7433,6 +8021,32 @@ pub fn run() {
                 .body(body)
                 .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
         })
+        // 便签里的图片给原图：`http://hbnote.localhost/<文件名>`。
+        // 不放进 Markdown 的 base64：一条笔记几张图会让正文变得没法读。
+        .register_uri_scheme_protocol("hbnote", |app, request| {
+            let name = percent_decode(request.uri().path().trim_start_matches('/'));
+            let root = app
+                .app_handle()
+                .state::<AppState>()
+                .shared
+                .lock()
+                .map(|shared| shared.config.notes.folder.clone())
+                .unwrap_or_default();
+            let body = hexbench_core::notes::resolve_root(&root)
+                .ok()
+                .and_then(|root| hexbench_core::notes::image_file(&root, &name))
+                .and_then(|file| std::fs::read(file).ok())
+                .unwrap_or_default();
+            let status = if body.is_empty() { 404 } else { 200 };
+            tauri::http::Response::builder()
+                .status(status)
+                .header("Content-Type", hexbench_core::notes::image_mime(&name))
+                // 文件名带内容哈希；同名改内容的概率很低，短缓存够了。
+                .header("Cache-Control", "public, max-age=86400")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(body)
+                .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+        })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             diagnostics,
@@ -7479,6 +8093,16 @@ pub fn run() {
             notes_open_folder,
             notes_clear_all,
             notes_send,
+            notes_pin,
+            notes_unpin,
+            notes_pinned,
+            open_url,
+            note_state,
+            note_ready,
+            note_unpin,
+            note_geometry,
+            note_roll,
+            note_rolled,
             launcher_new_folder,
     launcher_create_dir,
     launcher_set_web_mode,
@@ -7655,6 +8279,8 @@ pub fn run() {
             }
             // 吸附参考线的画布同样在启动阶段预建（隐藏）：运行中建出来的窗口没有 webview。
             prebuild_guides(app.handle());
+            // 上次钉在桌面上的便签：窗口在后台线程里建，不拖慢启动。
+            restore_note_pins(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -7838,6 +8464,18 @@ pub fn run() {
             let WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
+            // 便签窗和别的窗口不一样：它没有「藏起来下次再显示」的命运。
+            // Alt+F4 / 系统关闭 = 取消钉住，配置里不能留下一扇打不开的窗。
+            if window.label().starts_with(NOTE_LABEL_PREFIX) {
+                // 退出程序时便签窗也会收到关闭请求，那是关程序，不是「取消钉住」。
+                if QUITTING.load(Ordering::SeqCst) {
+                    return;
+                }
+                let app = window.app_handle().clone();
+                let id = unpin_label(&app, window.label());
+                let _ = app.emit("notes-changed", NotesChanged { id, source: None });
+                return;
+            }
             // Other windows (launcher, overlay, fences) keep the cheap hide/show toggle.
             if window.label() != "main" {
                 api.prevent_close();

@@ -65,7 +65,7 @@ const demoConfig: Config = {
     frosted: true,
     fences: [],
   },
-  notes: { enabled: true, folder: "", sendEnter: false },
+  notes: { enabled: true, folder: "", sendEnter: false, pinned: [] },
   ui: { theme: "system", language: "auto", onboarded: false },
   meta: { schema: 3, updatedAt: 0, deviceId: "" },
 };

@@ -27,6 +27,8 @@ The launcher also holds **收藏 (favorites)**: short Markdown notes for the per
 
 Every note is a plain `.md` file with its images in an `images/` folder, so the collection can be opened in any editor or synced by any cloud drive. The folder defaults to `Documents\HexBench 收藏` and can be changed in settings.
 
+The pin button on a note card turns it into a small always-on-top window on the desktop: Markdown is rendered, images are shown, double-click the body to edit, everything auto-saves (undo/redo only), and the window remembers where it was. Double-click the title bar (or the arrow button) to roll it up into a thin title strip, like a desktop fence. Unpin it or press Alt+F4 to put it away.
+
 | Feature | |
 | --- | --- |
 | Finding files | categories from a root folder, pinned folders, fuzzy search, grid/list views |

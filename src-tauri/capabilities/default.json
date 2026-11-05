@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "HexBench main window",
-  "windows": ["main", "launcher", "fence-*", "snap-guides"],
+  "windows": ["main", "launcher", "note-*", "fence-*", "snap-guides"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",

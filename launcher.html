@@ -948,6 +948,65 @@
         opacity: 0.5;
       }
 
+      /* 图钉：钉在桌面上就是一个常驻的小便签窗口。钉住时点亮。 */
+      .note-actions button.note-pin {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 3px 7px;
+        color: var(--muted);
+      }
+
+      .note-actions button.note-pin:hover:not(:disabled) {
+        color: var(--text);
+      }
+
+      .note-actions button.note-pin.on {
+        border-color: var(--text);
+        color: var(--text);
+      }
+
+      .note-actions button.note-pin.on svg {
+        fill: currentColor;
+      }
+
+      .note-save-state {
+        flex: 0 0 auto;
+        color: var(--muted);
+        font-size: 10.5px;
+        white-space: nowrap;
+      }
+
+      .note-save-state.error {
+        color: #c62828;
+      }
+
+      :root[data-theme="dark"] .note-save-state.error {
+        color: #ff8a8a;
+      }
+
+      .note-icon-btn {
+        flex: 0 0 auto;
+        display: grid;
+        place-items: center;
+        width: 26px;
+        height: 26px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: transparent;
+        color: var(--muted);
+        cursor: default;
+      }
+
+      .note-icon-btn:hover:not(:disabled) {
+        background: var(--surface-2);
+        color: var(--text);
+      }
+
+      .note-icon-btn:disabled {
+        opacity: 0.35;
+      }
+
       .note-actions button.danger {
         border-color: rgba(198, 40, 40, 0.5);
         color: #c62828;

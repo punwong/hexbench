@@ -1,7 +1,7 @@
 {
   "name": "hexbench",
   "private": true,
-  "version": "0.10.1",
+  "version": "0.11.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,11 +13,13 @@
     "@tauri-apps/api": "2.11.1",
     "@tauri-apps/plugin-dialog": "2.7.3",
     "lucide-react": "^0.468.0",
+    "markdown-it": "^15.0.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@types/markdown-it": "^14.2.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",

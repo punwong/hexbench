@@ -202,6 +202,22 @@ export interface NotesSettings {
   folder: string;
   /** 发送后是否再按一次回车 */
   sendEnter: boolean;
+  /** 钉在桌面上的便签窗口 */
+  pinned: NotePin[];
+}
+
+/** 一条钉住的笔记：窗口标签 + 屏幕位置（物理像素） */
+export interface NotePin {
+  /** 笔记文件名（含 .md），改名时后端会更新 */
+  id: string;
+  /** 窗口标签 note-<n>，钉住期间不变 */
+  label: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** 收起到只剩标题栏；h 仍是展开后的高度 */
+  rolled: boolean;
 }
 
 export interface MonitorDto {

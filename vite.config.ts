@@ -17,6 +17,7 @@ export default defineConfig({
         main: "index.html",
         overlay: "overlay.html",
         launcher: "launcher.html",
+        note: "note.html",
         "snap-guides": "snap-guides.html",
         web: "web.html",
       },
