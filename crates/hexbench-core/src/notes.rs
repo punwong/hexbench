@@ -14,7 +14,7 @@ use serde::Serialize;
 
 const FOLDER_NAME: &str = "HexBench 收藏";
 const IMAGES_DIR: &str = "images";
-const TITLE_FALLBACK: &str = "未命名笔记";
+const TITLE_FALLBACK: &str = "未命名便签";
 const MAX_TITLE_CHARS: usize = 60;
 const MAX_IMAGE_STEM: usize = 40;
 const PREVIEW_CHARS: usize = 280;
@@ -90,7 +90,7 @@ pub fn resolve_root(configured: &str) -> Result<PathBuf, String> {
 
 fn ensure_root(root: &Path) -> Result<(), String> {
     fs::create_dir_all(root.join(IMAGES_DIR))
-        .map_err(|error| format!("创建收藏目录失败：{error}"))
+        .map_err(|error| format!("创建便签目录失败：{error}"))
 }
 
 /// 标题 → 安全的文件名（不含 `.md`）。
@@ -218,11 +218,11 @@ fn modified_secs(path: &Path) -> i64 {
 }
 
 fn read_capped(path: &Path, cap: u64) -> Result<String, String> {
-    let file = File::open(path).map_err(|error| format!("读取笔记失败：{error}"))?;
+    let file = File::open(path).map_err(|error| format!("读取便签失败：{error}"))?;
     let mut bytes = Vec::new();
     file.take(cap)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("读取笔记失败：{error}"))?;
+        .map_err(|error| format!("读取便签失败：{error}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -400,7 +400,7 @@ pub fn preview(body: &str) -> String {
 /// 列目录：按修改时间倒序。
 pub fn list(root: &Path) -> Result<Vec<NoteSummary>, String> {
     ensure_root(root)?;
-    let entries = fs::read_dir(root).map_err(|error| format!("读取收藏目录失败：{error}"))?;
+    let entries = fs::read_dir(root).map_err(|error| format!("读取便签目录失败：{error}"))?;
     let mut notes = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -429,7 +429,7 @@ pub fn create(root: &Path, title: Option<&str>) -> Result<NoteSummary, String> {
         .write(true)
         .create_new(true)
         .open(&path)
-        .map_err(|error| format!("新建笔记失败：{error}"))?;
+        .map_err(|error| format!("新建便签失败：{error}"))?;
     summary_of(root, &path)
 }
 
@@ -587,7 +587,7 @@ pub fn import_images(
                 .iter()
                 .filter_map(|source| source.file_stem().and_then(|stem| stem.to_str()))
                 .next()
-                .unwrap_or("图片笔记");
+                .unwrap_or("图片便签");
             let name = unique_note_name(root, &sanitize_file_stem(title, 24), None);
             let path = root.join(&name);
             let body: Vec<&str> = refs
@@ -663,14 +663,14 @@ pub fn resolve_note(root: &Path, id: &str) -> Result<PathBuf, String> {
         || name.contains('\\')
         || name.contains("..")
     {
-        return Err("笔记名不正确".to_string());
+        return Err("便签名不正确".to_string());
     }
     if !name.to_ascii_lowercase().ends_with(".md") {
-        return Err("不是笔记文件".to_string());
+        return Err("不是便签文件".to_string());
     }
     let path = root.join(name);
     if !path.is_file() {
-        return Err("笔记不存在或已经被移动".to_string());
+        return Err("便签不存在或已经被移动".to_string());
     }
     Ok(path)
 }

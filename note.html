@@ -14,6 +14,8 @@
         --line: rgba(0, 0, 0, 0.08);
         --accent: #2f6fed;
         --danger: #c62828;
+        /* 便签自己的暖色：只用在标题栏圆点上，和桌面上的纸片对应。 */
+        --note: #e0a52c;
         --ease: cubic-bezier(0.2, 0, 0, 1);
         color-scheme: light;
       }
@@ -88,7 +90,7 @@
         height: 7px;
         margin-right: 7px;
         border-radius: 50%;
-        background: #e0a52c;
+        background: var(--note);
       }
 
       .bar-title {
@@ -105,7 +107,7 @@
         flex: 0 0 auto;
         margin-right: 4px;
         color: var(--muted);
-        font-size: 10.5px;
+        font-size: 11px;
         white-space: nowrap;
       }
 
@@ -135,8 +137,9 @@
         opacity: 0.32;
       }
 
-      .tool.pinned {
-        color: var(--accent);
+      /* 关闭是「拿掉桌面上的这张便签」，内容还在列表里：悬停才给一点警示色。 */
+      .tool.close:hover:not(:disabled) {
+        color: var(--danger);
       }
 
       /* ---------- 编辑 ---------- */

@@ -3,7 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import type { ReactNode } from "react";
 import {
   Crosshair,
-  Database,
   Gauge,
   Info,
   Keyboard,
@@ -13,6 +12,7 @@ import {
   Settings,
   Sparkles,
   AlertTriangle,
+  ArrowUpCircle,
 } from "lucide-react";
 
 import {
@@ -26,7 +26,6 @@ import {
   refreshLayout,
   saveConfig,
   setAutostart,
-  setTestMode,
   showTriggerOverlay,
   takePendingPage,
 } from "./api";
@@ -36,7 +35,6 @@ import {
   EdgePage,
   LauncherPage,
   DesktopPage,
-  CachePage,
   GeneralPage,
   GesturePage,
   HotkeysPage,
@@ -53,30 +51,36 @@ type Page =
   | "gestures"
   | "hotkeys"
   | "general"
-  | "cache"
   | "about";
 
-/// Where the updater currently is: nothing, a version to grab, downloading,
-/// a package waiting for a restart, or a failure worth showing.
-type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
+/// Where the updater currently is: nothing, a version to grab, up to date,
+/// downloading, a package waiting for a restart, or a failure worth showing.
+type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "current"
+  | "downloading"
+  | "ready"
+  | "error";
 
 const TITLES: Record<Page, { title: string; subtitle: string }> = {
-  overview: { title: "概览", subtitle: "按需打开，各占一个设置页" },
+  overview: { title: "概览", subtitle: "" },
   edge: { title: "边缘桌面", subtitle: "触发位置、时序与防误触" },
-  launcher: { title: "快捷面板", subtitle: "一个键呼出：找文件、搬运文件、写收藏" },
-  desktop: { title: "桌面格子", subtitle: "桌面上的文件夹小组件：拖进去就算整理好" },
+  launcher: { title: "快捷面板", subtitle: "找文件、搬文件、写便签" },
+  desktop: { title: "桌面格子", subtitle: "把文件夹钉在桌面上" },
   gestures: {
     title: "手势",
-    subtitle: "在快捷面板和桌面格子的文件区按住右键滑动：左滑后退、右滑前进",
+    subtitle: "在文件区按住右键滑动",
   },
-  hotkeys: { title: "热键", subtitle: "所有全局快捷键，集中在一处" },
-  general: { title: "通用", subtitle: "外观、启动与配置文件" },
-  cache: { title: "缓存", subtitle: "缩略图等缓存的占用与清理" },
-  about: { title: "关于", subtitle: "版本、许可证与诊断" },
+  hotkeys: { title: "热键", subtitle: "" },
+  general: { title: "通用", subtitle: "启动、外观与配置" },
+  about: { title: "关于", subtitle: "更新、链接与反馈" },
 };
 
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
+  const mainRef = useRef<HTMLElement>(null);
   const [launcherTab, setLauncherTab] = useState<
     "items" | "folders" | "sites" | "notes"
   >("items");
@@ -91,6 +95,13 @@ export default function App() {
     }
     setPage(target as Page);
   }, []);
+
+  // 换页回到顶部：滚动容器是 .main，不重置的话新页面会停在上
+  // 一页的滚动位置，从半截卡片开始看。
+  useEffect(() => {
+    const main = mainRef.current;
+    if (main) main.scrollTop = 0;
+  }, [page]);
 
   // 面板里点「去设置」：切到指定页面（可带 tab）。
   useEffect(() => {
@@ -121,12 +132,18 @@ export default function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [step, setStep] = useState(0);
+  // 设置是防抖静默保存的：给用户一个「正在保存 / 已保存」的回音，
+  // 免得改完开关不知道到底写没写进去。
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved">("idle");
+  const saveStateTimer = useRef<number | undefined>(undefined);
 
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase>("idle");
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateNotes, setUpdateNotes] = useState("");
+  const [updateDate, setUpdateDate] = useState("");
+  const [updateCheckedAt, setUpdateCheckedAt] = useState<number | null>(null);
 
   // 再查一次的时候要不要保留当前进度：包已经下好（ready）或正在下的时候
   // 一律不回到 checking —— 否则查完又变成 available，会重新下载一遍，
@@ -146,11 +163,17 @@ export default function App() {
       if (!info) {
         if (!stable) {
           setUpdateVersion(null);
-          setUpdatePhase("idle");
+          setUpdateNotes("");
+          setUpdateDate("");
+          setUpdatePhase("current");
         }
+        setUpdateCheckedAt(Date.now());
         return;
       }
       setUpdateVersion(info.version);
+      setUpdateNotes(info.notes ?? "");
+      setUpdateDate(info.date ?? "");
+      setUpdateCheckedAt(Date.now());
       if (!stable) setUpdatePhase("available");
     } catch (reason) {
       setUpdateError(String(reason));
@@ -195,17 +218,32 @@ export default function App() {
     let alive = true;
     let unlisten: (() => void) | undefined;
 
-    const applyStatus = (status: { version: string | null }) => {
+    const applyStatus = (status: {
+      version: string | null;
+      error?: string | null;
+      checkedAt?: number;
+      notes?: string | null;
+      date?: string | null;
+    }) => {
       if (!alive) return;
+      if (status.checkedAt && status.checkedAt > 0) {
+        setUpdateCheckedAt(status.checkedAt * 1000);
+      }
       if (status.version) {
         setUpdateVersion(status.version);
+        setUpdateNotes(status.notes ?? "");
+        setUpdateDate(status.date ?? "");
+        setUpdateError(null);
         setUpdatePhase((phase) =>
           phase === "downloading" || phase === "ready" ? phase : "available",
         );
       } else {
-        setUpdatePhase((phase) =>
-          phase === "downloading" || phase === "ready" ? phase : "idle",
-        );
+        setUpdateError(status.error ?? null);
+        setUpdatePhase((phase) => {
+          if (phase === "downloading" || phase === "ready") return phase;
+          // 查过（哪怕没查到）就算「已是最新」，没查过才什么都不说。
+          return status.checkedAt && status.checkedAt > 0 ? "current" : "idle";
+        });
       }
     };
 
@@ -314,6 +352,8 @@ export default function App() {
     };
     configRef.current = next;
     setConfig(next);
+    setSaveState("saving");
+    window.clearTimeout(saveStateTimer.current);
     window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       saveTimer.current = undefined;
@@ -333,8 +373,15 @@ export default function App() {
           .catch(() => {});
       };
       void saveConfig(next)
-        .then(() => setError(null))
-        .catch((reason) => setError(String(reason)))
+        .then(() => {
+          setError(null);
+          setSaveState("saved");
+          saveStateTimer.current = window.setTimeout(() => setSaveState("idle"), 1600);
+        })
+        .catch((reason) => {
+          setError(String(reason));
+          setSaveState("idle");
+        })
         .then(settle);
     }, 300);
   }, []);
@@ -354,44 +401,12 @@ export default function App() {
     return () => query.removeEventListener("change", apply);
   }, [config?.ui.theme]);
 
-  // Snapshot refreshes twice a second; the switch must react on click.
-  const [testModeLocal, setTestModeLocal] = useState<boolean | null>(null);
-  // 刚点下的值：快照要半秒才追上，这期间别拿旧值把开关盖回去。
-  const testModeWant = useRef<boolean | null>(null);
-  useEffect(() => {
-    if (!snap) return;
-    if (testModeWant.current !== null) {
-      if (snap.testMode !== testModeWant.current) return;
-      testModeWant.current = null;
-    }
-    setTestModeLocal(snap.testMode);
-  }, [snap?.testMode]);
-  const testMode = testModeLocal ?? snap?.testMode ?? false;
-
-  // A tool that gets switched off takes its settings page with it.
-  useEffect(() => {
-    if (!config) return;
-    if (page === "edge" && !config.enabled) setPage("overview");
-    if (page === "launcher" && !config.launcher.enabled) setPage("overview");
-    // 手势设置是面板和桌面格子共用的：还开着任意一个就留着这一页。
-    if (page === "gestures" && !config.launcher.enabled && !config.desktop.enabled) {
-      setPage("overview");
-    }
-    if (page === "desktop" && !config.desktop.enabled) setPage("overview");
-  }, [
-    config?.enabled,
-    config?.launcher.enabled,
-    config?.desktop.enabled,
-    page,
-  ]);
-
-  const finishOnboarding = () => {
+  // 引导里选哪个工具就进哪一页，进去就能直接配置。
+  const finishOnboarding = (target: "launcher" | "edge" | "desktop") => {
     update({ ui: { onboarded: true } });
-    void setTestMode(true);
+    setPage(target);
   };
 
-  // 「跳过」只是别再挡着设置窗口，不该顺手把测试模式打开——
-  // 测试模式会让光标在屏幕边缘被反复吸走，看起来像电脑出了毛病。
   const skipOnboarding = () => {
     update({ ui: { onboarded: true } });
   };
@@ -399,13 +414,15 @@ export default function App() {
   const status = snap
     ? snap.paused
       ? "已暂停"
-      : snap.testMode
-        ? "测试模式"
-        : config?.enabled
-          ? "运行中"
-          : "已关闭"
+      : config?.enabled
+        ? "运行中"
+        : "已关闭"
     : "加载中";
-  const statusClass = snap?.paused || snap?.testMode ? "warn" : config?.enabled ? "ok" : "";
+  const statusClass = snap?.paused ? "warn" : config?.enabled ? "ok" : "";
+  // 概览列出三个工具，状态就别只报边缘那一个。
+  const enabledTools = config
+    ? [config.enabled, config.launcher.enabled, config.desktop.enabled].filter(Boolean).length
+    : 0;
 
   const showOnboarding = snap !== null && config !== null && !config.ui.onboarded;
 
@@ -426,31 +443,20 @@ export default function App() {
           <NavItem page="overview" current={page} onClick={setPage} icon={<Gauge size={16} />} label="概览" />
         </div>
 
-        {config &&
-          (config.enabled || config.launcher.enabled || config.desktop.enabled) && (
-          <div className="nav-group">
-            <div className="nav-label">工具</div>
-            {config.launcher.enabled && (
-              <NavItem page="launcher" current={page} onClick={setPage} icon={<Rocket size={16} />} label="快捷面板" />
-            )}
-            {config.enabled && (
-              <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘桌面" />
-            )}
-            {config.desktop.enabled && (
-              <NavItem page="desktop" current={page} onClick={setPage} icon={<LayoutGrid size={16} />} label="桌面格子" />
-            )}
-          </div>
-        )}
+        <div className="nav-group">
+          <div className="nav-label">工具</div>
+          {/* 工具关掉了也留着入口：设置里才能把它再打开。 */}
+          <NavItem page="launcher" current={page} onClick={setPage} icon={<Rocket size={16} />} label="快捷面板" />
+          <NavItem page="edge" current={page} onClick={setPage} icon={<Crosshair size={16} />} label="边缘桌面" />
+          <NavItem page="desktop" current={page} onClick={setPage} icon={<LayoutGrid size={16} />} label="桌面格子" />
+        </div>
 
         <div className="nav-group">
-          <div className="nav-label">全局</div>
+          <div className="nav-label">应用</div>
           <NavItem page="hotkeys" current={page} onClick={setPage} icon={<Keyboard size={16} />} label="热键" />
-          {/* 快捷面板和桌面格子共用一份手势设置，所以不算某一个工具的，跟热键一起放在全局。 */}
-          {config && (config.launcher.enabled || config.desktop.enabled) && (
-            <NavItem page="gestures" current={page} onClick={setPage} icon={<MousePointer2 size={16} />} label="手势" />
-          )}
+          {/* 快捷面板和桌面格子共用一份手势设置，所以不算某一个工具的，跟热键一起放在这里。 */}
+          <NavItem page="gestures" current={page} onClick={setPage} icon={<MousePointer2 size={16} />} label="手势" />
           <NavItem page="general" current={page} onClick={setPage} icon={<Settings size={16} />} label="通用" />
-          <NavItem page="cache" current={page} onClick={setPage} icon={<Database size={16} />} label="缓存" />
           <NavItem page="about" current={page} onClick={setPage} icon={<Info size={16} />} label="关于" />
         </div>
 
@@ -459,21 +465,26 @@ export default function App() {
           <div className={`update-pill ${updatePhase}`}>
             {updatePhase === "ready" ? (
               <>
-                <div className="update-note">
-                  <span className="update-version">新版本 {updateVersion}</span>
-                  <span className="update-sub">已下载，装好会重启</span>
-                </div>
+                <span
+                  className="update-version"
+                  title={`新版本 ${updateVersion} 已下载，更新会重启应用`}
+                >
+                  新版本 {updateVersion}
+                </span>
                 <button
                   type="button"
                   className="btn primary update-install"
+                  title="安装新版本并重启"
                   onClick={() => void runInstall()}
                 >
-                  更新并安装
+                  <ArrowUpCircle size={13} strokeWidth={2.2} />
+                  更新
                 </button>
                 <button
                   type="button"
                   className="update-dismiss"
                   title="忽略这个版本"
+                  aria-label="忽略这个版本"
                   onClick={() => {
                     update({ updates: { dismissedVersion: updateVersion ?? "" } });
                   }}
@@ -498,15 +509,31 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main">
+      <main className="main" ref={mainRef}>
         <header className="page-head">
           <div>
             <h1>{TITLES[page].title}</h1>
-            <div className="sub">{TITLES[page].subtitle}</div>
+            {TITLES[page].subtitle && (
+              <div className="sub">{TITLES[page].subtitle}</div>
+            )}
           </div>
-          <div className="status">
-            <i className={`dot ${statusClass}`} />
-            {status}
+          <div className="page-head-side">
+            {saveState !== "idle" && (
+              <span className={`save-state ${saveState}`} aria-live="polite">
+                {saveState === "saving" ? "保存中…" : "已保存"}
+              </span>
+            )}
+            {page === "overview" ? (
+              <div className="status" title="三个工具当前的启用情况">
+                <i className={`dot ${enabledTools === 3 ? "ok" : ""}`} />
+                {enabledTools} / 3 个工具已启用
+              </div>
+            ) : page === "edge" ? (
+              <div className="status" title="边缘切换引擎的状态">
+                <i className={`dot ${statusClass}`} />
+                边缘切换 · {status}
+              </div>
+            ) : null}
           </div>
         </header>
 
@@ -522,16 +549,6 @@ export default function App() {
             config={config}
             update={update}
             monitors={snap.monitors}
-            testMode={testMode}
-            onTest={(value) => {
-              testModeWant.current = value;
-              setTestModeLocal(value);
-              void setTestMode(value).catch((reason) => {
-                testModeWant.current = null;
-                setTestModeLocal(null);
-                setError(String(reason));
-              });
-            }}
             onPreview={() => {
               void showTriggerOverlay().catch((reason) => setError(String(reason)));
             }}
@@ -545,7 +562,7 @@ export default function App() {
           />
 
         ) : page === "desktop" ? (
-          <DesktopPage config={config} update={update} />
+          <DesktopPage config={config} update={update} monitors={snap.monitors} />
         ) : page === "gestures" ? (
           <GesturePage config={config} update={update} />
         ) : page === "hotkeys" ? (
@@ -561,18 +578,17 @@ export default function App() {
             onRefresh={() => void refreshLayout()}
             onOpenFolder={() => void openConfigFolder()}
           />
-        ) : page === "cache" ? (
-          <CachePage />
         ) : (
           <AboutPage
             snap={snap}
-            config={config}
-            update={update}
             updateState={{
               phase: updatePhase,
               version: updateVersion,
               progress: updateProgress,
               error: updateError,
+              notes: updateNotes,
+              date: updateDate,
+              checkedAt: updateCheckedAt,
             }}
             onCheck={() => void runCheck(false)}
             onDownload={() => void runDownload()}
@@ -585,9 +601,8 @@ export default function App() {
 
       {showOnboarding && (
         <Onboarding
-          step={step}
-          onNext={() => setStep((value) => value + 1)}
-          onFinish={finishOnboarding}
+          hotkey={config?.hotkeys.launcher ?? ""}
+          onPick={finishOnboarding}
           onSkip={skipOnboarding}
         />
       )}
@@ -620,47 +635,73 @@ function NavItem({
   );
 }
 
-const STEPS = [
+/** 首次引导：三个工具各给一条入口，而不是只讲边缘切换。 */
+const ONBOARD_TOOLS: Array<{
+  target: "launcher" | "edge" | "desktop";
+  icon: ReactNode;
+  name: string;
+  hint: string;
+  action: string;
+}> = [
   {
-    title: "推到边缘就切",
-    body: "把鼠标推到屏幕最外侧边缘的角落区，停大约 0.1 秒，就会切到上一个 / 下一个虚拟桌面。",
+    target: "launcher",
+    icon: <Rocket size={18} />,
+    name: "快捷面板",
+    hint: "一键呼出：找文件、搬文件、写便签",
+    action: "设置",
   },
   {
-    title: "不会误触",
-    body: "内部接缝、任务栏、全屏应用、拖拽中的鼠标都会被跳过；停住不动也不会连续切换。",
+    target: "edge",
+    icon: <Crosshair size={18} />,
+    name: "边缘桌面",
+    hint: "鼠标贴到屏幕最外侧边缘，切换虚拟桌面",
+    action: "设置",
   },
   {
-    title: "先试一下",
-    body: "点“开始”会打开测试模式：布局图会高亮命中位置，但不会真的切换。确认位置对了再关掉。",
+    target: "desktop",
+    icon: <LayoutGrid size={18} />,
+    name: "桌面格子",
+    hint: "把常用文件夹钉在桌面上，拖进去就算整理好",
+    action: "设置",
   },
 ];
 
 function Onboarding({
-  step,
-  onNext,
-  onFinish,
+  hotkey,
+  onPick,
   onSkip,
 }: {
-  step: number;
-  onNext: () => void;
-  onFinish: () => void;
+  hotkey: string;
+  onPick: (target: "launcher" | "edge" | "desktop") => void;
   onSkip: () => void;
 }) {
-  const current = STEPS[Math.min(step, STEPS.length - 1)];
-  const last = step >= STEPS.length - 1;
-
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="首次使用引导">
-      <div className="modal">
+      <div className="modal onboarding">
         <div className="big-icon">
           <Sparkles size={20} />
         </div>
-        <h2>{current.title}</h2>
-        <p>{current.body}</p>
+        <h2>三个工具，各管一段</h2>
+        <p>三个可以同时用，之后随时能在概览里开关。</p>
 
-        <div className="steps">
-          {STEPS.map((_, index) => (
-            <div key={index} className={`step-dot ${index <= step ? "on" : ""}`} />
+        <div className="onboard-list">
+          {ONBOARD_TOOLS.map((tool) => (
+            <button
+              type="button"
+              key={tool.target}
+              className="onboard-row"
+              onClick={() => onPick(tool.target)}
+            >
+              <span className="onboard-icon">{tool.icon}</span>
+              <span className="onboard-text">
+                <span className="onboard-name">
+                  {tool.name}
+                  {tool.target === "launcher" && hotkey && <kbd>{hotkey}</kbd>}
+                </span>
+                <span className="onboard-hint">{tool.hint}</span>
+              </span>
+              <span className="onboard-go">{tool.action}</span>
+            </button>
           ))}
         </div>
 
@@ -668,15 +709,6 @@ function Onboarding({
           <button type="button" className="btn" onClick={onSkip}>
             跳过
           </button>
-          {last ? (
-            <button type="button" className="btn primary" onClick={onFinish}>
-              开始
-            </button>
-          ) : (
-            <button type="button" className="btn primary" onClick={onNext}>
-              下一步
-            </button>
-          )}
         </div>
       </div>
     </div>

@@ -1334,7 +1334,7 @@ function Launcher() {
         target = draft.id
           ? Promise.resolve(draft.id)
           : invoke<NoteSummary>("notes_create", {
-              title: draft.title.trim() || "未命名笔记",
+              title: draft.title.trim() || "未命名便签",
             }).then((created) => {
               setDraft((current) =>
                 current && current.id === null ? { ...current, id: created.id } : current,
@@ -1410,7 +1410,7 @@ function Launcher() {
    *
    * 排成一条链：连着改了好几处时，后写出的正文一定不会比先写出的旧。
    * 新建的笔记在第一次真正有内容时才落盘——打开又关掉的空编辑器不该
-   * 在收藏里留下一个「未命名笔记」。
+   * 在收藏里留下一个「未命名便签」。
    */
   const persistDraft = useCallback(() => {
     const current = draftRef.current;
@@ -1420,7 +1420,7 @@ function Launcher() {
     if (!noteSaveIdRef.current && !typed.trim() && !body) {
       return Promise.resolve();
     }
-    const title = typed.trim() || "未命名笔记";
+    const title = typed.trim() || "未命名便签";
     if (
       noteSaveIdRef.current &&
       title === noteSavedRef.current.title &&
@@ -2149,18 +2149,27 @@ function Launcher() {
       return;
     }
 
+    // 退层交给 Backspace（搜索框里也是它），Esc 只负责取消和关闭：
+    // 呼出式面板按 Esc 就该关掉，这是大多数人的肌肉记忆。
+    if (event.key === "Backspace" && !typing) {
+      if (scope.kind === "folder" && path && path !== base) {
+        event.preventDefault();
+        goUp();
+      }
+      return;
+    }
+
     if (event.key !== "Escape") return;
     event.preventDefault();
-    // 先取消多选，再退层，最后才关面板。
+    // 先取消多选，再清搜索词，最后才关面板。
     if (picked.size > 0) {
       setPicked(new Set());
       return;
     }
-    if (scope.kind === "folder" && path && path !== base) {
-      goUp();
+    if (query) {
+      setQuery("");
       return;
     }
-    setQuery("");
     void invoke("dismiss_launcher");
   };
 
@@ -2173,7 +2182,7 @@ function Launcher() {
         ? "__notes__"
         : `${scope.pinned ? "pin" : "cat"}:${scope.base}`;
   const baseLabel =
-    scope.kind === "all" ? "全部" : scope.kind === "notes" ? "收藏" : scope.label;
+    scope.kind === "all" ? "全部" : scope.kind === "notes" ? "便签" : scope.label;
 
   // 侧边栏的选中高亮是一块会滑动的形状：切换分类时从上一行滑到下一行，
   // 而不是两行各自闪一下底色。位置在绘制前算好，避免先闪在顶上。
@@ -2299,7 +2308,7 @@ function Launcher() {
               }}
               onMouseLeave={hoverCancel}
             >
-              <span>收藏</span>
+              <span>便签</span>
               {notes.length > 0 && <span className="count">{notes.length}</span>}
             </button>
             <div className="side-sep" />
@@ -2346,9 +2355,6 @@ function Launcher() {
             <span>{category.name}</span>
           </button>
         ))}
-        {!hasRoot && (
-          <div className="side-hint">在设置里选一个文件夹，它的子文件夹就是分类</div>
-        )}
 
         {root.folders.length > 0 && <div className="side-sep" />}
         {root.folders.map((folder) => (
@@ -2417,7 +2423,7 @@ function Launcher() {
                 type="button"
                 className="tool-btn notes-new"
                 onClick={newNote}
-                title="新建一条收藏"
+                title="新建一条便签"
               >
                 ＋ 新建
               </button>
@@ -2425,7 +2431,7 @@ function Launcher() {
                 type="button"
                 className="tool-btn"
                 onClick={openNotesFolder}
-                title="在资源管理器里打开收藏文件夹"
+                title="在资源管理器里打开便签文件夹"
               >
                 打开文件夹
               </button>
@@ -2546,7 +2552,7 @@ function Launcher() {
                 inputEditingRef.current = true;
               }}
               onKeyDown={onInputKeyDown}
-              placeholder=""
+              placeholder="搜索文件、文件夹、便签…"
               spellCheck={false}
               autoComplete="off"
             />
@@ -2649,15 +2655,24 @@ function Launcher() {
                 </>
               ) : searched ? (
                 <>
-                  <strong>所有分类里都没有</strong>
+                  <strong>没有找到匹配的文件</strong>
                   换个关键词试试
                 </>
               ) : loading ? (
-                <strong>正在读取…</strong>
+                <strong>正在读取文件夹…</strong>
               ) : (
                 <>
                   <strong>这里是空的</strong>
                   往这个文件夹里放点东西
+                  {scope.kind === "folder" && path && (
+                    <button
+                      type="button"
+                      className="empty-action"
+                      onClick={() => void invoke("launcher_open", { path })}
+                    >
+                      打开文件夹
+                    </button>
+                  )}
                 </>
               )}
             </div>
@@ -2840,18 +2855,18 @@ function Launcher() {
             {shownNotes.length === 0 ? (
               <div className="empty">
                 {notesLoading && notes.length === 0 ? (
-                  <strong>正在读取…</strong>
+                  <strong>正在读取便签…</strong>
                 ) : query.trim() ? (
                   <>
-                    <strong>没有匹配的收藏</strong>
+                    <strong>没有匹配的便签</strong>
                     换个关键词试试
                   </>
                 ) : (
                   <>
-                    <strong>还没有收藏</strong>
-                    点左上角「＋ 新建」写一条，或者把图片拖进来
+                    <strong>还没有便签</strong>
+                    写一条，或者把图片拖进来
                     <button type="button" className="empty-action" onClick={newNote}>
-                      新建一条收藏
+                      新建一条便签
                     </button>
                   </>
                 )}
@@ -2922,7 +2937,11 @@ function Launcher() {
                       {sendingNote === note.id ? "发送中…" : "发送"}
                     </button>
                     {note.images.length > 0 && (
-                      <button type="button" onClick={() => copyNoteImages(note)}>
+                      <button
+                        type="button"
+                        title="把图片作为文件放进剪贴板"
+                        onClick={() => copyNoteImages(note)}
+                      >
                         复制图片
                       </button>
                     )}
@@ -3012,11 +3031,8 @@ function Launcher() {
                 value={noteBody.value}
                 placeholder="写点什么…支持 Markdown。发送时只发送文字，图片会被去掉。"
                 spellCheck={false}
-                onKeyDown={(event) => {
-                  if (event.nativeEvent.isComposing) return;
-                  if (event.key !== "Escape") return;
-                  event.stopPropagation();
-                }}
+                // Esc 交给外面的编辑器处理（关掉正在写的便签）：这里再拦一次，
+                // 光标在正文里时 Esc 就成了哑键。
                 onChange={(event) => noteBody.set(event.target.value)}
               />
               {editingImages.length > 0 && (
@@ -3065,7 +3081,7 @@ function Launcher() {
                   <Redo2 size={14} strokeWidth={2} />
                 </button>
                 <span className="note-editor-hint">
-                  自动保存：写下去就存，Ctrl+Z 撤销 · Esc 关闭
+                  自动保存 · Ctrl+Z 撤销 · Esc 关闭
                 </span>
               </div>
             </div>
@@ -3079,18 +3095,24 @@ function Launcher() {
 
         <div className="foot">
           {/* 一搜索就跨所有分类找，这里跟着说清楚范围。 */}
-          <span>{scope.kind === "notes" ? "收藏" : searched ? "所有分类" : baseLabel}</span>
+          <span>{scope.kind === "notes" ? "便签" : searched ? "全部" : baseLabel}</span>
           <span>·</span>
           <span>{scope.kind === "notes" ? `${shownNotes.length} 条` : `${shown.length} 项`}</span>
           <span>·</span>
-          <span>
+          <span className="foot-hint">
             {scope.kind === "notes"
-              ? "点击卡片编辑 · 拖图片到空白处新建、到卡片上追加 · 发送会收起面板并输入到原窗口"
-              : "双击打开 · 拖动拖出 · 空白处或 Alt+拖动框选 · Alt+滚轮缩放 · Ctrl+A 全选"}
+              ? "点击卡片编辑 · 拖图片到空白处新建 · 到卡片上追加"
+              : "双击打开 · 拖动拖出 · 空白处或 Alt+拖动框选 · Alt+滚轮缩放"}
           </span>
           <span>·</span>
-          <span>
-            <kbd>Esc</kbd> {canUp ? "上一层" : "关闭"}
+          <span className="foot-keys">
+            <kbd>Esc</kbd> 关闭
+            {canUp && (
+              <>
+                {" · "}
+                <kbd>Backspace</kbd> 上一层
+              </>
+            )}
           </span>
         </div>
       </section>

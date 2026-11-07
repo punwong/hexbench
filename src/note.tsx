@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import MarkdownIt from "markdown-it";
-import { ChevronDown, ChevronUp, Eye, Pencil, PinOff, Redo2, Undo2 } from "lucide-react";
+import { ChevronDown, ChevronUp, Eye, Pencil, Redo2, Undo2, X } from "lucide-react";
 import { useTextHistory } from "./notehistory";
 import { watchTheme } from "./theme";
 
@@ -175,7 +175,7 @@ function NoteApp() {
       try {
         const saved = await invoke<NoteSummary>("notes_save", {
           id: currentId,
-          title: snapshot.title.trim() || "未命名笔记",
+          title: snapshot.title.trim() || "未命名便签",
           body: snapshot.body,
           // 带上自己的标签：这条广播会传回来，页面据此忽略自己的回声，
           // 不然自动保存每 450ms 就会把正在输入的内容重读一遍。
@@ -330,7 +330,17 @@ function NoteApp() {
           <span className="dot" />
           <span className="bar-title">便签打不开</span>
         </div>
-        <div className="empty">{error}</div>
+        <div className="empty">
+          <span>{error}</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={() => void load(true)}>
+              重试
+            </button>
+            <button type="button" onClick={unpin}>
+              关闭便签
+            </button>
+          </div>
+        </div>
       </div>
     );
   }
@@ -348,9 +358,9 @@ function NoteApp() {
           toggleRoll();
         }}
       >
-        <span className="dot" />
-        <span className="bar-title" title={title || "未命名笔记"}>
-          {title || "未命名笔记"}
+        <span className="dot" title="已钉在桌面" />
+        <span className="bar-title" title={title || "未命名便签"}>
+          {title || "未命名便签"}
         </span>
         {!rolled && (
           <>
@@ -408,8 +418,14 @@ function NoteApp() {
             <ChevronUp size={14} strokeWidth={2} />
           )}
         </button>
-        <button type="button" className="tool pinned" title="取消钉住" onClick={unpin}>
-          <PinOff size={14} strokeWidth={2} />
+        <button
+          type="button"
+          className="tool close"
+          title="关闭便签（内容留在便签列表里）"
+          aria-label="关闭便签"
+          onClick={unpin}
+        >
+          <X size={14} strokeWidth={2} />
         </button>
       </header>
 
@@ -434,7 +450,7 @@ function NoteApp() {
             ref={bodyInputRef}
             className="body-input"
             value={bodyText}
-            placeholder="写点什么…支持 Markdown，拖图片进收藏会自动插图。"
+            placeholder="写点什么…支持 Markdown，拖图片进便签会自动插图。"
             spellCheck={false}
             autoFocus={!!bodyText.trim()}
             onChange={(event) => history.set(event.target.value)}
@@ -466,7 +482,7 @@ function NoteApp() {
       ) : (
         <div className="empty">
           <strong>这条便签还是空的</strong>
-          随时写点什么，自动保存
+          写点什么，自动保存
           <button type="button" onClick={enterEdit}>
             开始编辑
           </button>

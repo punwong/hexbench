@@ -82,9 +82,6 @@ export function TitleBar() {
           <span className="titlebar-name">
             HexBench
           </span>
-          <span className="titlebar-sub">
-            海克斯
-          </span>
         </span>
         <div className="titlebar-actions">
           <button

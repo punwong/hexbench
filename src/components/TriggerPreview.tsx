@@ -51,6 +51,24 @@ function exposedSegments(
   return segments;
 }
 
+/**
+ * Another monitor touching this monitor's vertical edge. Seams never trigger —
+ * even where the neighbour is shorter and the seam is partially open.
+ * Same rule as `shares_edge` in `hexbench-core::geometry`.
+ */
+function sharesEdge(
+  monitors: MonitorDto[],
+  monitor: MonitorDto,
+  side: Side,
+): boolean {
+  return monitors.some((other) => {
+    if (other.index === monitor.index) return false;
+    const touching =
+      side === "left" ? other.x + other.w === monitor.x : other.x === monitor.x + monitor.w;
+    return touching && other.y < monitor.y + monitor.h && monitor.y < other.y + other.h;
+  });
+}
+
 export interface PreviewRegion {
   monitor: number;
   side: Side;
@@ -95,6 +113,8 @@ export function previewRegions(
       for (const side of ["left", "right"] as const) {
         if (trigger.sides === "left" && side === "right") continue;
         if (trigger.sides === "right" && side === "left") continue;
+        // 两块屏幕拼在一起的接缝不触发，预览也不画。
+        if (sharesEdge(monitors, monitor, side)) continue;
 
         const edgeX = side === "left" ? monitor.x : monitor.x + monitor.w - 1;
         for (const [a, b] of exposedSegments(monitors, monitor, side)) {

@@ -226,6 +226,11 @@ export interface MonitorDto {
   y: number;
   w: number;
   h: number;
+  /** 工作区（去掉任务栏），格子几何和触发带都按它算 */
+  workX: number;
+  workY: number;
+  workW: number;
+  workH: number;
   primary: boolean;
   device: string;
 }
@@ -269,7 +274,6 @@ export interface Snapshot {
   hit: HitDto | null;
   guard: string | null;
   paused: boolean;
-  testMode: boolean;
   stats: Stats;
   version: string;
   configPath: string;

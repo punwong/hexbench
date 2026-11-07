@@ -72,7 +72,6 @@ const demoConfig: Config = {
 
 let mockConfig = demoConfig;
 let mockPaused = false;
-let mockTest = true;
 let mockAutostart = false;
 let mockFires = 0;
 let mockDesktops = 1;
@@ -81,14 +80,14 @@ const started = Date.now();
 function mockSnapshot(): Snapshot {
   const t = (Date.now() - started) / 1000;
   // A slow figure-eight, parking on the portrait's left edge every other 8s.
-  const onEdge = mockTest && Math.floor(t / 8) % 2 === 1;
+  const onEdge = Math.floor(t / 8) % 2 === 1;
   const cursor = onEdge
     ? { x: -1080, y: 1600 }
     : { x: Math.round(1720 + Math.cos(t * 0.6) * 1500), y: Math.round(720 + Math.sin(t * 1.2) * 600) };
 
   const monitors = [
-    { index: 0, x: 0, y: 0, w: 3440, h: 1440, primary: true, device: "DISPLAY1" },
-    { index: 1, x: -1080, y: -232, w: 1080, h: 1920, primary: false, device: "DISPLAY2" },
+    { index: 0, x: 0, y: 0, w: 3440, h: 1440, workX: 0, workY: 0, workW: 3440, workH: 1392, primary: true, device: "DISPLAY1" },
+    { index: 1, x: -1080, y: -232, w: 1080, h: 1920, workX: -1080, workY: -232, workW: 1080, workH: 1872, primary: false, device: "DISPLAY2" },
   ];
   const regions = [
     { monitor: 0, side: "right" as const, edgeX: 3439, y0: 1296, y1: 1440 },
@@ -105,7 +104,6 @@ function mockSnapshot(): Snapshot {
     hit,
     guard: mockPaused ? "paused" : null,
     paused: mockPaused,
-    testMode: mockTest,
     stats: { ticks: Math.round(t * 20), fires: mockFires, failures: 0 },
     version: "0.1.0",
     configPath: "C:\\Users\\you\\AppData\\Roaming\\io.github.hexbench\\config.json",
@@ -165,14 +163,6 @@ export async function pickFolder(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
-export async function setTestMode(enabled: boolean): Promise<void> {
-  if (!isTauri) {
-    mockTest = enabled;
-    return;
-  }
-  await invoke("set_test_mode", { enabled });
-}
-
 export async function setAutostart(enabled: boolean): Promise<void> {
   if (!isTauri) {
     mockAutostart = enabled;
@@ -184,6 +174,12 @@ export async function setAutostart(enabled: boolean): Promise<void> {
 export async function openConfigFolder(): Promise<void> {
   if (!isTauri) return;
   await invoke("open_config_folder");
+}
+
+/** 用系统默认浏览器打开一个链接。 */
+export async function openUrl(url: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke("open_url", { url });
 }
 
 export async function refreshLayout(): Promise<void> {
@@ -288,11 +284,15 @@ export interface UpdateStatus {
   version: string | null;
   error: string | null;
   checkedAt: number;
+  notes: string | null;
+  date: string | null;
 }
 
 /// Cached result of the process-wide check (no network round trip).
 export async function updateStatus(): Promise<UpdateStatus> {
-  if (!isTauri) return { version: null, error: null, checkedAt: 0 };
+  if (!isTauri) {
+    return { version: null, error: null, checkedAt: 0, notes: null, date: null };
+  }
   return invoke<UpdateStatus>("update_status");
 }
 

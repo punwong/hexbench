@@ -2,9 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Crosshair,
+  ExternalLink,
   Eye,
   EyeOff,
   FolderOpen,
+  Github,
   Inbox,
   LayoutGrid,
   List,
@@ -12,6 +14,8 @@ import {
   LockOpen,
   Plus,
   Rocket,
+  Scale,
+  ScrollText,
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
@@ -56,6 +60,7 @@ import {
   diagnostics,
   onAppPicked,
   openPath,
+  openUrl,
   pickApp,
   pickFolder,
   runningApps,
@@ -65,7 +70,17 @@ import {
   syncTest,
 } from "./api";
 import { TriggerPreview } from "./components/TriggerPreview";
-import { Card, Row, Segmented, Slider, Tabs, Toggle } from "./components/ui";
+import {
+  Card,
+  ConfirmDialog,
+  EmptyState,
+  NumberField,
+  Row,
+  Segmented,
+  Slider,
+  Tabs,
+  Toggle,
+} from "./components/ui";
 
 export type Patch = {
   enabled?: boolean;
@@ -87,6 +102,7 @@ function ToolRow({
   icon,
   name,
   hint,
+  keycap,
   enabled,
   onToggle,
   onOpen,
@@ -94,6 +110,7 @@ function ToolRow({
   icon: ReactNode;
   name: string;
   hint: string;
+  keycap?: string;
   enabled: boolean;
   onToggle: (value: boolean) => void;
   onOpen: () => void;
@@ -102,14 +119,15 @@ function ToolRow({
     <div className="tool">
       <span className="tool-icon">{icon}</span>
       <span className="tool-text">
-        <span className="tool-name">{name}</span>
+        <span className="tool-name">
+          {name}
+          {keycap && <kbd>{keycap}</kbd>}
+        </span>
         <span className="tool-hint">{hint}</span>
       </span>
-      {enabled && (
-        <button type="button" className="btn" onClick={onOpen}>
-          设置
-        </button>
-      )}
+      <button type="button" className="btn" onClick={onOpen}>
+        设置
+      </button>
       <Toggle checked={enabled} onChange={onToggle} />
     </div>
   );
@@ -134,7 +152,8 @@ export function Overview({
           <ToolRow
             icon={<Rocket size={18} />}
             name="快捷面板"
-            hint="一个键呼出：按分类找文件、搬运文件，还能存收藏（便签和图片）"
+            hint="呼出面板，找文件、搬文件、写便签"
+            keycap={config.hotkeys.launcher}
             enabled={config.launcher.enabled}
             onToggle={(value) => update({ launcher: { enabled: value } })}
             onOpen={() => onOpen("launcher")}
@@ -145,8 +164,8 @@ export function Overview({
             name="边缘桌面"
             hint={
               desktops
-                ? `鼠标推到屏幕最外侧边缘就切虚拟桌面（当前 ${desktops} 个）`
-                : "鼠标推到屏幕最外侧边缘就切虚拟桌面"
+                ? `鼠标贴到屏幕最外侧边缘切换虚拟桌面（当前 ${desktops} 个）`
+                : "鼠标贴到屏幕最外侧边缘切换虚拟桌面"
             }
             enabled={config.enabled}
             onToggle={(value) => update({ enabled: value })}
@@ -155,7 +174,7 @@ export function Overview({
           <ToolRow
             icon={<LayoutGrid size={18} />}
             name="桌面格子"
-            hint="桌面上摆几个绑定文件夹的小组件，文件拖进去就算整理好"
+            hint="把文件夹钉在桌面上，随时取用"
             enabled={config.desktop.enabled}
             onToggle={(value) => update({ desktop: { enabled: value } })}
             onOpen={() => onOpen("desktop")}
@@ -171,20 +190,24 @@ export function EdgePage({
   update,
   monitors,
   onPreview,
-  testMode,
-  onTest,
 }: {
   config: Config;
   update: UpdateConfig;
   monitors: MonitorDto[];
   onPreview: () => void;
-  testMode: boolean;
-  onTest: (value: boolean) => void;
 }) {
   const [tab, setTab] = useState<"trigger" | "guards">("trigger");
 
   return (
     <div className="stack">
+      <Card>
+        <Row label="启用边缘切换">
+          <Toggle
+            checked={config.enabled}
+            onChange={(value) => update({ enabled: value })}
+          />
+        </Row>
+      </Card>
       <Tabs
         value={tab}
         options={[
@@ -201,11 +224,6 @@ export function EdgePage({
             monitors={monitors}
             onPreview={onPreview}
           />
-          <Card title="测试模式">
-            <Row label="只高亮，不切换" hint="先确认位置，再关掉去实际用">
-              <Toggle checked={testMode} onChange={onTest} />
-            </Row>
-          </Card>
         </>
       ) : (
         <GuardsPage config={config} update={update} />
@@ -235,15 +253,20 @@ export function TriggerPage({
   return (
     <div className="stack">
       <Card
-        title="触发范围"
+        title="预览"
         action={
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span className="sub">
               {positionLabel} {percent}% · {sidesLabel}
               {corners ? "（四角）" : ""}
             </span>
-            <button type="button" className="btn" onClick={onPreview}>
-              叠到屏幕上
+            <button
+              type="button"
+              className="btn"
+              title="在屏幕上显示 5 秒"
+              onClick={onPreview}
+            >
+              在屏幕上预览
             </button>
           </div>
         }
@@ -252,7 +275,7 @@ export function TriggerPage({
         <div className="legend">
           <span>
             <i className="swatch area" />
-            触发带（屏高的 {percent}%）
+            触发带
           </span>
           <span>
             <i className="swatch edge" />
@@ -260,21 +283,11 @@ export function TriggerPage({
           </span>
         </div>
         <p className="sub" style={{ marginTop: 10, marginBottom: 0 }}>
-          鼠标要贴到边缘那一列、并停满下面的「停留阈值」，才会切。点「叠到屏幕上」可以把它投到真实屏幕上看 5 秒。
+          屏幕拼接处的接缝不触发。
         </p>
       </Card>
 
       <Card title="触发带">
-        <Row label="占屏高比例" hint="每块屏按自己的高度计算">
-          <Slider
-            value={Math.round(config.trigger.ratio * 100)}
-            min={3}
-            max={50}
-            step={1}
-            onChange={(value) => update({ trigger: { ratio: value / 100 } })}
-            format={(value) => `${value}%`}
-          />
-        </Row>
         <Row label="贴哪条边" hint="选「上下」再配「两侧」就是四个角">
           <Segmented
             value={config.trigger.position}
@@ -286,7 +299,7 @@ export function TriggerPage({
             onChange={(value) => update({ trigger: { position: value } })}
           />
         </Row>
-        <Row label="启用边缘" hint="左右两侧可以单独关">
+        <Row label="左右两侧">
           <Segmented
             value={config.trigger.sides}
             options={[
@@ -297,58 +310,69 @@ export function TriggerPage({
             onChange={(value) => update({ trigger: { sides: value } })}
           />
         </Row>
-      </Card>
-
-      <Card title="时序">
-        <Row label="停留阈值" hint="进入后停留多久才算数">
+        <Row label="占屏高比例" hint="每块屏按自己的高度计算">
           <Slider
-            value={config.trigger.dwellMs}
-            min={0}
-            max={500}
-            step={10}
-            onChange={(value) => update({ trigger: { dwellMs: value } })}
-            format={(value) => `${value} ms`}
-          />
-        </Row>
-        <Row label="冷却" hint="两次触发的最小间隔">
-          <Slider
-            value={config.trigger.cooldownMs}
-            min={200}
-            max={2000}
-            step={50}
-            onChange={(value) => update({ trigger: { cooldownMs: value } })}
-            format={(value) => `${value} ms`}
-          />
-        </Row>
-        <Row label="轮询间隔" hint="越小越跟手，也越费电">
-          <Slider
-            value={config.trigger.pollMs}
-            min={20}
-            max={100}
-            step={10}
-            onChange={(value) => update({ trigger: { pollMs: value } })}
-            format={(value) => `${value} ms`}
+            value={Math.round(config.trigger.ratio * 100)}
+            min={3}
+            max={50}
+            step={1}
+            onChange={(value) => update({ trigger: { ratio: value / 100 } })}
+            format={(value) => `${value}%`}
           />
         </Row>
       </Card>
 
-      <Card title="光标回位">
-        <Row label="触发后向内推" hint="同时充当“离开触发区”，避免连切">
-          <Toggle
-            checked={config.trigger.restoreCursor}
-            onChange={(value) => update({ trigger: { restoreCursor: value } })}
-          />
-        </Row>
-        <Row label="内推距离">
-          <Slider
-            value={config.trigger.restoreOffsetPx}
-            min={8}
-            max={200}
-            step={4}
-            onChange={(value) => update({ trigger: { restoreOffsetPx: value } })}
-            format={(value) => `${value} px`}
-          />
-        </Row>
+      {/* 调好触发带就够用了；时序、光标回位、轮询这些平时不用动，收起来。 */}
+      <Card>
+        <details className="adv-details">
+          <summary>高级：时序与光标</summary>
+          <Row label="停留阈值" hint="光标在触发带里停多久才切换">
+            <NumberField
+              value={config.trigger.dwellMs}
+              min={0}
+              max={500}
+              step={10}
+              suffix="ms"
+              onChange={(value) => update({ trigger: { dwellMs: value } })}
+            />
+          </Row>
+          <Row label="冷却" hint="两次触发的最小间隔">
+            <NumberField
+              value={config.trigger.cooldownMs}
+              min={200}
+              max={2000}
+              step={50}
+              suffix="ms"
+              onChange={(value) => update({ trigger: { cooldownMs: value } })}
+            />
+          </Row>
+          <Row label="触发后向内推" hint="同时充当「离开触发区」，避免连续切换">
+            <Toggle
+              checked={config.trigger.restoreCursor}
+              onChange={(value) => update({ trigger: { restoreCursor: value } })}
+            />
+          </Row>
+          <Row label="内推距离">
+            <NumberField
+              value={config.trigger.restoreOffsetPx}
+              min={8}
+              max={200}
+              step={4}
+              suffix="px"
+              onChange={(value) => update({ trigger: { restoreOffsetPx: value } })}
+            />
+          </Row>
+          <Row label="轮询间隔" hint="越小越跟手，也越费电">
+            <NumberField
+              value={config.trigger.pollMs}
+              min={20}
+              max={100}
+              step={10}
+              suffix="ms"
+              onChange={(value) => update({ trigger: { pollMs: value } })}
+            />
+          </Row>
+        </details>
       </Card>
     </div>
   );
@@ -488,13 +512,13 @@ export function GuardsPage({
           />
         </Row>
 
-        <Row label="光标在任务栏上" hint="开始按钮、托盘、显示桌面都不抢">
+        <Row label="光标在任务栏上" hint="开始按钮、托盘、显示桌面都不触发">
           <Toggle
             checked={config.guard.excludeTaskbar}
             onChange={(value) => update({ guard: { excludeTaskbar: value } })}
           />
         </Row>
-        <Row label="锁屏时" hint="安全桌面下直接暂停">
+        <Row label="锁屏时">
           <Toggle
             checked={config.guard.skipWhenLocked}
             onChange={(value) => update({ guard: { skipWhenLocked: value } })}
@@ -512,7 +536,7 @@ export function GuardsPage({
       >
         {blacklist.length === 0 ? (
           <p className="sub" style={{ margin: 0 }}>
-            这些程序在前台时不触发。比如远程桌面、窗口化的游戏、模拟器。
+            这些程序在前台时不触发，比如远程桌面、全屏游戏、模拟器。
           </p>
         ) : (
           <div className="chips">
@@ -535,7 +559,7 @@ export function GuardsPage({
       {picker && (
         <AppPicker
           title="添加应用"
-          hint="点一下加入黑名单；也可以点「拾取窗口」后直接点屏幕上的程序。"
+          hint="点一下加入黑名单，或用「拾取窗口」点屏幕上的程序。"
           onPick={(app) => addApp(app.name)}
           onClose={() => setPicker(false)}
         />
@@ -550,6 +574,8 @@ function SyncCard({ config }: { config: Config }) {
   const [pass, setPass] = useState("");
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  // 上传 / 拉取都是一键覆盖：先问一句，并写明会覆盖哪一边。
+  const [ask, setAsk] = useState<null | "push" | "pull">(null);
 
   useEffect(() => {
     setUrl(config.sync.url);
@@ -574,7 +600,7 @@ function SyncCard({ config }: { config: Config }) {
   return (
     <Card title="配置同步（WebDAV）">
       <p className="sub" style={{ marginTop: 0 }}>
-        把配置传到你的 WebDAV 目录，换一台电脑拉回来即可。密码用本机 DPAPI 加密保存，不会上传。
+        密码只在本机加密保存，不会上传。
       </p>
       <Row label="地址" hint="指向一个已存在的目录，例如 https://dav.example.com/hexbench/">
         <input
@@ -593,7 +619,7 @@ function SyncCard({ config }: { config: Config }) {
           onChange={(event) => setUser(event.target.value)}
         />
       </Row>
-      <Row label="密码" hint="留空表示沿用已保存的密码">
+      <Row label="密码">
         <input
           className="phrase-text"
           style={{ width: 220 }}
@@ -616,7 +642,7 @@ function SyncCard({ config }: { config: Config }) {
           type="button"
           className="btn"
           disabled={busy}
-          onClick={() => run("上传", async () => (await remember(), await syncPush()))}
+          onClick={() => setAsk("push")}
         >
           上传配置
         </button>
@@ -624,7 +650,7 @@ function SyncCard({ config }: { config: Config }) {
           type="button"
           className="btn"
           disabled={busy}
-          onClick={() => run("拉取", async () => (await remember(), await syncPull()))}
+          onClick={() => setAsk("pull")}
         >
           拉取配置
         </button>
@@ -638,6 +664,25 @@ function SyncCard({ config }: { config: Config }) {
         </button>
       </div>
       {status && <p className="sub" style={{ marginBottom: 0 }}>{status}</p>}
+      <ConfirmDialog
+        open={ask !== null}
+        title={ask === "pull" ? "用云端配置覆盖本机？" : "用本机配置覆盖云端？"}
+        confirmLabel={ask === "pull" ? "覆盖本机" : "覆盖云端"}
+        onCancel={() => setAsk(null)}
+        onConfirm={() => {
+          const mode = ask;
+          setAsk(null);
+          if (mode === "pull") {
+            void run("拉取", async () => (await remember(), await syncPull()));
+          } else if (mode === "push") {
+            void run("上传", async () => (await remember(), await syncPush()));
+          }
+        }}
+      >
+        {ask === "pull"
+          ? "云端的设置会写进这台电脑，本机现在的设置会被替换。"
+          : "云端已有的配置会被这台电脑的设置替换。"}
+      </ConfirmDialog>
     </Card>
   );
 }
@@ -659,8 +704,10 @@ export function GeneralPage({
 }) {
   return (
     <div className="stack">
-      <SyncCard config={config} />
-      <Card title="外观">
+      <Card title="常规">
+        <Row label="开机自动启动" hint="只进托盘，不弹窗">
+          <Toggle checked={snap.autostart} onChange={onAutostart} />
+        </Row>
         <Row label="主题">
           <Segmented
             value={config.ui.theme}
@@ -674,30 +721,24 @@ export function GeneralPage({
         </Row>
       </Card>
 
-      <Card title="启动">
-        <Row label="开机自动启动" hint="只进托盘，不弹窗">
-          <Toggle checked={snap.autostart} onChange={onAutostart} />
-        </Row>
-
-      </Card>
-
       <Card title="显示器">
-        <Row label="重新读取布局" hint="插拔显示器后如果没自动刷新，点一下">
-          <button type="button" className="btn" onClick={onRefresh}>
-            刷新
-          </button>
-        </Row>
         <Row label="当前布局">
           <span className="sub">
             {snap.monitors.map((m) => `${m.w}×${m.h}`).join(" + ") || "—"}
           </span>
         </Row>
+        <Row label="重新读取布局" hint="插拔显示器后如果没自动刷新，点一下">
+          <button type="button" className="btn" onClick={onRefresh}>
+            刷新
+          </button>
+        </Row>
       </Card>
 
+      <StorageCard />
+
+      <SyncCard config={config} />
+
       <Card title="配置">
-        <div className="row-hint" style={{ marginBottom: 8 }}>
-          所有设置存在这一个文件里，跨设备同步以后也用它。
-        </div>
         <div className="mono" style={{ wordBreak: "break-all", color: "var(--muted)" }}>
           {snap.configPath}
         </div>
@@ -711,66 +752,76 @@ export function GeneralPage({
   );
 }
 
+function formatCheckedAt(ms: number): string {
+  const date = new Date(ms);
+  const now = new Date();
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (date.toDateString() === now.toDateString()) return `今天 ${time}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `昨天 ${time}`;
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${time}`;
+}
+
+type UpdateView = {
+  phase: string;
+  version: string | null;
+  progress: number | null;
+  error: string | null;
+  notes: string;
+  date: string;
+  checkedAt: number | null;
+};
+
 function UpdateCard({
-  version,
-  endpoint,
-  onSaveEndpoint,
   state,
   onCheck,
   onDownload,
   onInstall,
 }: {
-  version: string;
-  endpoint: string;
-  onSaveEndpoint: (value: string) => void;
-  state: { phase: string; version: string | null; progress: number | null; error: string | null };
+  state: UpdateView;
   onCheck: () => void;
   onDownload: () => void;
   onInstall: () => void;
 }) {
-  const [endpointDraft, setEndpointDraft] = useState(endpoint);
-
-  useEffect(() => {
-    setEndpointDraft(endpoint);
-  }, [endpoint]);
-
   const busy = state.phase === "checking" || state.phase === "downloading";
   const status =
     state.phase === "checking"
       ? "检查中…"
-      : state.phase === "available"
-        ? `发现新版本 ${state.version}`
-        : state.phase === "downloading"
-          ? `下载中 ${state.progress ?? 0}%`
-          : state.phase === "ready"
-            ? `已下载 ${state.version}，重启后生效`
-            : state.phase === "error"
-              ? `更新失败：${state.error ?? "未知错误"}`
-              : "";
+      : state.phase === "current"
+        ? state.error
+          ? "检查失败，请检查网络后重试"
+          : "已是最新版本"
+        : state.phase === "available"
+          ? `发现新版本 ${state.version}`
+          : state.phase === "downloading"
+            ? `下载中 ${state.progress ?? 0}%`
+            : state.phase === "ready"
+              ? `已下载 ${state.version}，点「更新并重启」安装`
+              : state.phase === "error"
+                ? "更新失败，请检查网络后重试"
+                : "";
+  const showNotes =
+    (state.phase === "available" || state.phase === "ready") && state.notes.trim() !== "";
 
   return (
     <Card title="更新">
-      <p className="sub" style={{ marginTop: 0 }}>
-        侧边栏会提示新版本：点一下开始下载，下载完成后再点「更新并重启」。
-      </p>
-      <Row label="当前版本">
-        <span className="sub">{version}</span>
+      <Row label="上次检查">
+        <span className="sub">
+          {state.checkedAt ? formatCheckedAt(state.checkedAt) : "尚未检查"}
+        </span>
       </Row>
-      <Row label="更新源" hint="留空用内置地址；也可以填自己的镜像（需 https）">
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input
-            className="phrase-text"
-            style={{ width: 330 }}
-            value={endpointDraft}
-            placeholder="https://…/latest.json"
-            onChange={(event) => setEndpointDraft(event.target.value)}
-          />
-          <button type="button" className="btn" onClick={() => onSaveEndpoint(endpointDraft.trim())}>
-            保存
-          </button>
-        </div>
-      </Row>
-      <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center" }}>
+      {status && (
+        <Row label="状态">
+          <span
+            className={`sub update-state ${state.phase}`}
+            title={state.error ?? undefined}
+          >
+            {status}
+          </span>
+        </Row>
+      )}
+      <div className="update-actions">
         <button type="button" className="btn" disabled={busy} onClick={onCheck}>
           检查更新
         </button>
@@ -786,14 +837,17 @@ function UpdateCard({
         )}
       </div>
       {state.phase === "downloading" && (
-        <div className="update-bar" style={{ marginTop: 10 }}>
+        <div className="update-bar">
           <i style={{ width: `${state.progress ?? 0}%` }} />
         </div>
       )}
-      {status && (
-        <p className="sub" style={{ marginBottom: 0 }}>
-          {status}
-        </p>
+      {showNotes && (
+        <div className="release-notes">
+          <div className="release-notes-head">
+            更新内容{state.date ? ` · ${state.date}` : ""}
+          </div>
+          <pre>{state.notes}</pre>
+        </div>
       )}
     </Card>
   );
@@ -815,19 +869,34 @@ const GUARD_LABEL: Record<string, string> = {
   disabled: "总开关关闭",
 };
 
+const LINKS = [
+  { label: "GitHub 项目", url: "https://github.com/punwong/hexbench", icon: <Github size={15} /> },
+  {
+    label: "问题反馈",
+    url: "https://github.com/punwong/hexbench/issues",
+    icon: <Inbox size={15} />,
+  },
+  {
+    label: "更新日志",
+    url: "https://github.com/punwong/hexbench/blob/main/docs/CHANGELOG.md",
+    icon: <ScrollText size={15} />,
+  },
+  {
+    label: "MIT 许可证",
+    url: "https://github.com/punwong/hexbench/blob/main/LICENSE",
+    icon: <Scale size={15} />,
+  },
+] as const;
+
 export function AboutPage({
   snap,
-  config,
-  update,
   updateState,
   onCheck,
   onDownload,
   onInstall,
 }: {
   snap: Snapshot;
-  config: Config;
-  update: UpdateConfig;
-  updateState: { phase: string; version: string | null; progress: number | null; error: string | null };
+  updateState: UpdateView;
   onCheck: () => void;
   onDownload: () => void;
   onInstall: () => void;
@@ -836,65 +905,81 @@ export function AboutPage({
 
   return (
     <div className="stack">
+      <div className="about-brand">
+        <span className="about-mark" aria-hidden="true" />
+        <div>
+          <div className="about-name">HexBench</div>
+          <div className="sub">版本 v{snap.version}</div>
+        </div>
+      </div>
+
       <UpdateCard
-        version={snap.version}
-        endpoint={config.updates.endpoint}
-        onSaveEndpoint={(value) => update({ updates: { endpoint: value } })}
         state={updateState}
         onCheck={onCheck}
         onDownload={onDownload}
         onInstall={onInstall}
       />
-      <Card title="关于 HexBench">
-        <dl className="kv">
-          <dt>版本</dt>
-          <dd>{snap.version}</dd>
-          <dt>许可证</dt>
-          <dd>MIT</dd>
-          <dt>定位</dt>
-          <dd>托盘常驻的 Windows 效率工具箱</dd>
-          <dt>首个工具</dt>
-          <dd>边缘桌面</dd>
-        </dl>
+
+      <Card title="链接">
+        <div className="link-list">
+          {LINKS.map((link) => (
+            <button
+              type="button"
+              key={link.url}
+              className="link-row"
+              onClick={() => void openUrl(link.url)}
+            >
+              {link.icon}
+              <span>{link.label}</span>
+              <ExternalLink size={13} className="link-glyph" />
+            </button>
+          ))}
+        </div>
         <div className="footnote">
           项目名与图标不在 MIT 授权范围内；衍生分发请改名换图标。
         </div>
       </Card>
 
-      <Card title="诊断">
-        <dl className="kv">
-          <dt>引擎状态</dt>
-          <dd>{PHASE_LABEL[snap.enginePhase] ?? snap.enginePhase}</dd>
-          <dt>当前命中</dt>
-          <dd>{snap.hit ? `${snap.hit.side === "left" ? "左" : "右"}边缘 · 第 ${snap.hit.monitor + 1} 块屏` : "无"}</dd>
-          <dt>防误触拦截</dt>
-          <dd>{GUARD_LABEL[snap.guard ?? ""] ?? (snap.guard ?? "无")}</dd>
-          <dt>轮询次数</dt>
-          <dd>{snap.stats.ticks}</dd>
-          <dt>触发次数</dt>
-          <dd>{snap.stats.fires}</dd>
-          <dt>发送失败</dt>
-          <dd>{snap.stats.failures}</dd>
-        </dl>
-        <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center" }}>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => {
-              void (async () => {
-                try {
-                  await copyText(await diagnostics());
-                  setCopyState("已复制，可以直接粘贴给我");
-                } catch (reason) {
-                  setCopyState(`复制失败：${String(reason)}`);
-                }
-              })();
-            }}
-          >
-            复制诊断信息
-          </button>
-          {copyState && <span className="sub">{copyState}</span>}
+      <Card title="反馈">
+        <div className="sub" style={{ marginBottom: 4 }}>
+          遇到问题时，附上诊断信息能更快定位。
         </div>
+        <details className="adv-details">
+          <summary>诊断信息</summary>
+          <dl className="kv">
+            <dt>引擎状态</dt>
+            <dd>{PHASE_LABEL[snap.enginePhase] ?? snap.enginePhase}</dd>
+            <dt>当前命中</dt>
+            <dd>{snap.hit ? `${snap.hit.side === "left" ? "左" : "右"}边缘 · 第 ${snap.hit.monitor + 1} 块屏` : "无"}</dd>
+            <dt>防误触拦截</dt>
+            <dd>{GUARD_LABEL[snap.guard ?? ""] ?? (snap.guard ?? "无")}</dd>
+            <dt>轮询次数</dt>
+            <dd>{snap.stats.ticks}</dd>
+            <dt>触发次数</dt>
+            <dd>{snap.stats.fires}</dd>
+            <dt>发送失败</dt>
+            <dd>{snap.stats.failures}</dd>
+          </dl>
+          <div className="adv-actions">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                void (async () => {
+                  try {
+                    await copyText(await diagnostics());
+                    setCopyState("诊断信息已复制");
+                  } catch (reason) {
+                    setCopyState(`复制失败：${String(reason)}`);
+                  }
+                })();
+              }}
+            >
+              复制诊断信息
+            </button>
+            {copyState && <span className="sub">{copyState}</span>}
+          </div>
+        </details>
       </Card>
     </div>
   );
@@ -903,22 +988,15 @@ export function AboutPage({
 /** 热键按工具分组：每个工具一组，工具页里不再重复配置。 */
 const HOTKEY_GROUPS: Array<{
   tool: string;
-  hint: string;
-  rows: Array<{ key: "pause" | "launcher"; label: string; hint: string }>;
+  rows: Array<{ key: "pause" | "launcher"; label: string }>;
 }> = [
   {
     tool: "快捷面板",
-    hint: "一个键呼出：文件分类 / 快速访问 / 收藏 / 内置网页",
-    rows: [
-      { key: "launcher", label: "呼出面板", hint: "任何时候按一下就能呼出" },
-    ],
+    rows: [{ key: "launcher", label: "呼出面板" }],
   },
   {
     tool: "边缘桌面",
-    hint: "停掉边缘切换不用打开窗口",
-    rows: [
-      { key: "pause", label: "暂停 / 继续", hint: "随手停掉边缘切换，不用打开窗口" },
-    ],
+    rows: [{ key: "pause", label: "暂停 / 继续" }],
   },
 ];
 
@@ -968,7 +1046,7 @@ function HotkeyCapture({ onCapture }: { onCapture: (combo: string) => void }) {
       onBlur={() => setListening(false)}
       aria-label="设置热键"
     >
-      {listening ? "按下组合键…" : "设置"}
+      {listening ? "按下组合键…" : "设置热键"}
     </button>
   );
 }
@@ -992,17 +1070,10 @@ export function HotkeysPage({
 }) {
   return (
     <div className="stack">
-      <p className="sub" style={{ margin: 0 }}>
-        快捷键按工具分组，工具自己的设置页里不再单独配置。点「设置」后按下组合键，Esc 取消；改完立即生效。
-      </p>
-
       {HOTKEY_GROUPS.map((group) => (
         <Card key={group.tool} title={group.tool}>
-          <p className="sub" style={{ marginTop: 0 }}>
-            {group.hint}
-          </p>
           {group.rows.map((row) => (
-            <Row key={row.key} label={row.label} hint={row.hint}>
+            <Row key={row.key} label={row.label}>
               <div className="hotkey-cell">
                 <code>{config.hotkeys[row.key] || "未设置"}</code>
                 <HotkeyCapture
@@ -1026,22 +1097,14 @@ export function HotkeysPage({
           {snap.hotkeyError}
         </p>
       )}
-
-      <Card title="说明">
-        <p className="sub" style={{ margin: 0, lineHeight: 1.8 }}>
-          如果组合键被其他程序占用，注册会失败并在上方提示——换一个组合即可。
-          <br />
-          工具关掉时，它的快捷键不会生效，但配置会保留。
-        </p>
-      </Card>
     </div>
   );
 }
 
 /**
  * 快捷面板：一个键呼出的面板。设置分成三块，对应三个标签：
- *   快捷启动 —— 根目录下的每个子文件夹就是一个分类；
- *   快速访问 —— 另外钉住的几个普通文件夹；
+ *   分类 —— 根目录下的每个子文件夹就是一个分类；
+ *   固定文件夹 —— 另外钉住的几个普通文件夹；
  *   内置网页 —— 网页窗口顶栏上的那些站点。
  */
 /// 可拖动排序的行。自己处理鼠标事件，不用 HTML5 拖放：
@@ -1177,9 +1240,12 @@ export function LauncherPage({
   onTabChange: (tab: "items" | "folders" | "sites" | "notes") => void;
 }) {
   const root = config.launcher.root;
+  const webOn = config.launcher.webEnabled !== false;
   const folders = config.launcher.folders ?? [];
   const hidden = config.launcher.hiddenCategories ?? [];
   const [categories, setCategories] = useState<LauncherCategoryInfo[]>([]);
+  // 「清空」不可撤销：根目录和固定文件夹各问一句。
+  const [askClear, setAskClear] = useState<null | "root" | "folders">(null);
 
   // 根目录变了就重新读一遍分类（后端已经按配置顺序排好）。
   useEffect(() => {
@@ -1212,8 +1278,7 @@ export function LauncherPage({
   };
 
   // ---- 收藏 ----
-  // 清空要点两下：第一下只是把按钮变成「确认清空」。
-  const [clearArmed, setClearArmed] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [notesNote, setNotesNote] = useState<string | null>(null);
 
@@ -1240,16 +1305,11 @@ export function LauncherPage({
   };
 
   const clearNotes = async () => {
-    if (!clearArmed) {
-      setClearArmed(true);
-      window.setTimeout(() => setClearArmed(false), 3000);
-      return;
-    }
-    setClearArmed(false);
+    setConfirmClear(false);
     setClearing(true);
     try {
       const count = await notesClearAll();
-      setNotesNote(count ? `已把 ${count} 条收藏移到回收站` : "没有可清空的收藏");
+      setNotesNote(count ? `已把 ${count} 条便签移到回收站` : "没有可清空的便签");
     } catch (error) {
       setNotesNote(String(error));
     } finally {
@@ -1259,26 +1319,30 @@ export function LauncherPage({
 
   return (
     <div className="stack">
+      <Card>
+        <Row label="启用快捷面板" hint="关掉后热键和面板都不再生效">
+          <Toggle
+            checked={config.launcher.enabled}
+            onChange={(value) => update({ launcher: { enabled: value } })}
+          />
+        </Row>
+      </Card>
       <Tabs
         value={tab}
         onChange={(value) =>
           onTabChange(value as "items" | "folders" | "sites" | "notes")
         }
         options={[
-          { value: "items", label: "快捷启动" },
-          { value: "folders", label: "快速访问" },
+          { value: "items", label: "分类" },
+          { value: "folders", label: "固定文件夹" },
           { value: "sites", label: "内置网页" },
-          { value: "notes", label: "收藏" },
+          { value: "notes", label: "便签" },
         ]}
       />
 
       {tab === "items" ? (
-        <Card title="快捷启动">
-          <p className="sub" style={{ marginTop: 0 }}>
-            选一个根目录，它下面的每个子文件夹就是一个分类（比如 常用 / 软件 / 设计）。
-            面板左侧按下面的顺序生成导航，拖动可以调整。
-          </p>
-          <Row label="根目录" hint="例如 D:\启动器，里面放几个子文件夹当分类">
+        <Card>
+          <Row label="根目录" hint="每个子文件夹就是一个分类">
             <div className="hotkey-cell">
               <code>{root || "未选择"}</code>
               <button type="button" className="btn" onClick={() => void chooseRoot()}>
@@ -1287,17 +1351,63 @@ export function LauncherPage({
               <button
                 type="button"
                 className="btn"
-                onClick={() => update({ launcher: { root: "", categoryOrder: [] } })}
+                disabled={!root}
+                onClick={() => setAskClear("root")}
               >
-                清空
+                清空…
               </button>
             </div>
           </Row>
 
+          <Row label="呼出位置">
+            <div className="hotkey-cell">
+              <Toggle
+                checked={config.launcher.followCursor}
+                onChange={(value) => update({ launcher: { followCursor: value } })}
+              />
+              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
+                {config.launcher.followCursor ? "贴着鼠标" : "屏幕居中"}
+              </span>
+            </div>
+          </Row>
+
+          <Row label="面板宽度" hint="占工作区宽度">
+            <Slider
+              value={config.launcher.widthPercent}
+              min={25}
+              max={80}
+              step={1}
+              onChange={(value) => update({ launcher: { widthPercent: value } })}
+              format={(value) => `${value}%`}
+            />
+          </Row>
+          <Row label="面板高度" hint="占工作区高度">
+            <Slider
+              value={config.launcher.heightPercent}
+              min={30}
+              max={80}
+              step={1}
+              onChange={(value) => update({ launcher: { heightPercent: value } })}
+              format={(value) => `${value}%`}
+            />
+          </Row>
+          <Row label="记住调整后的面板大小">
+            <Toggle
+              checked={config.launcher.panelRememberSize ?? true}
+              onChange={(next) => update({ launcher: { panelRememberSize: next } })}
+            />
+          </Row>
+          <Row label="记住浏览位置" hint="下次呼出回到上次停的文件夹">
+            <Toggle
+              checked={config.launcher.rememberLocation}
+              onChange={(value) => update({ launcher: { rememberLocation: value } })}
+            />
+          </Row>
+
           {root && (
-            <div style={{ marginTop: 12 }}>
+            <div style={{ marginTop: 16 }}>
               <div className="row-hint" style={{ marginBottom: 8 }}>
-                面板里的顺序（拖动调整）；眼睛控制它在面板上显不显示
+                拖动排序 · 点眼睛图标隐藏分类
               </div>
 
               {/* 「全部」：固定在第一条，只能显示 / 隐藏 */}
@@ -1306,7 +1416,6 @@ export function LauncherPage({
                   ⠿
                 </span>
                 <span className="sortable-label">全部</span>
-                <span className="sub">所有分类合在一起</span>
                 <span className="sortable-actions">
                   <EyeButton
                     hidden={hidden.includes("__all__")}
@@ -1318,7 +1427,10 @@ export function LauncherPage({
               <div style={{ height: 6 }} />
 
               {categories.length === 0 ? (
-                <div className="row-hint">这个目录下还没有子文件夹。</div>
+                <EmptyState
+                  title="还没有分类"
+                  hint="在根目录里建一个文件夹。"
+                />
               ) : (
                 <SortableRows
                   items={categories.map((category) => ({
@@ -1345,83 +1457,23 @@ export function LauncherPage({
               )}
             </div>
           )}
-
-          <Row
-            label="呼出位置"
-            hint="打开后贴着鼠标出现；关掉则固定在该屏幕的中间偏上"
-          >
-            <div className="hotkey-cell">
-              <Toggle
-                checked={config.launcher.followCursor}
-                onChange={(value) => update({ launcher: { followCursor: value } })}
-              />
-              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                {config.launcher.followCursor ? "贴着鼠标" : "屏幕居中"}
-              </span>
-            </div>
-          </Row>
-
-          <Row label="记住拖出来的面板大小">
-            <Toggle
-              checked={config.launcher.panelRememberSize ?? true}
-              onChange={(next) => update({ launcher: { panelRememberSize: next } })}
-            />
-          </Row>
-          <Row label="面板宽度" hint="占所在屏幕工作区宽度的百分比">
-            <Slider
-              value={config.launcher.widthPercent}
-              min={25}
-              max={80}
-              step={1}
-              onChange={(value) => update({ launcher: { widthPercent: value } })}
-              format={(value) => `${value}%`}
-            />
-          </Row>
-          <Row label="面板高度" hint="占所在屏幕工作区高度的百分比">
-            <Slider
-              value={config.launcher.heightPercent}
-              min={30}
-              max={80}
-              step={1}
-              onChange={(value) => update({ launcher: { heightPercent: value } })}
-              format={(value) => `${value}%`}
-            />
-          </Row>
-          <Row
-            label="记住上次位置"
-            hint="呼出时回到上次浏览的文件夹，不用每次重新选"
-          >
-            <Toggle
-              checked={config.launcher.rememberLocation}
-              onChange={(value) => update({ launcher: { rememberLocation: value } })}
-            />
-          </Row>
         </Card>
       ) : tab === "sites" ? (
-        <Card title="内置网页">
-          <p className="sub" style={{ marginTop: 0 }}>
-            这里加的站点会出现在网页窗口的顶栏，点一下直接打开（真 WebView，不是 iframe，
-            所以 Google、ChatGPT 这类也能开）。面板收起时网页会一起关掉，不占内存。
-          </p>
-          <Row label="启用网页窗口" hint="关掉之后面板只显示文件夹，不会创建任何 WebView">
+        <Card>
+          <Row label="启用网页窗口">
             <Toggle
-              checked={config.launcher.webEnabled !== false}
+              checked={webOn}
               onChange={(value) => update({ launcher: { webEnabled: value } })}
             />
           </Row>
 
-          <Row label="收起后保留" hint="面板收起后网页继续运行多少秒（0 = 立刻关闭）。问 AI 时建议留几十秒">
-            <Slider
-              value={config.launcher.siteKeepAliveSecs ?? 90}
-              min={0}
-              max={300}
-              step={10}
-              onChange={(value) => update({ launcher: { siteKeepAliveSecs: value } })}
-              format={(value) => (value === 0 ? "立刻关闭" : `${value} 秒`)}
-            />
-          </Row>
-
-          <Row label="网页窗口宽度" hint="占所在屏幕工作区宽度的百分比">
+          {/* 关掉网页窗口后，下面这些尺寸 / 跟随选项都不生效：整块置灰，
+              别让它们看起来还能调。 */}
+          <fieldset className="fieldset" disabled={!webOn}>
+            {!webOn && (
+              <p className="sub fieldset-note">启用网页窗口后，这些选项才会生效。</p>
+            )}
+          <Row label="网页窗口宽度" hint="占工作区宽度">
             <Slider
               value={config.launcher.siteWidthPercent ?? 24}
               min={10}
@@ -1431,7 +1483,7 @@ export function LauncherPage({
               format={(value) => `${value}%`}
             />
           </Row>
-          <Row label="网页窗口高度" hint="占所在屏幕工作区高度的百分比，可以比呼出面板高很多">
+          <Row label="网页窗口高度" hint="占工作区高度，可以比面板高">
             <Slider
               value={config.launcher.siteHeightPercent ?? 85}
               min={20}
@@ -1442,20 +1494,14 @@ export function LauncherPage({
             />
           </Row>
 
-          <Row
-            label="跟着呼出面板走"
-            hint="开启后网页贴着呼出面板出现，面板移动时一起移动"
-          >
+          <Row label="跟着呼出面板走">
             <Toggle
               checked={config.launcher.siteFollowPanel ?? false}
               onChange={(value) => update({ launcher: { siteFollowPanel: value } })}
             />
           </Row>
 
-          <Row
-            label="记住位置和大小"
-            hint="关掉则每次打开都按上面的宽度/高度重新摆"
-          >
+          <Row label="记住位置和大小" hint="关掉则每次按上面的宽高重新摆">
             <Toggle
               checked={config.launcher.siteRememberPosition ?? true}
               onChange={(value) => update({ launcher: { siteRememberPosition: value } })}
@@ -1475,10 +1521,22 @@ export function LauncherPage({
             </Row>
           )}
 
+          <Row label="收起后保留" hint="面板收起后网页还开多久，0 = 立刻关闭">
+            <Slider
+              value={config.launcher.siteKeepAliveSecs ?? 90}
+              min={0}
+              max={300}
+              step={10}
+              onChange={(value) => update({ launcher: { siteKeepAliveSecs: value } })}
+              format={(value) => (value === 0 ? "立刻关闭" : `${value} 秒`)}
+            />
+          </Row>
+
           {(config.launcher.sites ?? []).length === 0 && (
-            <div className="row-hint" style={{ marginBottom: 10 }}>
-              还没有添加网址。
-            </div>
+            <EmptyState
+              title="还没有网址"
+              hint="添加后从面板里直接打开。"
+            />
           )}
 
           {(config.launcher.sites ?? []).map((entry, index) => (
@@ -1601,15 +1659,11 @@ export function LauncherPage({
               添加网址
             </button>
           </div>
+          </fieldset>
         </Card>
       ) : tab === "notes" ? (
-        <Card title="收藏">
-          <p className="sub" style={{ marginTop: 0 }}>
-            收藏是面板里的便签：写 Markdown 文字，也可以把图片拖进去。每个笔记都是一个
-            .md 文件，图片放在旁边的 images 文件夹里，整个目录可以直接用别的编辑器打开、
-            或者丢进同步盘。点「发送」会收起面板，把文字逐字输入到呼出前的窗口。
-          </p>
-          <Row label="启用收藏" hint="在呼出面板左侧显示「收藏」这一栏">
+        <Card>
+          <Row label="启用便签" hint="在面板左侧显示">
             <Toggle
               checked={config.notes.enabled !== false}
               onChange={(value) => update({ notes: { enabled: value } })}
@@ -1617,7 +1671,7 @@ export function LauncherPage({
           </Row>
           <Row
             label="保存位置"
-            hint="默认是「文档\HexBench 收藏」，也可以换成同步盘里的文件夹"
+            hint="默认在文档下，也可以放到同步盘"
           >
             <div className="hotkey-cell">
               <code title={notesPath}>{notesPath || "文档\\HexBench 收藏"}</code>
@@ -1654,29 +1708,34 @@ export function LauncherPage({
               onChange={(value) => update({ notes: { sendEnter: value } })}
             />
           </Row>
-          <Row label="清空全部收藏" hint="笔记和图片都会进回收站，之后还能从回收站找回">
+          <Row label="清空全部便签" hint="便签和图片都会进回收站，之后还能从回收站找回">
             <button
               type="button"
               className="btn"
               disabled={clearing}
-              onClick={() => void clearNotes()}
+              onClick={() => setConfirmClear(true)}
             >
-              {clearing ? "清空中…" : clearArmed ? "确认清空" : "清空…"}
+              {clearing ? "清空中…" : "清空…"}
             </button>
           </Row>
           {notesNote && <div className="row-hint">{notesNote}</div>}
+          <ConfirmDialog
+            open={confirmClear}
+            title="清空全部便签？"
+            confirmLabel="清空"
+            onCancel={() => setConfirmClear(false)}
+            onConfirm={() => void clearNotes()}
+          >
+            便签和图片都会进回收站，之后还能从回收站找回。
+          </ConfirmDialog>
         </Card>
       ) : (
-        <Card title="快速访问">
-          <p className="sub" style={{ marginTop: 0 }}>
-            这里的文件夹会出现在面板左侧，点一下直接跳过去；拖动可以调整顺序。
-            往里拖文件就是移动进那个目录，往外拖就是复制或移动出去。
-          </p>
-
+        <Card>
           {folders.length === 0 ? (
-            <div className="row-hint" style={{ marginBottom: 10 }}>
-              还没有添加任何文件夹。
-            </div>
+            <EmptyState
+              title="还没有固定文件夹"
+              hint="常用的文件夹会固定显示在面板里。"
+            />
           ) : (
             <SortableRows
               items={folders.map((folder) => ({
@@ -1709,14 +1768,30 @@ export function LauncherPage({
               <button
                 type="button"
                 className="btn"
-                onClick={() => update({ launcher: { folders: [] } })}
+                onClick={() => setAskClear("folders")}
               >
-                全部清空
+                全部清空…
               </button>
             )}
           </div>
         </Card>
       )}
+      <ConfirmDialog
+        open={askClear !== null}
+        title={askClear === "root" ? "清空根目录？" : "清空全部固定文件夹？"}
+        confirmLabel="清空"
+        onCancel={() => setAskClear(null)}
+        onConfirm={() => {
+          const mode = askClear;
+          setAskClear(null);
+          if (mode === "root") update({ launcher: { root: "", categoryOrder: [] } });
+          if (mode === "folders") update({ launcher: { folders: [] } });
+        }}
+      >
+        {askClear === "root"
+          ? "面板不再列出分类。文件夹本身不会被删除，重新选择根目录就能恢复。"
+          : "这些文件夹会从面板里移除，文件夹本身不会被删除，可以再添加回来。"}
+      </ConfirmDialog>
     </div>
   );
 }
@@ -1830,8 +1905,7 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
   return (
     <div className="rule-editor">
       <p className="sub" style={{ marginTop: 0 }}>
-        按规则把来源目录里的文件收进这个盒子。盒子自己和收纳目录永远不会被再收一次；
-        一次整理算一步撤销（Ctrl+Z 能退）。
+        来源目录的文件按规则收进盒子；每次整理算一步撤销（Ctrl+Z）。
       </p>
       <Row label="自动整理" hint="来源目录一有变化就按规则收；关掉只能手动点「立即整理」">
         <Toggle
@@ -1841,7 +1915,7 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
       </Row>
       {draft.length === 0 && (
         <div className="row-hint">
-          还没有规则。没有规则时它就是普通收纳盒：拖什么进来收什么。
+          还没有规则，现在就是普通收纳盒。
         </div>
       )}
       {draft.map((rule, index) => (
@@ -1899,7 +1973,7 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
               />
             </label>
             <label>
-              大于 MB
+              大于（MB）
               <input
                 className="side-input"
                 type="number"
@@ -1910,7 +1984,7 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
               />
             </label>
             <label>
-              小于 MB
+              小于（MB）
               <input
                 className="side-input"
                 type="number"
@@ -1921,7 +1995,7 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
               />
             </label>
             <label>
-              早于 N 天
+              早于（天）
               <input
                 className="side-input"
                 type="number"
@@ -2036,18 +2110,46 @@ function FenceRulesEditor({ fence }: { fence: FenceSettings }) {
 
 /// 设置页里的「手势」：快捷面板文件区的右键滑动。
 /// 桌面格子：总开关 + 格子列表。增删改走专属命令，其余设置走 save_config。
-export function DesktopPage({ config, update }: { config: Config; update: UpdateConfig }) {
+/** 格子摆在哪：屏幕用「主屏 / 屏 2」，尺寸换成像素，原始设备名只放 tooltip。 */
+function fencePlacement(fence: FenceSettings, monitors: MonitorDto[]) {
+  const monitor =
+    monitors.find((item) => item.device === fence.monitor) ??
+    monitors.find((item) => item.primary) ??
+    null;
+  const name = monitor ? (monitor.primary ? "主屏" : `屏 ${monitor.index + 1}`) : "屏幕";
+  const pxW = monitor ? Math.round(monitor.workW * fence.w) : null;
+  const pxH = monitor ? Math.round(monitor.workH * fence.h) : null;
+  const corner = `${fence.x < 0.5 ? "左" : "右"}${fence.y < 0.5 ? "上" : "下"}`;
+  const parts = [name];
+  if (pxW && pxH) parts.push(`${pxW} × ${pxH}`);
+  parts.push(corner);
+  return {
+    label: parts.join(" · "),
+    title: `${fence.monitor || "默认屏幕"} · 宽 ${Math.round(fence.w * 100)}% × 高 ${Math.round(fence.h * 100)}%`,
+  };
+}
+
+export function DesktopPage({
+  config,
+  update,
+  monitors,
+}: {
+  config: Config;
+  update: UpdateConfig;
+  monitors: MonitorDto[];
+}) {
   const desktop = config.desktop;
   const fences = desktop.fences ?? [];
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 哪一格的整理规则展开着（同一时间只开一个）。
   const [openRules, setOpenRules] = useState<string | null>(null);
-  // 删除收纳盒前问文件怎么处理；普通格子直接确认删掉。
+  // 删除收纳盒前问文件怎么处理；普通格子 / 空收纳盒直接确认删掉。
   const [deleting, setDeleting] = useState<{
     fence: FenceSettings;
     info: FenceBoxInfo;
   } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<FenceSettings | null>(null);
 
   // 外观滑块要跟手：先改本地值，停手 220ms 再写配置、通知所有格子换色。
   const [opacity, setOpacity] = useState(desktop.opacity);
@@ -2131,8 +2233,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
         return;
       }
     }
-    if (!window.confirm(`删除「${fence.title || folderLabel(fence.path)}」这个格子？`)) return;
-    void fenceDelete(fence.id).catch((problem) => setError(String(problem)));
+    setConfirmDelete(fence);
   };
 
   const finishDelete = (mode: "release" | "purge" | "keep") => {
@@ -2144,17 +2245,14 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
 
   return (
     <div className="stack">
-      <Card title="桌面格子">
-        <p className="sub" style={{ marginTop: 0 }}>
-          在桌面上摆几个绑定文件夹的小组件：文件拖进去就算整理好，系统桌面图标照常使用。
-        </p>
-        <Row label="开启桌面格子" hint="关掉会销毁所有格子窗口，位置和设置保留">
+      <Card>
+        <Row label="开启桌面格子" hint="关掉后桌面上的格子会消失，位置和设置会保留">
           <Toggle
             checked={desktop.enabled}
             onChange={(value) => update({ desktop: { enabled: value } })}
           />
         </Row>
-        <Row label="按 Win+D 时保持可见" hint="关掉就跟着系统桌面一起藏起来">
+        <Row label="按 Win+D 时保持可见">
           <Toggle
             checked={desktop.keepOnShowDesktop}
             onChange={(value) => update({ desktop: { keepOnShowDesktop: value } })}
@@ -2172,34 +2270,6 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
             onChange={(value) => update({ desktop: { snapGrid: value } })}
           />
         </Row>
-      </Card>
-
-      <Card title="外观">
-        <Row label="不透明度" hint="越低背后的壁纸 / 磨砂透得越多；太低字会和背景糊在一起">
-          <Slider
-            value={opacity}
-            min={30}
-            max={100}
-            step={1}
-            onChange={(value) => {
-              setOpacity(value);
-              applyAppearance(value, frosted);
-            }}
-            format={(value) => `${value}%`}
-          />
-        </Row>
-        <Row label="磨砂（模糊背景）" hint="关掉就是纯透明玻璃：壁纸原样透出来，不模糊">
-          <Toggle
-            checked={frosted}
-            onChange={(value) => {
-              setFrosted(value);
-              applyAppearance(opacity, value);
-            }}
-          />
-        </Row>
-        <p className="sub" style={{ marginBottom: 0 }}>
-          所有格子共用这一份外观，改完立刻生效。系统不支持磨砂时，卡片会自动变成近乎纯色。
-        </p>
       </Card>
 
       <Card
@@ -2223,17 +2293,16 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
         }
       >
         {fences.length === 0 ? (
-          <div className="empty-inline">
-            <LayoutGrid size={20} />
-            <span>
-              还没有格子。绑一个文件夹，或者新建一个收纳盒：拖进去的文件真的会被收起来。
-            </span>
-          </div>
+          <EmptyState
+            icon={<LayoutGrid size={22} />}
+            title="还没有格子"
+          />
         ) : (
           <div className="fence-list">
             {fences.map((fence) => {
               const isBox = fence.kind === "bucket";
               const ruleCount = fence.rules?.length ?? 0;
+              const place = fencePlacement(fence, monitors);
               return (
                 <div className="fence-item" key={fence.id}>
                   <div className="fence-row">
@@ -2244,17 +2313,16 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
                       <span className="fence-name">
                         {fence.title || folderLabel(fence.path)}
                         {isBox && (
-                          <span className="fence-badge">{ruleCount > 0 ? "整理盒" : "收纳盒"}</span>
+                          <span className="fence-badge">收纳盒</span>
                         )}
                         {fence.rolled ? "（卷起）" : ""}
                       </span>
                       <span className="fence-path mono" title={fence.path}>
                         {isBox ? `收纳目录 · ${fence.path}` : fence.path || "没有绑定文件夹"}
                       </span>
-                      <span className="row-hint">
-                        {fence.monitor || "主显示器"} ·{" "}
-                        {`${Math.round(fence.w * 100)}% × ${Math.round(fence.h * 100)}%`}
-                        {fence.zoom !== 100 ? ` · ${fence.zoom}% 排版` : ""}
+                      <span className="row-hint" title={place.title}>
+                        {place.label}
+                        {fence.zoom !== 100 ? ` · ${fence.zoom}% 缩放` : ""}
                         {fence.locked ? " · 位置已锁定" : ""}
                         {isBox && ruleCount > 0
                           ? ` · ${ruleCount} 条规则${fence.rulesAuto ? "（自动）" : "（手动）"}`
@@ -2332,9 +2400,7 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
           </div>
         )}
         <div className="row-hint" style={{ marginTop: 10 }}>
-          桌面上：拖标题条移动，拖边缘 / 四角缩放，双击标题条卷起；右键文件用系统菜单；
-          双击文件夹进入，Alt+滚轮缩放排版。标题条右侧的按钮切换列表 / 图标视图，
-          「⋯」菜单里可以锁定位置。收纳盒里的文件拖出去也能放回桌面。
+          拖动标题栏移动，双击卷起，Alt+滚轮缩放。
         </div>
         {error && <div className="row-error">{error}</div>}
         {fences.length >= 8 && (
@@ -2342,6 +2408,34 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
             最多 8 个格子。
           </div>
         )}
+      </Card>
+
+      <Card title="外观">
+        <Row label="不透明度" hint="太低会影响阅读">
+          <Slider
+            value={opacity}
+            min={30}
+            max={100}
+            step={1}
+            onChange={(value) => {
+              setOpacity(value);
+              applyAppearance(value, frosted);
+            }}
+            format={(value) => `${value}%`}
+          />
+        </Row>
+        <Row label="磨砂（模糊背景）">
+          <Toggle
+            checked={frosted}
+            onChange={(value) => {
+              setFrosted(value);
+              applyAppearance(opacity, value);
+            }}
+          />
+        </Row>
+        <p className="sub" style={{ marginBottom: 0 }}>
+          系统不支持磨砂时，格子会显示为纯色。
+        </p>
       </Card>
 
       {deleting && (
@@ -2359,19 +2453,36 @@ export function DesktopPage({ config, update }: { config: Config; update: Update
               <button type="button" className="btn" onClick={() => finishDelete("keep")}>
                 保留文件
               </button>
-              <button type="button" className="btn" onClick={() => finishDelete("purge")}>
+              <button type="button" className="btn danger" onClick={() => finishDelete("purge")}>
                 删到回收站
               </button>
               <button type="button" className="btn primary" onClick={() => finishDelete("release")}>
                 移到桌面
               </button>
             </div>
-            <p className="sub" style={{ marginBottom: 0 }}>
-              「保留文件」只删格子，文件继续留在收纳目录里；「移到桌面」会把它们都放到系统桌面。
-            </p>
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        title={`删除「${
+          confirmDelete?.title ||
+          (confirmDelete ? folderLabel(confirmDelete.path) : "")
+        }」？`}
+        onCancel={() => setConfirmDelete(null)}
+        onConfirm={() => {
+          const target = confirmDelete;
+          setConfirmDelete(null);
+          if (target) {
+            void fenceDelete(target.id).catch((problem) => setError(String(problem)));
+          }
+        }}
+      >
+        {confirmDelete?.kind === "bucket"
+          ? "收纳盒里的文件会留在收纳目录里，之后也能从那里找回。"
+          : "只删掉这个格子，文件夹和里面的文件不受影响。"}
+      </ConfirmDialog>
     </div>
   );
 }
@@ -2389,11 +2500,6 @@ export function GesturePage({ config, update }: { config: Config; update: Update
   return (
     <div className="stack">
       <Card title="鼠标手势">
-        <p className="sub" style={{ marginTop: 0 }}>
-          在快捷面板的文件区、桌面格子的文件区按住右键横着划：默认向左后退、向右前进，
-          松手后执行，不弹右键菜单。格子里的后退 / 前进走的是你进出过的目录。
-          只在文件区生效，用右键慢慢点开菜单不受影响。
-        </p>
         <Row label="启用手势">
           <Toggle checked={g.enabled} onChange={(value) => set({ enabled: value })} />
         </Row>
@@ -2401,8 +2507,8 @@ export function GesturePage({ config, update }: { config: Config; update: Update
           <Segmented
             value={g.invertDirection ? "leftForward" : "leftBack"}
             options={[
-              { value: "leftBack", label: "左 = 后退" },
-              { value: "leftForward", label: "左 = 前进" },
+              { value: "leftBack", label: "左滑 → 后退" },
+              { value: "leftForward", label: "左滑 → 前进" },
             ]}
             onChange={(value) => set({ invertDirection: value === "leftForward" })}
           />
@@ -2425,8 +2531,8 @@ export function GesturePage({ config, update }: { config: Config; update: Update
   );
 }
 
-/// 设置页里的「缓存」：目前只有缩略图，以后别的工具也能挂在这里。
-export function CachePage() {
+/// 「通用」里的存储卡片：缩略图等缓存的占用与清理。
+function StorageCard() {
   const [items, setItems] = useState<CacheInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -2455,59 +2561,35 @@ export function CachePage() {
   };
 
   return (
-    <div className="stack">
-      <Card title="缓存">
-        <div className="row-hint" style={{ marginBottom: 12 }}>
-          删掉不会丢东西，只是下次打开要重新生成一遍。
-        </div>
-
-        {items.length === 0 && <div className="row-hint">还没有任何缓存。</div>}
-
-        {items.map((item) => (
-          <div
+    <Card title="存储">
+      {items.length === 0 ? (
+        <EmptyState title="还没有缓存" hint="打开过的缩略图会缓存在这里。" />
+      ) : (
+        items.map((item) => (
+          <Row
             key={item.key}
-            style={{
-              padding: "10px 12px",
-              border: "1px solid var(--line)",
-              borderRadius: 10,
-              marginBottom: 10,
-            }}
+            label={item.label}
+            hint={`${item.hint} · ${formatBytes(item.bytes)}，${item.files} 个文件`}
           >
-            <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
-              <strong style={{ fontSize: 13 }}>{item.label}</strong>
-              <span className="sub">
-                {formatBytes(item.bytes)} · {item.files} 个文件
-              </span>
-            </div>
-            <div className="row-hint" style={{ margin: "4px 0 6px" }}>
-              {item.hint}
-            </div>
-            <div className="mono" style={{ wordBreak: "break-all", color: "var(--muted)", fontSize: 11.5 }}>
-              {item.path}
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <button type="button" className="btn" onClick={() => void openPath(item.path)}>
-                打开文件夹
-              </button>
-            </div>
-          </div>
-        ))}
+            <button type="button" className="btn" onClick={() => void openPath(item.path)}>
+              打开文件夹
+            </button>
+          </Row>
+        ))
+      )}
 
-        <Row label="合计" hint="所有缓存加起来的占用">
-          <span className="sub">{formatBytes(total)}</span>
-        </Row>
+      <Row label="合计">
+        <span className="sub">{formatBytes(total)}</span>
+      </Row>
 
-        <div style={{ marginTop: 12 }}>
-          <button type="button" className="btn" disabled={busy || total === 0} onClick={() => void clear()}>
-            {busy ? "清理中…" : "清空所有缓存"}
-          </button>
-        </div>
-        {note && (
-          <div className="row-hint" style={{ marginTop: 8 }}>
-            {note}
-          </div>
-        )}
-      </Card>
-    </div>
+      <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
+        <button type="button" className="btn" disabled={busy || total === 0} onClick={() => void clear()}>
+          {busy ? "清理中…" : "清空缓存"}
+        </button>
+        <span className="row-hint" style={{ margin: 0 }}>
+          {note ?? "删掉不会丢东西，只是下次打开要重新生成"}
+        </span>
+      </div>
+    </Card>
   );
 }

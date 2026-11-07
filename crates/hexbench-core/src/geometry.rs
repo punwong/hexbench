@@ -73,6 +73,26 @@ pub fn bands(m: &Monitor, cfg: &TriggerConfig) -> Vec<(i32, i32)> {
     }
 }
 
+/// Whether another monitor touches this monitor's vertical edge.
+///
+/// A seam between two screens is never a trigger edge — the cursor cannot cross
+/// it. That stays true even when the neighbour is shorter and the seam is only
+/// half covered: the exposed part is still the seam, not the outside of the
+/// desktop, and popping a panel there feels like a glitch.
+fn shares_edge(monitors: &[Monitor], index: usize, side: Side) -> bool {
+    let m = &monitors[index];
+    monitors.iter().enumerate().any(|(other_index, other)| {
+        if other_index == index {
+            return false;
+        }
+        let touching = match side {
+            Side::Left => other.rect.right == m.rect.left,
+            Side::Right => other.rect.left == m.rect.right,
+        };
+        touching && other.rect.top < m.rect.bottom && m.rect.top < other.rect.bottom
+    })
+}
+
 /// Split one edge into maximal segments whose outside column is empty, cutting
 /// at every other monitor's top/bottom so boundaries land on real geometry.
 pub fn exposed_segments(
@@ -116,6 +136,11 @@ pub fn regions(monitors: &[Monitor], cfg: &TriggerConfig) -> Vec<Region> {
         let bands = bands(m, cfg);
         for side in Side::all() {
             if !cfg.side_enabled(side) {
+                continue;
+            }
+            // 两块屏幕贴在一起的接缝不是外沿，不触发（上下叠放共用的是另一条边，
+            // 左右外沿仍然算）。
+            if shares_edge(monitors, index, side) {
                 continue;
             }
             for (a, b) in exposed_segments(&probe, monitors, index, side) {
@@ -163,12 +188,12 @@ mod tests {
     }
 
     #[test]
-    fn dev_layout_has_three_regions() {
+    fn dev_layout_has_two_regions() {
         let monitors = dev_layout();
         let cfg = TriggerConfig::default();
         let regions = regions(&monitors, &cfg);
 
-        assert_eq!(regions.len(), 3, "{regions:#?}");
+        assert_eq!(regions.len(), 2, "{regions:#?}");
 
         // Screen 0 right edge, full 10% band.
         let r = regions.iter().find(|r| r.monitor == 0 && r.side == Side::Right).unwrap();
@@ -179,11 +204,6 @@ mod tests {
         let l = regions.iter().find(|r| r.monitor == 1 && r.side == Side::Left).unwrap();
         assert_eq!(l.edge_x, -1080);
         assert_eq!((l.y0, l.y1), (1496, 1688));
-
-        // Screen 1 right edge is a real edge only below screen 0.
-        let rr = regions.iter().find(|r| r.monitor == 1 && r.side == Side::Right).unwrap();
-        assert_eq!(rr.edge_x, -1);
-        assert_eq!((rr.y0, rr.y1), (1496, 1688));
     }
 
     #[test]
@@ -192,8 +212,27 @@ mod tests {
         let regions = regions(&monitors, &TriggerConfig::default());
         // x = 0 on screen 0's left edge is covered by the portrait monitor.
         assert!(regions.iter().all(|r| !(r.monitor == 0 && r.side == Side::Left)));
-        // x = -1 above screen 0 is covered as well.
-        assert!(regions.iter().all(|r| !(r.monitor == 1 && r.side == Side::Right && r.y0 < 1440)));
+        // The portrait's right edge is the seam. Screen 0 is shorter, but the
+        // piece below it is still the seam, not the outside of the desktop.
+        assert!(regions.iter().all(|r| !(r.monitor == 1 && r.side == Side::Right)));
+    }
+
+    #[test]
+    fn seams_block_whole_edges_even_partially_open() {
+        // Same layout, but the right screen is *taller*: the seam is exposed
+        // above it now, and still must not trigger.
+        let mut v = vec![
+            monitor(0, 0, 1920, 1440),
+            monitor(1920, -480, 3000, 1440),
+        ];
+        v[0].primary = true;
+        sort_monitors(&mut v);
+        let regions = regions(&v, &TriggerConfig::default());
+        assert!(regions.iter().all(|r| !(r.monitor == 0 && r.side == Side::Right)));
+        assert!(regions.iter().all(|r| !(r.monitor == 1 && r.side == Side::Left)));
+        // The two outer edges are still there.
+        assert!(regions.iter().any(|r| r.monitor == 0 && r.side == Side::Left));
+        assert!(regions.iter().any(|r| r.monitor == 1 && r.side == Side::Right));
     }
 
     #[test]

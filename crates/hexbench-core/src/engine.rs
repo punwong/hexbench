@@ -77,7 +77,7 @@ impl Engine {
         self.refresh();
     }
 
-    /// Test mode: report hits but never send the shortcut.
+    /// Dry run: report hits but never send the shortcut (used by the CLI).
     pub fn set_dry_run(&mut self, dry_run: bool) {
         self.dry_run = dry_run;
     }

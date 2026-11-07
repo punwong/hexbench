@@ -1,23 +1,26 @@
 # 文档索引
 
-| 文档 | 说明 | 状态 |
+本目录收录用户文档、开发文档和版本记录。按读者分成三类：
+
+| 文档 | 内容 | 读者 |
 | --- | --- | --- |
-| [../README.md](../README.md) | 产品说明、架构、配置、开发与发布流程 | 现行 |
-| [web-window-notes.md](web-window-notes.md) | 网页窗口的实现细节、配置项、踩过的坑 | 现行 |
-| [dev-testing.md](dev-testing.md) | 测试用的固定目录和规矩（**别动用户的 root/folders**） | 现行 |
-| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 | 现行 |
-| [plan.html](plan.html) | 最早的产品规划稿（HTML 版） | 历史，仅存档 |
+| [README.md](../README.md) / [README.en.md](../README.en.md) | 功能说明、配置项、安装与使用、开发与发布流程 | 用户、开发者 |
+| [CHANGELOG.md](CHANGELOG.md) | 各版本的变更记录 | 用户、开发者 |
+| [dev-testing.md](dev-testing.md) | 自动化测试与手动验证使用的固定环境、测试数据和操作方法 | 开发者 |
+| [web-window-notes.md](web-window-notes.md) | 内置网页窗口的结构、摆放规则、配置项和实现约束 | 开发者 |
 
-## 截图
+## 文档约定
 
-`assets/` 里是开发过程中验证用的截图，**README 不引用任何图片**。
-命名按主题前缀：
+- 用户可见的功能和配置以 `README.md` 为准，`README.en.md` 与其内容保持一致。
+- 版本变更写入 `CHANGELOG.md`，每个版本一个二级标题，条目按模块归类。
+- 开发文档只描述当前实现，不保留已废弃方案的设计过程。
+- `assets/` 保存开发过程中用于核对界面的截图，正文不引用这些图片。文件名以主题开头：
 
-- `launcher-*` —— 快捷面板
-- `settings-*` —— 设置页
-- `ui-*` / `update-*` —— 主界面与更新提示
-- `web-*` —— 网页窗口
-- 其余（`context-menu`、`trigger-blue` 等）按内容命名
+  | 前缀 | 对应界面 |
+  | --- | --- |
+  | `launcher-` | 快捷面板 |
+  | `settings-` | 设置窗口 |
+  | `ui-`、`update-` | 主界面与更新提示 |
+  | `web-` | 网页窗口 |
 
-同一个界面往往有多张截图（不同迭代版本），**以最新的为准**；
-发现重复或过期可以直接删。
+  同一界面存在多张截图时，以最新版本为准；过期截图可以直接删除。

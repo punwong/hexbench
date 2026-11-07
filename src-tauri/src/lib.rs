@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WebviewUrl,
@@ -17,6 +17,13 @@ use tauri_plugin_updater::UpdaterExt;
 /// Set only by the tray "quit" item (and app.exit calls), so the exit veto can
 /// tell "the user closed the window" from "the user wants to quit".
 static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// WebView2 自带的「原生窗口遮挡」计算会在窗口被别的程序挡住一段时间后
+/// 冻结渲染进程；再点回来时主线程等它恢复，窗口就变成「未响应」。
+/// 设置窗口常被压在别的窗口后面，所以所有 WebView 窗口都关掉这项计算。
+/// `--disable-features` 会覆盖 wry 默认带的那几个，必须一起写上。
+const WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion";
+
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 use hexbench_core::config::{
@@ -35,6 +42,11 @@ struct MonitorDto {
     y: i32,
     w: i32,
     h: i32,
+    /// Work area (taskbar excluded): the trigger band and fence geometry use it.
+    work_x: i32,
+    work_y: i32,
+    work_w: i32,
+    work_h: i32,
     primary: bool,
     device: String,
 }
@@ -82,7 +94,6 @@ struct Snapshot {
     hit: Option<HitDto>,
     guard: Option<String>,
     paused: bool,
-    test_mode: bool,
     stats: StatsDto,
     version: String,
     config_path: String,
@@ -96,7 +107,6 @@ struct Snapshot {
 struct Shared {
     config: Config,
     paused: bool,
-    test_mode: bool,
     cursor: Option<(i32, i32)>,
     hit: Option<Hit>,
     guard: Option<String>,
@@ -116,7 +126,6 @@ impl Shared {
         Self {
             config,
             paused: false,
-            test_mode: false,
             cursor: None,
             hit: None,
             guard: None,
@@ -147,6 +156,8 @@ struct AppState {
     /// 等窗口（和页面）起来之后由前端来取。主窗口关掉一阵子会被销毁，
     /// 直接 emit 会发给一个还不存在的页面，用户看到的就是「点齿轮没反应」。
     pending_page: Mutex<Option<(String, Option<String>)>>,
+    /// 托盘菜单：勾选项要跟着暂停状态走。
+    tray_menu: Mutex<Option<Menu<tauri::Wry>>>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -155,6 +166,9 @@ struct UpdateStatus {
     version: Option<String>,
     error: Option<String>,
     checked_at: i64,
+    /// 上次查到的新版本说明与日期：窗口重开时也直接能显示。
+    notes: Option<String>,
+    date: Option<String>,
 }
 
 #[tauri::command]
@@ -235,7 +249,6 @@ fn snapshot(state: State<'_, AppState>) -> Snapshot {
         }),
         guard: shared.guard.clone(),
         paused: shared.paused,
-        test_mode: shared.test_mode,
         stats: shared.stats.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         config_path: state.config_path.display().to_string(),
@@ -376,8 +389,9 @@ fn save_config(
 }
 
 #[tauri::command]
-fn set_paused(paused: bool, state: State<'_, AppState>) {
+fn set_paused(paused: bool, app: AppHandle, state: State<'_, AppState>) {
     state.shared.lock().unwrap().paused = paused;
+    sync_tray_checks(&app);
 }
 
 /// Re-register every global shortcut from the config.
@@ -398,13 +412,15 @@ fn register_hotkeys(app: &AppHandle) {
     let _ = manager.unregister_all();
 
     let mut error = None;
-    for (label, combo) in [("暂停 / 继续", &pause), ("快速呼出", &launcher)] {
+    for (label, combo) in [("暂停 / 继续", &pause), ("呼出面板", &launcher)] {
         if combo.trim().is_empty() {
             continue;
         }
         if let Err(reason) = manager.register(combo.as_str()) {
             log::warn!("注册热键「{label}」{combo} 失败：{reason}");
-            error = Some(format!("「{label}」{combo} 注册失败，可能已被其他程序占用"));
+            error = Some(format!(
+                "「{label}」{combo} 注册失败，可能已被其他程序占用，换一个组合键再试"
+            ));
         }
     }
     app.state::<AppState>().shared.lock().unwrap().hotkey_error = error;
@@ -443,14 +459,12 @@ fn show_all_fences(app: &AppHandle) {
 
 /// Toggle the pause flag from outside the UI (tray, global shortcut).
 fn toggle_pause(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let mut shared = state.shared.lock().unwrap();
-    shared.paused = !shared.paused;
-}
-
-#[tauri::command]
-fn set_test_mode(enabled: bool, state: State<'_, AppState>) {
-    state.shared.lock().unwrap().test_mode = enabled;
+    {
+        let state = app.state::<AppState>();
+        let mut shared = state.shared.lock().unwrap();
+        shared.paused = !shared.paused;
+    }
+    sync_tray_checks(app);
 }
 
 #[tauri::command]
@@ -510,17 +524,19 @@ fn overlay_geometry(
     let bands = monitors
         .iter()
         .flat_map(|monitor| {
-            let height = ((monitor.h as f64 * ratio).round() as i32).min(monitor.h);
-            let top = monitor.y;
-            let bottom = monitor.y + monitor.h - height;
+            // 只画工作区：任务栏不参与触发（引擎里由 exclude_taskbar 拦着），
+            // 预览也别糊在任务栏上。区域本身按整块屏算，但任务栏那一段永远不会命中。
+            let height = ((monitor.work_h as f64 * ratio).round() as i32).min(monitor.work_h);
+            let top = monitor.work_y;
+            let bottom = monitor.work_y + monitor.work_h - height;
             let ranges: Vec<(i32, i32)> = match position {
-                hexbench_core::model::BandPosition::Bottom => vec![(bottom, monitor.y + monitor.h)],
+                hexbench_core::model::BandPosition::Bottom => vec![(bottom, monitor.work_y + monitor.work_h)],
                 hexbench_core::model::BandPosition::Top => vec![(top, top + height)],
                 hexbench_core::model::BandPosition::Both => {
                     if top + height >= bottom {
-                        vec![(top, monitor.y + monitor.h)]
+                        vec![(top, monitor.work_y + monitor.work_h)]
                     } else {
-                        vec![(top, top + height), (bottom, monitor.y + monitor.h)]
+                        vec![(top, top + height), (bottom, monitor.work_y + monitor.work_h)]
                     }
                 }
             };
@@ -673,13 +689,14 @@ fn open_overlay(app: &AppHandle) -> Result<(), String> {
         overlay_geometry(&monitors, &regions, trigger.ratio, trigger.position)
     else {
         log::warn!("overlay: no monitors yet");
-        return Err("还没有读到显示器".to_string());
+        return Err("还没读到显示器，点「刷新」再试".to_string());
     };
 
     let overlay = match app.get_webview_window("overlay") {
         Some(window) => window,
         None => WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("overlay.html".into()))
             .title("HexBench")
+            .additional_browser_args(WEBVIEW_ARGS)
             .decorations(false)
         .zoom_hotkeys_enabled(false)
             .transparent(true)
@@ -913,10 +930,14 @@ async fn update_check(app: AppHandle) -> Result<Option<UpdateInfoDto>, String> {
         match &result {
             Ok(info) => {
                 status.version = info.as_ref().map(|info| info.version.clone());
+                status.notes = info.as_ref().map(|info| info.notes.clone());
+                status.date = info.as_ref().map(|info| info.date.clone());
                 status.error = None;
             }
             Err(error) => {
                 status.version = None;
+                status.notes = None;
+                status.date = None;
                 status.error = Some(error.clone());
             }
         }
@@ -1238,21 +1259,25 @@ fn open_main_now(app: &AppHandle) {
             return;
     }
 
-    // 设置窗口和呼出面板同一套比例：默认占所在屏幕工作区的六成。
+    // 设置窗口宽度占工作区六成，高度给到七成二：设置页多是长表单，
+    // 高度太省会把标签栏和预览都挤到折叠线以下。下限抬到 600，
+    // 保证 125%/150% 缩放下也能露出一屏有效内容。
     // 工作区是物理像素，窗口尺寸要逻辑值，先按这块屏的缩放换算。
     let (cursor_x, cursor_y) = hexbench_core::sys::cursor_position();
     let scale = scale_at_cursor(app);
     let (width, height) = match hexbench_core::sys::work_area_at(cursor_x, cursor_y) {
         Some((left, top, right, bottom)) => (
             (((right - left) * 60 / 100) as f64 / scale).max(840.0),
-            (((bottom - top) * 60 / 100) as f64 / scale).max(560.0),
+            (((bottom - top) * 72 / 100) as f64 / scale).max(600.0),
         ),
         None => (980.0, 660.0),
     };
     match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("HexBench")
+        // 任务栏和 Alt+Tab 里显示的名字：跟面板、格子区分开。
+        .title("HexBench 设置")
+        .additional_browser_args(WEBVIEW_ARGS)
         .inner_size(width, height)
-        .min_inner_size(840.0, 560.0)
+        .min_inner_size(840.0, 600.0)
         // The app draws its own title bar and window buttons.
         .decorations(false)
         .zoom_hotkeys_enabled(false)
@@ -1398,7 +1423,8 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     // 竖版标志必须跟着清掉，否则会出现「竖版空壳」。
     LAUNCHER_WEB_MODE.store(false, Ordering::Relaxed);
     let built = WebviewWindowBuilder::new(app, "launcher", WebviewUrl::App("launcher.html".into()))
-        .title("快速呼出")
+        .title("HexBench 快捷面板")
+        .additional_browser_args(WEBVIEW_ARGS)
         .inner_size(780.0, 500.0)
         .min_inner_size(520.0, 320.0)
         .decorations(false)
@@ -2002,6 +2028,7 @@ fn ensure_web_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
         tauri::WebviewUrl::App("web.html".into()),
     )
     .title("网页")
+    .additional_browser_args(WEBVIEW_ARGS)
     .inner_size(WEB_COLUMN_WIDTH, height)
     .decorations(false)
     .resizable(true)
@@ -2316,6 +2343,7 @@ fn build_site_window(app: &AppHandle, url: tauri::Url) -> Result<(), String> {
     let height = (size.height as f64 / scale).max(240.0);
     tauri::WebviewWindowBuilder::new(app, SITE_WEBVIEW, tauri::WebviewUrl::External(url))
         .title("网页")
+        .additional_browser_args(WEBVIEW_ARGS)
         .inner_size(WEB_COLUMN_WIDTH, height)
         .position(left, top)
         .decorations(false)
@@ -2380,12 +2408,12 @@ fn launcher_set_web_mode(on: bool) -> Result<WebRect, String> {
 #[tauri::command]
 async fn launcher_open_site(app: AppHandle, url: String) -> Result<(), String> {
     if !web_enabled_at(&app) {
-        return Err("内置网页已在设置里关闭".to_string());
+        return Err("内置网页已关闭，先到「设置 → 快捷面板 → 内置网页」打开".to_string());
     }
     let normalized = hexbench_core::net::normalize_url(&url);
     let parsed: tauri::Url = normalized
         .parse()
-        .map_err(|_| format!("网址不对：{url}"))?;
+        .map_err(|_| "网址格式不对，需要以 http:// 或 https:// 开头".to_string())?;
     if let Some(existing) = app.get_webview_window(SITE_WEBVIEW) {
         let _ = existing.navigate(parsed);
         // 不在这里 show()：预建窗口该保持隐藏，否则一开机就自己弹出来。
@@ -2425,12 +2453,12 @@ fn web_side_state() -> bool {
 #[tauri::command]
 async fn web_page_open(app: AppHandle, url: String) -> Result<(), String> {
     if !web_enabled_at(&app) {
-        return Err("内置网页已在设置里关闭".to_string());
+        return Err("内置网页已关闭，先到「设置 → 快捷面板 → 内置网页」打开".to_string());
     }
     let normalized = hexbench_core::net::normalize_url(&url);
     let parsed: tauri::Url = normalized
         .parse()
-        .map_err(|_| format!("网址不对：{url}"))?;
+        .map_err(|_| "网址格式不对，需要以 http:// 或 https:// 开头".to_string())?;
     // add_child 定义在 Window 上：用持有句柄换出底层 Window，
     // get_window(WEB_PANEL) 查不到（这个窗口实体不在注册表里）。
     let web_panel = web_window_handle().ok_or_else(|| "网页面板还没建好".to_string())?;
@@ -3294,7 +3322,7 @@ fn notes_copy_images(id: String, state: State<'_, AppState>) -> Result<usize, St
     let root = notes_root(&state)?;
     let paths = hexbench_core::notes::image_paths(&root, &id)?;
     if paths.is_empty() {
-        return Err("这条收藏里没有图片".to_string());
+        return Err("这条便签里没有图片".to_string());
     }
     hexbench_core::shell_ops::clipboard_set_files(&paths, false)?;
     Ok(paths.len())
@@ -3575,6 +3603,7 @@ fn build_note_window(app: &AppHandle, pin: &NotePin) -> Result<tauri::WebviewWin
         WebviewUrl::App("note.html".into()),
     )
     .title("HexBench 便签")
+    .additional_browser_args(WEBVIEW_ARGS)
     .inner_size(w as f64, h as f64)
     .min_inner_size(NOTE_MIN_W, NOTE_MIN_H)
     .decorations(false)
@@ -3869,7 +3898,7 @@ async fn notes_send(
         let note = hexbench_core::notes::read(&root, &id)?;
         let text = hexbench_core::notes::send_text(&note.body);
         if text.is_empty() {
-            return Err("这条收藏没有可发送的文字".to_string());
+            return Err("这条便签没有可发送的文字".to_string());
         }
         let target = LAUNCHER_RETURN
             .lock()
@@ -3895,7 +3924,7 @@ async fn notes_send(
         }
         if front != Some(target) {
             reshow_launcher(&handle);
-            return Err("无法切回目标窗口（可能已最小化或被前台锁拦住）".to_string());
+            return Err("无法切回目标窗口，可能已最小化，或被系统拦住".to_string());
         }
         if !hexbench_core::sys::type_text(&text) {
             reshow_launcher(&handle);
@@ -6071,6 +6100,7 @@ fn build_guides_window(
         WebviewUrl::App("snap-guides.html".into()),
     )
     .title("HexBench")
+    .additional_browser_args(WEBVIEW_ARGS)
     .decorations(false)
     .zoom_hotkeys_enabled(false)
     .transparent(true)
@@ -7213,9 +7243,21 @@ fn fence_run_resize(
     Ok(())
 }
 
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
-    let test = MenuItem::with_id(app, "test", "测试模式", true, None::<&str>)?;
-    let pause = MenuItem::with_id(app, "pause", "暂停 / 继续", true, None::<&str>)?;
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let paused = {
+        let state = app.state::<AppState>();
+        let shared = state.shared.lock().unwrap();
+        shared.paused
+    };
+    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
+    let pause = CheckMenuItem::with_id(
+        app,
+        "pause",
+        "暂停边缘切换",
+        true,
+        paused,
+        None::<&str>,
+    )?;
     let show_all = MenuItem::with_id(app, "show-all", "显示全部格子", true, None::<&str>)?;
     let separator_a = PredefinedMenuItem::separator(app)?;
     let separator_b = PredefinedMenuItem::separator(app)?;
@@ -7225,13 +7267,13 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::wi
         &[
             &open,
             &separator_a,
-            &test,
             &pause,
             &show_all,
             &separator_b,
             &quit,
         ],
     )?;
+    *app.state::<AppState>().tray_menu.lock().unwrap() = Some(menu.clone());
 
     let icon = match app.default_window_icon() {
         Some(icon) => icon.clone(),
@@ -7240,17 +7282,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::wi
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip("HexBench · 海克斯")
+        .tooltip("HexBench")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => open_main(app),
             "quit" => request_quit(app),
-            "test" => {
-                let state = app.state::<AppState>();
-                let mut shared = state.shared.lock().unwrap();
-                shared.test_mode = !shared.test_mode;
-            }
             "pause" => toggle_pause(app),
             "show-all" => show_all_fences(app),
             _ => {}
@@ -7270,6 +7307,22 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {    let open = MenuItem::wi
     Ok(())
 }
 
+/// 托盘勾选跟着状态走：热键和设置页也能改暂停开关。
+fn sync_tray_checks(app: &AppHandle) {
+    let menu = app.state::<AppState>().tray_menu.lock().unwrap().clone();
+    let Some(menu) = menu else {
+        return;
+    };
+    let paused = {
+        let state = app.state::<AppState>();
+        let shared = state.shared.lock().unwrap();
+        shared.paused
+    };
+    if let Some(MenuItemKind::Check(item)) = menu.get("pause") {
+        let _ = item.set_checked(paused);
+    }
+}
+
 fn spawn_engine(shared: Arc<Mutex<Shared>>) {
     thread::spawn(move || {
         let initial = shared.lock().unwrap().config.clone();
@@ -7279,13 +7332,12 @@ fn spawn_engine(shared: Arc<Mutex<Shared>>) {
 
         loop {
             tick_count += 1;
-            let (desired, paused, test_mode, refresh_requested, poll_ms) = {
+            let (desired, paused, refresh_requested, poll_ms) = {
                 let mut state = shared.lock().unwrap();
                 let refresh = std::mem::take(&mut state.refresh_requested);
                 (
                     state.config.clone(),
                     state.paused,
-                    state.test_mode,
                     refresh,
                     state.config.trigger.poll_ms,
                 )
@@ -7294,7 +7346,6 @@ fn spawn_engine(shared: Arc<Mutex<Shared>>) {
             if refresh_requested || engine.config() != &desired {
                 engine.set_config(desired.clone());
             }
-            engine.set_dry_run(test_mode);
 
             let tick = if paused {
                 engine.reset();
@@ -7382,6 +7433,10 @@ fn monitor_dto(index: usize, monitor: &Monitor) -> MonitorDto {
         y: monitor.rect.top,
         w: monitor.rect.width(),
         h: monitor.rect.height(),
+        work_x: monitor.work.left,
+        work_y: monitor.work.top,
+        work_w: monitor.work.width(),
+        work_h: monitor.work.height(),
         primary: monitor.primary,
         device: monitor.device.clone(),
     }
@@ -8002,6 +8057,7 @@ pub fn run() {
             pending_update: Mutex::new(None),
             update_status: Mutex::new(UpdateStatus::default()),
             pending_page: Mutex::new(None),
+            tray_menu: Mutex::new(None),
         })
         // 图标直接从磁盘给 WebView：`http://hbicon.localhost/<缓存键>`。
         // 走协议比把 base64 塞进 IPC 省得多——解码和缓存都交给引擎。
@@ -8053,7 +8109,6 @@ pub fn run() {
             save_config,
     ui_theme_preference,
             set_paused,
-            set_test_mode,
             refresh_layout,
             set_autostart,
             open_config_folder,
@@ -8230,13 +8285,14 @@ pub fn run() {
 
             // A tray app can run for days: checking only at launch would mean
             // "restart to find out you have an update". latest.json is a few
-            // hundred bytes, so half-hourly is cheap.
+            // hundred bytes, so a ten-minute poll costs nothing and gets a
+            // release in front of people well inside the hour.
             let check_handle = handle.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(3));
                 loop {
                     let _ = tauri::async_runtime::block_on(update_check(check_handle.clone()));
-                    thread::sleep(Duration::from_secs(30 * 60));
+                    thread::sleep(Duration::from_secs(10 * 60));
                 }
             });
 

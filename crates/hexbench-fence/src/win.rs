@@ -1018,12 +1018,13 @@ impl Brushes {
             line: solid(dc, if dark { rgb(255, 255, 255, 0.10) } else { rgb(0, 0, 0, 0.09) })?,
             hover: solid(dc, if dark { rgb(255, 255, 255, 0.07) } else { rgb(0, 0, 0, 0.05) })?,
             pick: solid(dc, if dark { rgb(255, 255, 255, 0.14) } else { rgb(0, 0, 0, 0.10) })?,
+            // 滚动条要能看见：以前最浓也只有 10%，浅色壁纸上的格子等于没有。
             scroll: solid(
                 dc,
                 if dark {
-                    rgb(255, 255, 255, 0.03 + alpha * 0.07)
+                    rgb(255, 255, 255, 0.10 + alpha * 0.16)
                 } else {
-                    rgb(0, 0, 0, 0.03 + alpha * 0.07)
+                    rgb(0, 0, 0, 0.10 + alpha * 0.16)
                 },
             )?,
             gesture_line: solid(
@@ -2827,9 +2828,9 @@ impl FenceWindow {
             let top = HEADER_H + self.head_row_h() + (self.scroll / max) * travel;
             let thumb = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
-                    left: w - 6.0,
+                    left: w - 8.0,
                     top,
-                    right: w,
+                    right: w - 2.0,
                     bottom: top + thumb_h,
                 },
                 radiusX: 3.0,
@@ -3086,6 +3087,22 @@ fn show_fence_menu(hwnd: HWND, fence: &FenceWindow, x: i32, y: i32) -> u32 {
         let _ = DestroyMenu(menu);
         command.0 as u32
     })
+}
+
+/// 删除格子前的确认框。用系统 MessageBox：格子的菜单本来就跑在窗口自己的
+/// 线程上，这里不需要再搭一套对话框架；默认按钮落在「否」上，防止连按回车。
+fn confirm_delete(hwnd: HWND, text: &str) -> bool {
+    let text = HSTRING::from(text);
+    let caption = HSTRING::from("删除格子");
+    let result = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            &text,
+            &caption,
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND | MB_DEFBUTTON2,
+        )
+    };
+    result == IDYES
 }
 
 /// 菜单期间临时让格子能成为前台。
@@ -4162,7 +4179,18 @@ unsafe extern "system" fn fence_wndproc(
                         key: "type".to_string(),
                     }),
                     MENU_HIDE => ((*engine).sink)(Event::Hide { id: fence.id.clone() }),
-                    MENU_DELETE => ((*engine).sink)(Event::Delete { id: fence.id.clone() }),
+                    MENU_DELETE => {
+                        // 和设置页一样先确认：右键菜单里「隐藏」和「删除」挨着，
+                        // 点错就把格子删了。文件不动，只删这个格子。
+                        let text = if fence.is_bucket {
+                            "删除这个收纳盒？\n收纳目录里的文件不会被删除。"
+                        } else {
+                            "删除这个格子？\n绑定的文件夹和文件不会被删除。"
+                        };
+                        if confirm_delete(hwnd, text) {
+                            ((*engine).sink)(Event::Delete { id: fence.id.clone() });
+                        }
+                    }
                     _ => {}
                 }
                 // 菜单开着时收不到 WM_MOUSEMOVE，关掉后按当前位置重算悬停。

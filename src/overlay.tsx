@@ -19,6 +19,14 @@ interface Payload {
 function Overlay() {
   const [bands, setBands] = useState<Rect[]>([]);
   const [zones, setZones] = useState<Rect[]>([]);
+  // 预览只挂 5 秒（后端定时收起）：这里数给用户看，免得一眨眼就没了。
+  const [left, setLeft] = useState(0);
+
+  useEffect(() => {
+    if (left <= 0) return;
+    const timer = window.setTimeout(() => setLeft((value) => value - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [left]);
 
   useEffect(() => {
     const apply = (payload: Payload) => {
@@ -32,6 +40,7 @@ function Overlay() {
       });
       setBands((payload.bands ?? []).map(scale));
       setZones((payload.zones ?? []).map(scale));
+      setLeft(5);
     };
 
     // The window is created before this page finishes loading, so the event that
@@ -52,6 +61,20 @@ function Overlay() {
           className="band"
           style={{ left: band.x, top: band.y, width: band.w, height: band.h }}
         />
+      ))}
+      {bands.map((band, index) => (
+        <div
+          key={`tip-${index}`}
+          className="band-tip"
+          style={{
+            left: band.x + band.w - 16,
+            top: band.y + Math.min(band.h, 40) / 2 - 11,
+            transform: "translateX(-100%)",
+          }}
+        >
+          <span>触发带预览</span>
+          <strong>{left > 0 ? `${left} 秒后收起` : "收起中…"}</strong>
+        </div>
       ))}
       {zones.map((zone, index) => (
         <div

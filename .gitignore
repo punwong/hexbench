@@ -14,3 +14,7 @@ latest.json
 
 # 原生格子原型（本地验证用，不进仓库）
 proto/
+
+# 本地开发工具状态，不进仓库
+.claude/
+.impeccable/

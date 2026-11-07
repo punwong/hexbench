@@ -1,8 +1,23 @@
-# 开发/测试用的固定环境
+# 开发与测试指南
 
-> 目的：自动化测试和手动验证都用同一套目录，**不要再动用户配置里的 `root` / `folders`**。
+本文说明快捷面板、桌面格子、收纳盒和便签的自动化测试与手动验证方法，包括固定测试目录、自动化入口、各项功能的验证步骤和判定方法。
+
+测试数据统一放在 `D:\hexbench-test\`，测试进程使用独立配置，不修改用户配置中的 `root` / `folders`。
 
 ## 目录
+
+- [测试目录](#测试目录)
+- [测试数据规则](#测试数据规则)
+- [自动化入口](#自动化入口)
+- [便签](#便签)
+- [删除 / 回收站后的键盘焦点](#删除--回收站后的键盘焦点)
+- [呼出 / 收起的压测](#呼出--收起的压测)
+- [右键菜单里的系统命令（压缩 / 复制 / 发送到）](#右键菜单里的系统命令压缩--复制--发送到)
+- [图标（lucide 一套）](#图标lucide-一套)
+- [调试版 exe 的前端来源](#调试版-exe-的前端来源)
+- [验证常用手法](#验证常用手法)
+
+## 测试目录
 
 ```
 D:\hexbench-test\                 ← 启动器根目录（每个子文件夹 = 一个分类）
@@ -22,23 +37,22 @@ D:\hexbench-test\                 ← 启动器根目录（每个子文件夹 = 
 | `launcher.root` | `D:\hexbench-test` |
 | `launcher.folders` | `D:\hexbench-test\文档`、`D:\hexbench-test\项目`、`%USERPROFILE%\Downloads` |
 
-## 测试规则（重要）
+## 测试数据规则
 
-1. **不要清空 `root` / `folders`**：用户会用它手动验证，清掉就得重新添加。
-2. 需要临时换根目录时：先备份 `config.json`，测完立刻还原。
-3. 需要「空目录」场景：在 `D:\hexbench-test\` 下临时建一个空子文件夹当分类，测完删掉即可，**不要改 root**。
-4. 造数据（新建/复制/删除的验证）一律在 `D:\hexbench-test\` 里做，别碰用户的真实文件。
+1. **不要清空 `root` / `folders`**：用户需要用它们手动验证，清空后需要重新添加。
+2. 需要临时更换根目录时：先备份 `config.json`，测试完成后立即还原。
+3. 需要「空目录」场景时：在 `D:\hexbench-test\` 下临时新建一个空的子文件夹作为分类，测试后删除，**不要修改 root**。
+4. 新建、复制、删除等造数据操作一律在 `D:\hexbench-test\` 内进行，不要改动用户的真实文件。
 
-## 自动化通道
+## 自动化入口
 
-debug 构建下有个自测入口：放一个文件
+debug 构建提供自测入口：写入文件
 
 ```
 %TEMP%\hexbench-selftest.txt
 ```
 
-启动应用后会自动跑一组操作，把结果写到 `%TEMP%\hexbench-selftest-out.txt`。
-它比截图可靠——直接读真实的窗口尺寸和可见性。
+启动应用后会自动执行一组操作，并将结果写入 `%TEMP%\hexbench-selftest-out.txt`。该方式直接读取真实的窗口尺寸和可见性，比截图判定更可靠。
 
 输出里以 `files:` 开头的行是文件区的命令级自检：列目录、新建文件夹、改名、
 移动、撤销、复制 / 剪切粘贴、图标（含缓存文件是否落地）、隐藏文件过滤、
@@ -51,10 +65,9 @@ debug 构建下有个自测入口：放一个文件
 图标走自定义协议：`http://hbicon.localhost/<16 位缓存键>`，内容来自
 `%LOCALAPPDATA%\io.github.hexbench\thumbs\<键>.png`。
 
-### 面板界面自动化（假点击打不进去时用这个）
+### 面板界面自动化
 
-面板是 always_on_top 的小窗口，别的程序浮在上面时系统的模拟点击（`mouse_event`）
-会打到上层窗口，测不到面板。改用应用内的脚本通道：
+面板是 always_on_top 的小窗口，其他程序浮在其上时，系统模拟点击（`mouse_event`）会落在上层窗口，无法测到面板。此时使用应用内的脚本通道：
 
 ```
 把脚本写到 %TEMP%\hexbench-ui.js  →  应用在面板里 eval 执行
@@ -62,36 +75,27 @@ debug 构建下有个自测入口：放一个文件
                                     →  追加到 %TEMP%\hexbench-ui-out.txt
 ```
 
-只在 debug 构建里有：`spawn_ui_eval` 每 250ms 看一眼脚本文件，执行完就删。
-脚本里可以直接派发 `PointerEvent` / `MouseEvent` / `input` 事件，测的就是前台
-真实的 React 处理器；读 DOM 拿渲染了多少项、选中了什么、撑开多高。
+该通道只在 debug 构建中可用：`spawn_ui_eval` 每 250ms 检查一次脚本文件，执行后删除。脚本可以直接派发 `PointerEvent` / `MouseEvent` / `input` 事件，触发的是前台真实的 React 处理器；通过读取 DOM 可以确认渲染项数、选中状态和撑开高度。
 
-注意两点：
+注意事项：
 
-1. 选中/拖动是 `pointerdown` 起手的，派发完要补一个 `pointerup`，否则 window 上
-   的拖拽监听会留着，下一次 `pointermove` 会真的发起一次 OLE 拖拽。
-2. 框选会调 `setPointerCapture`，脚本里可以先把它换成空函数（pointerId 是造的）。
-3. 面板窗口是第一次呼出时才建的：应用刚启动、还没按过 Alt+1 就写脚本，日志里只有
-   `ui-eval: launcher missing`，脚本已经被吃掉——先按一次 Alt+1 再写。
-4. 脚本里写 Windows 路径别经过 shell（`echo` / heredoc 会吃掉一层 `\\`，`\h` 就对不上了）。
-   用编辑器写文件，或者拿 `el.dataset.path.endsWith(...)` 比，不拼完整路径。
+1. 选中和拖动以 `pointerdown` 开始，派发后需要补一个 `pointerup`；否则 window 上的拖拽监听会保留，下一次 `pointermove` 会真正发起一次 OLE 拖拽。
+2. 框选会调用 `setPointerCapture`，脚本中可以先将它替换为空函数（pointerId 由脚本构造）。
+3. 面板窗口在第一次呼出时才创建。应用刚启动、尚未按过 Alt+1 时写入脚本，日志中只有 `ui-eval: launcher missing`，脚本会被删除。应先按一次 Alt+1 再写入。
+4. 脚本中写入 Windows 路径时不要经过 shell（`echo` / heredoc 会丢失一层 `\\`，`\h` 将无法匹配）。应使用编辑器写入文件，或通过 `el.dataset.path.endsWith(...)` 比较，不拼接完整路径。
 
 ### 桌面格子的界面自检
 
-格子是原生窗口（`crates/hexbench-fence`），没有页面可注入脚本：内容、视图、锁定位置
-都只能从外面看——截图 + `debug_native_state`（窗口清单、z-order）+ `debug_native_drop_target`
-（落点）。建 / 删格子仍然走命令，等同于右键菜单点「新建格子…」之后的那一步（菜单只
-负责把路径交给 `fence_create`）：
+格子是原生窗口（`crates/hexbench-fence`），没有可注入脚本的页面，内容、视图和锁定位置只能从外部观察：截图、`debug_native_state`（窗口清单、z-order）和 `debug_native_drop_target`（落点）。新建和删除格子仍然通过命令完成，等同于右键菜单点击「新建格子…」之后的步骤（菜单只负责把路径交给 `fence_create`）：
 
 ```js
 await window.__TAURI_INTERNALS__.invoke("fence_create", { path: "D:\\hexbench-test\\文档" });
 await window.__TAURI_INTERNALS__.invoke("fence_delete", { id: "<上一步返回的 id>" });
 ```
 
-只看到 `fence …: created` 的日志不能证明格子显示正常：先 `Shell.Application.MinimizeAll()`
-露出桌面再截图，标题条和条目画出来了才算过。最大化 / 被别的窗口盖住时截到的是别的窗口。
+日志中出现 `fence …: created` 不能证明格子显示正常。应先调用 `Shell.Application.MinimizeAll()` 露出桌面再截图，标题条和条目绘制出来才算通过。格子最大化或被其他窗口覆盖时，截图得到的是其他窗口。
 
-外观（不透明度 / 磨砂）只能「改完看像素」：
+外观（不透明度、磨砂）只能通过像素采样验证：
 
 ```js
 await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, frosted: false });
@@ -124,10 +128,10 @@ await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, f
 - 划动过程中截图应看到轨迹线和光标旁的「← 后退 / → 前进」；历史到头时提示画淡一档，
   松手不动作，而且这一次右键**不弹菜单**。
 - 轨迹线的画法和面板的 canvas 版对齐：整条轨迹建成**一条**路径（`gesture_path`），
-  经过相邻采样点的中点画二次曲线，辉光 9px / 主线 3px 各描一次边。别退回逐段
-  `DrawLine`——每段单独画会在每个采样点把半透明再叠一层，拐角处出现深浅不一的斑点和
-  折角，就是「比面板粗糙」的来源。验收时把划出来的线截图放大 4–6 倍看：线上不应有
-  网格状接缝，辉光边缘也要连续。
+  经过相邻采样点的中点画二次曲线，辉光 9px / 主线 3px 各描一次边。不要改回逐段
+  `DrawLine`：每段单独绘制会在每个采样点重复叠加半透明，拐角处出现深浅不一的斑点和
+  折角，导致轨迹比面板粗糙。验收时将划出的线截图放大 4–6 倍：线上不应有网格状接缝，
+  辉光边缘应保持连续。
 - 没划够 8px 的普通右键必须照常弹菜单（回归点：手势判定之后才抢捕获）。
 - 划回上一层后标题条的面包屑应退一段；反方向划回来应恢复。
 - 只在正文起手（`y >= HEADER_H`），标题条上右键不认手势。
@@ -174,12 +178,12 @@ await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, f
   大小留空。列名条固定在 `HEADER_H .. HEADER_H + LIST_HEAD_H`，条目在它下面滚动
   （`paint` 里给正文区单独 `PushAxisAlignedClip`，否则滚上来的行会盖住列名）。点列名发
   `Event::Sort`，同键反转，箭头画在列名后面。行与行之间那 2px `LIST_GAP` 也算命中
-  （算上面那一行），别留成点一下就清空选中的死区。
+  （算上面那一行），不应留成点击后清空选中的死区。
 - 托盘「显示全部格子」：把所有 `visible = false` 的格子置回可见、存盘、
   `apply_fence_windows`。没有隐藏的格子时什么也不做（不写盘）。验证：用测试格子
   （`D:\hexbench-test` 里随便建一个）的「⋯ → 隐藏格子」，`EnumWindows` 里应少一个
   `HexBenchNativeFence`、配置里 `visible: false`；再点托盘这一项，窗口回来、`visible: true`。
-  托盘图标在 UIA 里叫 `SystemTray.NormalButton`、名字 `HexBench · 海克斯`（坐标取
+  托盘图标在 UIA 里叫 `SystemTray.NormalButton`、名字 `HexBench`（坐标取
   `BoundingRectangle` 中心）。
 - 菜单最后一项是「锁定位置 / 解锁位置」（`Frame.locked`）。锁定后标题条拖不动、
   边角光标也不出现，但双击卷起、面包屑、视图按钮、菜单照常。
@@ -203,16 +207,16 @@ await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, f
   桌面落回底层，格子自然又露出来，不需要单独记「结束」时刻。
   验证时把配置里 `keepOnShowDesktop` 改成 `false` 重启：按 Win+D 应只剩桌面图标，
   再按一次（或点任务栏 / 点程序）格子回来；改成 `true` 时 Win+D 之后格子仍可见。
-  判断状态别截图数像素：`EnumWindows` 按 z-order 从上往下枚举，格子的索引比 `Progman`
-  小就是在它上面。日志里 `fence: 桌面盖住格子…` / `桌面不再盖住格子…` 各一行。
+  判断状态时不要通过截图数像素：`EnumWindows` 按 z-order 从上往下枚举，格子的索引小于
+  `Progman` 即表示位于其上方。日志中 `fence: 桌面盖住格子…` / `桌面不再盖住格子…` 各出现一行。
 - 重命名：标题菜单「重命名格子」和条目右键「重命名」弹的是同一个原生弹层（窗口类
   `HexBenchNativeFenceRename` + 系统 `EDIT`，输入法 / 选区 / 剪贴板都交给控件），
   回车提交、Esc 取消、点到别处也取消。标题默认全选；文件预填名字并只选中主干部分
   （扩展名留在外面，和资源管理器一致），文件夹则是全选。提交走 `Event::Rename` /
   `Event::RenameItem`，后者经 `launcher_rename` 改名并重读目录；一个字没改不发事件。
-  验证时用 `keybd_event` 发 `VK_RETURN`（`0x0D`）/ `VK_ESCAPE`（`0x1B`）；WScript
-  `SendKeys("{ENTER}")` 在同一个脚本里常常送不到，别拿它当判据。改名只在自己的测试
-  目录里做——条目菜单里「重命名」上下的「删除」离得很近，点偏了会真的把文件删掉。
+  验证时用 `keybd_event` 发送 `VK_RETURN`（`0x0D`）/ `VK_ESCAPE`（`0x1B`）；WScript 的
+  `SendKeys("{ENTER}")` 在同一个脚本中经常无法送达，不能作为判定依据。改名只在测试
+  目录中进行：条目菜单中「重命名」与「删除」相邻，点击偏移会实际删除文件。
 - 表头背景：`paint` 里表头的圆角矩形要画到 `HEADER_H + RADIUS`，才能把下面两个圆角
   压成直边；但必须 `PushAxisAlignedClip` 裁到表头高度。不裁的话展开后会有一条 8px
   的表头色带露在分割线下面，看着就像「顶部下方多了一点 UI」。验收时截格子顶部，沿一条
@@ -221,9 +225,9 @@ await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, f
   （`DropSnapshot::destination`）算一次落点，只读不搬，`x` / `y` 是客户区物理像素。
   铺 40 多个文件让格子能滚，先量一个压着文件夹的点，再往格子里 `PostMessage`
   一条 `WM_MOUSEWHEEL`（`0x020A`，wParam 高 16 位是滚动量）滚到底，同一个点应改成
-  返回当前目录（或滚上来之后压着的那个文件夹）。曾经快照只在排版时重建、滚轮只改
-  `scroll`，于是高亮的是新位置、松手却按上一屏的位置落点。别用真滚轮测：格子是
-  桌面层窗口，前台一盖住它，滚轮就打到别人窗口上去了。
+  返回当前目录（或滚上来之后压着的那个文件夹）。如果快照只在排版时重建、滚轮只修改
+  `scroll`，高亮位置会更新，松手却按上一屏的位置落点。不要用真实滚轮测试：格子是
+  桌面层窗口，前台一旦盖住它，滚轮事件会发送到其他窗口。
 
 ### 格子的面包屑
 
@@ -236,15 +240,14 @@ await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, f
 `.crumb.drop-hover`；再发 `drop`，`launcher_move_into` 会把文件移到那一段的目录里
 （实测从 `界面测试\子目录` 拖到根，文件落在 `界面测试` 下）。
 
-脚本里写 Windows 路径用正斜杠（`D:/hexbench-test/...`）。heredoc 写进
-`%TEMP%\hexbench-ui-*.js` 的 `\\` 会被吃掉一层，反斜杠到了 JS 里就变成转义，
-`'D:\\hexbench-test'` 最后成了 `D:hexbench-test`，`fence_create` 报「文件夹不存在」。
+脚本中写入 Windows 路径时使用正斜杠（`D:/hexbench-test/...`）。通过 heredoc 写入
+`%TEMP%\hexbench-ui-*.js` 时，`\\` 会丢失一层，反斜杠在 JS 中变为转义符，
+`'D:\\hexbench-test'` 最终成为 `D:hexbench-test`，`fence_create` 报「文件夹不存在」。
 
 ### 吸附参考线（跨屏虚线）
 
-虚线不属于任何格子：它由一块独立窗口 `snap-guides` 画——盖住整个虚拟屏幕、透明、置顶、
-点击穿透、不进任务栏。启动时预建好藏起来（`prebuild_guides`），拖动中显示、松手藏回去。
-所以格子页面里既没有这根线，也没有它的事件；只能从外面验：
+虚线不属于任何格子，由独立窗口 `snap-guides` 绘制：覆盖整个虚拟屏幕、透明、置顶、点击穿透、不进入任务栏。启动时预先创建并隐藏（`prebuild_guides`），拖动时显示，松手后隐藏。
+格子页面中既没有这条线，也没有对应事件，只能从外部验证：
 
 1. 用 `mouse_event` + `SetCursorPos` 按住某个格子的标题条拖，停在离对齐位 8px 以内
    （吸附阈值，DIP×DPI）。中途照片要在**还按着**的时候拍。
@@ -252,27 +255,22 @@ await window.__TAURI_INTERNALS__.invoke("fence_set_appearance", { opacity: 40, f
    （或那一行）就是竖线（横线）的位置，应该正好是被对齐的那条边。
 3. 松手后再拍一张，同样的列 / 行必须归零；`HGUIDE` 画布窗口同时要被藏回去。
 
-三个已经踩过的坑：
+以下为三条注意事项：
 
-- **运行中新建的窗口没有 webview**（只有外壳），页面根本不会加载——所以画布必须启动时预建，
-  放在拖动里懒建的话永远等不到第一笔。
-- 新窗口 label 要写进 `src-tauri/capabilities/default.json` 的 `windows`，否则页面里的
-  `listen` 会被权限拒绝（Promise 静默失败），症状是画布窗口在、页面也在，但一条线都不出现。
-  加完要重新 `cargo build`，capability 是编译进二进制的。
-- 画布是隐藏窗口，外层窗口标题**不会**跟着 `document.title` 变。要确认页面是不是起来了，
-  枚举它的子窗口，看 `Chrome_WidgetWin_1` 那个子窗口的标题（页面里设的是 `HGUIDE v/h/-`）。
+- **运行中新建的窗口没有 webview**（只有外壳），页面不会加载。因此画布必须在启动时预先创建；在拖动过程中延迟创建将无法收到任何绘制指令。
+- 新窗口的 label 必须写入 `src-tauri/capabilities/default.json` 的 `windows`，否则页面中的 `listen` 会被权限拒绝（Promise 静默失败），表现为画布窗口和页面都存在，但没有任何线条出现。修改后需要重新 `cargo build`，capability 会编译进二进制。
+- 画布是隐藏窗口，外层窗口标题**不会**随 `document.title` 变化。确认页面是否加载时，应枚举其子窗口，查看 `Chrome_WidgetWin_1` 子窗口的标题（页面中设置为 `HGUIDE v/h/-`）。
 
-调试通道：`%TEMP%\hexbench-ui-guides.js` 会 eval 进画布窗口（日志里是 `ui-eval: guides …`）。
+调试通道：`%TEMP%\hexbench-ui-guides.js` 会被执行到画布窗口（日志中为 `ui-eval: guides …`）。
 
-另外：测试用的格子**别和用户现有的格子重叠**。重叠区域里鼠标落到 z-order 更上面的那个窗口，
-看起来就是"拖不动"——先挪开或者换个空位再测。
+另外：测试用的格子**不要与用户已有的格子重叠**。重叠区域内的鼠标事件会落到 z-order 更高的窗口，表现为无法拖动；应先移开或换一个空位再测试。
 
 ### 收纳盒与整理规则
 
 收纳盒（`kind: "bucket"`）没有用户选的文件夹：`fence_create_box` 在「文档\HexBench 收纳」
 下按 `<标题>-<id 后 10 位>` 建目录，`path` 存的就是这个目录，所以列目录 / 拖入 / 拖出
 全都走原来那条路径，不用另测一遍。测规则时把来源指向 `D:\hexbench-test\` 里的目录，
-**别指向真实的下载目录**——条件写错会把整个目录扫进来。
+**不要指向真实的下载目录**：条件写错会把整个目录纳入扫描。
 
 ```js
 // 建盒 → 塞规则 → 预览 → 跑
@@ -315,28 +313,21 @@ cargo test -p hexbench-core --test file_ops -- --test-threads=1 --nocapture
 
 ### 拖放：从桌面拖文件进收纳盒
 
-拖放目标由 OLE 按窗口登记，而 **OLE 只把回调交给「调用 `RegisterDragDrop` 的那条线程」，
-并且那条线程必须自己泵消息**（msdn 原话：不满足时，任何拖着东西经过这个窗口的程序都会
-一直卡住，直到目标程序退出）。原生格子的窗口和拖放目标都挂在渲染层自己的消息循环线程上
-（`crates/hexbench-fence`），那条线程本来就泵消息；呼出面板的窗口属于主线程，登记仍然走
-`run_on_main_thread`。曾经在「建窗的 worker 线程」上登记，用户看到的就是从桌面拖个文件
-进收纳盒、整个拖拽直接冻住。
+拖放目标由 OLE 按窗口登记。**OLE 只将回调交给调用 `RegisterDragDrop` 的线程，并且该线程必须自行处理消息循环**；否则任何拖拽经过该窗口的程序都会一直卡住，直到目标程序退出（见 MSDN 的 `RegisterDragDrop` 说明）。原生格子的窗口和拖放目标都位于渲染层自己的消息循环线程（`crates/hexbench-fence`），该线程本身处理消息；呼出面板的窗口属于主线程，登记通过 `run_on_main_thread` 完成。若在创建窗口的 worker 线程上登记，从桌面拖动文件进入收纳盒时整个拖拽会冻结。
 
-格子没有页面可注入脚本，自动化只能看窗口和落点：
+格子没有可注入脚本的页面，自动化只能观察窗口和落点：
 
 | 命令 | 用途 |
 | --- | --- |
 | `debug_native_state` | 列出原生格子的窗口：`hwnd` / `visible` / `topmost` / `behind_desktop` / `rect`。 |
-| `debug_native_drop_target` | 按 OLE 回调同一份口径算一次落点（只算不搬）：传格子 id 和客户区物理坐标，返回此刻压在那个点下的目录。滚动后落错目录的回归靠它。 |
-| `debug_drop_targets` | 面板侧拖放目标的登记线程：`label` / `hwnd` / `registered_tid` / `owner_tid` / `main`。**`main=true` 才是对的**。 |
+| `debug_native_drop_target` | 按 OLE 回调相同的规则计算落点（只计算，不移动）：传入格子 id 和客户区物理坐标，返回该点下方的目录。用于回归验证滚动后落点错误的问题。 |
+| `debug_drop_targets` | 面板侧拖放目标的登记线程：`label` / `hwnd` / `registered_tid` / `owner_tid` / `main`。**`main=true` 表示登记正确**。 |
 
-真实的 OLE 拖拽没法在脚本里「发起」，`mouse_event` + `SetCursorPos` 可以：资源管理器
-自己进 `DoDragDrop`，格子那边收到的是真 OLE 回调（日志 `drag: enter` → `drop`）。
-这条路要人工定坐标，所以没进回归脚本；写脚本时要先 Win+D 把桌面露出来（被窗口盖住就
-拖的是那个窗口），落点取格子的 `pixelX/pixelY` 中心。
+真实的 OLE 拖拽无法在脚本中发起，但可以用 `mouse_event` + `SetCursorPos` 模拟：资源管理器自行进入 `DoDragDrop`，格子收到的是真实 OLE 回调（日志 `drag: enter` → `drop`）。
+该方式需要人工确定坐标，因此未纳入回归脚本。编写脚本时应先按 Win+D 露出桌面（被窗口覆盖时会拖动该窗口），落点取格子的 `pixelX/pixelY` 中心。
 
-**改完拖放代码要人工拖一次**：桌面 → 收纳盒空白处、桌面 → 盒子里的子文件夹、
-盒子 → 资源管理器、两个盒子互拖；松手前光标要一直跟手，资源管理器不能卡。
+**修改拖放代码后必须人工拖拽一次**：桌面 → 收纳盒空白处、桌面 → 盒子内的子文件夹、
+盒子 → 资源管理器、两个盒子互拖；松手前光标应始终跟随，资源管理器不能卡顿。
 
 ### 拖放：浏览器网页里的图片（虚拟文件）
 
@@ -365,30 +356,20 @@ cargo test -p hexbench-core drop_target
 拖到面板空白处，文件应出现在面板当前目录。写探针时注意：`STGMEDIUM.hGlobal` 是**句柄**，
 要先 `GlobalLock` 再读，直接当指针读会得到垃圾名字。
 
-## 收藏（笔记）
+## 便签
 
-**测试时先把收藏目录改到测试盘**：默认目录是用户真实的「文档\HexBench 收藏」，验证时在
-测试配置里把 `notes.folder` 设成 `D:\hexbench-test\notes`（或在设置页选这个目录），
-别往真实文档目录里写测试笔记。
+**测试前先将便签目录改到测试盘**：默认目录是用户真实的「文档\HexBench 收藏」。验证时在测试配置里把 `notes.folder` 设为 `D:\hexbench-test\notes`（或在设置页选择该目录），不要在真实文档目录中写入测试笔记。
 
-- 新建 / 编辑 / 改名 / 删除 / 清空各走一遍。改名会把文件跟着改成新标题（重名自动加 (2)），
-  列表里的 id 随之变化，选中和后续编辑都不能落到旧文件上。
-- 点卡片空白处（标题、预览，不是按钮）就进编辑；点「发送 / 复制图片 / 删除」不应顺带
-  打开编辑器。双击卡片时第二下落在刚弹出的遮罩上，编辑器不能闪退。
-- 磁盘上应是一篇笔记一个 `.md`、正文就是 Markdown（没有 frontmatter），图片在
-  `images/` 下，正文引用写成 `![名字](<images/文件名>)`；同内容的图片只存一份。
-- 拖图：资源管理器拖到空白 → 新建；拖到卡片 → 追加；Edge 网页图片（虚拟文件）同样；
-  混入非图片时只提示忽略几个、不报错。**源文件必须还在**（只复制，绝不移动）；
-  浏览器落在 `%TEMP%\hexbench-drop\` 的临时文件也要能拷进来。
-- 发送：先点记事本 / 浏览器输入框，再按 Alt+1 呼出 → 收藏 → 发送。面板应收起、焦点回到
-  原窗口、文字逐字输入；正文里的 `![...](...)` 不应被输入。多行、中文、emoji 都要试。
-  **多行要在记事本里数行数**：换行必须真的按回车（`type_text` 把 `\n` 当键发），
-  不能作为 `U+000A` 字符塞进去——那样控件会把它丢掉，整段挤成一行。
-  管理员权限的窗口会失败：面板应自己回来并提示，而不是静默丢字。
-- 改收藏目录 / 开关后不用重启：设置页的「保存位置」立刻显示新目录，面板侧边栏的
-  收藏条数跟着变。保存有 300 ms 防抖，界面别拿后端回读的路径去覆盖刚选的值。
-- 「复制图片」后在资源管理器 Ctrl+V，应得到该笔记的全部图片文件。
-- 删除 / 清空走回收站（`trash_quiet`），回收站里能找到。
+- 新建、编辑、改名、删除、清空各验证一遍。改名会同步修改文件名（重名时自动追加 `(2)`），列表中的 id 随之变化，选中状态和后续编辑不能落到旧文件上。
+- 点击卡片空白处（标题、预览，不含按钮）进入编辑；点击「发送 / 复制图片 / 删除」不应同时打开编辑器。双击卡片时，第二次点击落在刚弹出的遮罩上，编辑器不能闪退。
+- 磁盘上一篇笔记对应一个 `.md` 文件，正文为 Markdown（没有 frontmatter），图片位于 `images/` 下，正文引用写作 `![名字](<images/文件名>)`；内容相同的图片只保存一份。
+- 拖图：从资源管理器拖到空白处新建，拖到卡片上追加，Edge 网页图片（虚拟文件）同样处理；混入非图片时只提示忽略数量，不报错。**源文件必须保留**（只复制，不移动）；浏览器落在 `%TEMP%\hexbench-drop\` 的临时文件也应能复制进来。
+- 发送：先点击记事本或浏览器输入框，再按 Alt+1 呼出面板 → 便签 → 发送。面板应收起，焦点回到原窗口，文字逐字输入；正文中的 `![...](...)` 不应被输入。多行、中文、emoji 都要验证。
+  **多行内容要在记事本中核对行数**：换行必须实际发送回车（`type_text` 将 `\n` 作为按键发送），不能作为 `U+000A` 字符写入，否则控件会丢弃该字符，整段内容挤成一行。
+  管理员权限的窗口会失败：面板应自行恢复并提示，不能静默丢字。
+- 修改便签目录或开关后无需重启：设置页的「保存位置」立即显示新目录，面板侧边栏的便签条数同步变化。保存带有 300 ms 防抖，界面不要用后端回读的路径覆盖刚选的值。
+- 「复制图片」后在资源管理器中按 Ctrl+V，应得到该笔记的全部图片文件。
+- 删除和清空通过回收站完成（`trash_quiet`），回收站中可以找到。
 - 回归：`dist/` 里不应再有 `phrases.html`；托盘没有「常用语」；`Ctrl+Alt+Shift+Q` 无反应；
   旧配置里的 `phrases` 段读入后不报错、下次保存自动消失。
 
@@ -431,49 +412,48 @@ cargo test -p hexbench-core drop_target
 
 ## 呼出 / 收起的压测
 
-卡死过的两次都在这里，改完 `reveal_launcher` / `hide_launcher` 都要跑一遍：
+此前的卡死问题都出现在这里。修改 `reveal_launcher` / `hide_launcher` 后都需要执行一遍：
 
 ```
 连按 Alt+1 40～60 次，间隔 40～80ms
 ```
 
-- 用 `keybd_event` 发，不用模拟鼠标点击（面板是 always_on_top，点击容易打到别的窗口）。
-- 判定：每次按键后 `IsWindowVisible` 应严格 1/0 交替；日志里不应出现
-  `ui: main thread busy`（看门狗 ≥400ms 就会记一行，后面括号里是当时卡住的操作）。
-- 最后再按一次应能正常呼出，并且 `GetForegroundWindow` 就是面板窗口（说明能打字）。
+- 使用 `keybd_event` 发送，不要使用模拟鼠标点击（面板是 always_on_top，点击容易落到其他窗口）。
+- 判定：每次按键后 `IsWindowVisible` 应严格在 1 / 0 之间交替；日志中不应出现
+  `ui: main thread busy`（看门狗在 ≥400ms 时记录一行，括号内为当时阻塞的操作）。
+- 最后再按一次应能正常呼出，并且 `GetForegroundWindow` 为面板窗口（表示可以输入）。
 
-**别踩的坑**：窗口操作（`show` / `hide` / `set_focus` / `SetForegroundWindow`）
-只能在窗口自己所属的线程上做。从别的线程调 `SetFocus` 是跨线程同步发
-`WM_KILLFOCUS` / `WM_SETFOCUS`，主线程正好在处理键盘消息（tao 在里面持有
-`KEY_EVENT_BUILDERS`）时互等，就是之前那种「连按几次后整块面板僵死、快捷键失效」。
-需要延迟执行就 `sleep` 在工作线程、`run_on_main_thread` 回主线程。
+**注意事项**：窗口操作（`show` / `hide` / `set_focus` / `SetForegroundWindow`）
+只能在窗口所属的线程上执行。从其他线程调用 `SetFocus` 会跨线程同步发送
+`WM_KILLFOCUS` / `WM_SETFOCUS`；主线程正在处理键盘消息（tao 在其中持有
+`KEY_EVENT_BUILDERS`）时双方互等，会导致面板僵死、快捷键失效。
+需要延迟执行时，在工作线程中 `sleep`，再通过 `run_on_main_thread` 回到主线程。
 
 ## 右键菜单里的系统命令（压缩 / 复制 / 发送到）
 
-面板菜单里选完系统命令后，`InvokeCommand` 只是把活儿交给 Shell，命令自己还会弹
-进度窗口抢前台。这段时间面板必须留着：
+面板菜单选择系统命令后，`InvokeCommand` 只是将任务交给 Shell，命令自身还会弹出进度窗口并抢占前台。此期间面板必须保留：
 
-- `show_shell_context_menu` 在 `InvokeCommand` **之前**就置上 `SHELL_OP_UNTIL`
-  （`_ms` 时间戳），`watch_shell_op` 盯着目标目录的条目数 / 最新修改时间 / 总大小，
-  还在变就续期；10 次轮询（2.5 秒）没动静就算干完了。
-- 期间收到的失焦不收起面板，改由 `hide_after_shell_op` 在命令结束后补一次收起
-  （前提是那时前台确实不在面板上）。
+- `show_shell_context_menu` 在 `InvokeCommand` **之前**设置 `SHELL_OP_UNTIL`
+  （`_ms` 时间戳），`watch_shell_op` 监视目标目录的条目数、最新修改时间和总大小，
+  仍在变化则续期；连续 10 次轮询（2.5 秒）无变化即视为完成。
+- 此期间收到的失焦不收起面板，改由 `hide_after_shell_op` 在命令结束后补一次收起
+  （前提是当时前台确实不在面板上）。
 
-复现/验证：在 `D:\hexbench-test\` 里临时放几百 MB 的目录，右键 →「添加到 xxx.zip」，
-日志里应看到 `invoked shell command` 之后**没有**紧跟着 `hide`，压缩结束后才收。
-自动化可以用 `%TEMP%\menutest.ps1`（弹菜单、按 Down×N + Enter 选中）。
+验证：在 `D:\hexbench-test\` 中临时放置数百 MB 的目录，右键 →「添加到 xxx.zip」，
+日志中 `invoked shell command` 之后**不应**紧跟 `hide`，压缩结束后才收起。
+自动化可以使用 `%TEMP%\menutest.ps1`（弹出菜单、按 Down×N + Enter 选中）。
 
 ## 图标（lucide 一套）
 
 界面图标（不含文件类型图标）只有一个来源：**lucide**。
 
 - 网页部分直接用 `lucide-react`：设置窗口、呼出面板都是。
-- 桌面格子是 Direct2D 画的，用不了 SVG：`node scripts/gen-icons.mjs` 会读
-  `node_modules/lucide-react` 里的图标定义，把 path / circle / rect 图元采样成折线，
-  写进 `crates/hexbench-fence/src/icons.rs`（**生成文件，别手改**）。换图标或升级
-  lucide 之后重跑一次；CI 会重跑并比对，文件过期会直接失败。
-- 原生层按 `size / 24` 缩放、描边宽度随之变成 `2 / 24 * size`，和网页里
-  `<Icon size={n} />` 的比例一致；圆头、圆角连接（`gpu.stroke`）。
+- 桌面格子由 Direct2D 绘制，无法直接使用 SVG：`node scripts/gen-icons.mjs` 读取
+  `node_modules/lucide-react` 中的图标定义，将 path / circle / rect 图元采样为折线，
+  写入 `crates/hexbench-fence/src/icons.rs`（**生成文件，不要手动修改**）。更换图标或升级
+  lucide 后需重新运行；CI 会重新生成并比对，文件过期将直接失败。
+- 原生层按 `size / 24` 缩放，描边宽度相应为 `2 / 24 * size`，与网页中
+  `<Icon size={n} />` 的比例一致；使用圆头端点、圆角连接（`gpu.stroke`）。
 - 尺寸只有三档：工具条 / 标题条按钮 **16**（`size={16}`、`*_ICON = 16.0`），
   前进 / 后退箭头和卡片头图标 **18**，文字按钮旁的小图标 **14**。三处要一起改。
 - 新增图标：在 `scripts/gen-icons.mjs` 的 `ICONS` 里加一行（Rust 常量名 → lucide
@@ -482,16 +462,15 @@ cargo test -p hexbench-core drop_target
 
 ## 调试版 exe 的前端来源
 
-`cargo build` 出来的 debug exe **不内嵌前端**：主界面、面板这些 WebView 窗口都从
-`http://127.0.0.1:1420`（`devUrl`）加载，也就是必须先 `npm run dev`。忘了起 Vite
-时每个窗口都是 WebView2 的「无法访问此页面」，界面上没有任何更明确的提示。
-桌面格子不是 WebView（见 `crates/hexbench-fence`），不受这条影响。
+`cargo build` 生成的 debug exe **不内嵌前端**：主界面、面板等 WebView 窗口都从
+`http://127.0.0.1:1420`（`devUrl`）加载，因此必须先运行 `pnpm tauri dev`（或 `pnpm dev` 启动 Vite）。未启动 Vite 时，每个窗口都会显示 WebView2 的「无法访问此页面」，界面中没有其他提示。
+桌面格子不是 WebView（见 `crates/hexbench-fence`），不受此限制。
 
-手动验证、或者交给别人试的时候用内嵌版：
+手动验证或交给其他人试用时，使用内嵌前端的版本：
 
 ```
-npm run build
-npx tauri build --debug --no-bundle --config '{"build":{"beforeBuildCommand":""}}'
+pnpm build
+pnpm tauri build --debug --no-bundle --config '{"build":{"beforeBuildCommand":""}}'
 ```
 
 产物还是 `target/debug/hexbench-app.exe`（桌面右键菜单不用重装），窗口 URL 变成
