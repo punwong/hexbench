@@ -465,16 +465,11 @@ export default function App() {
           <div className={`update-pill ${updatePhase}`}>
             {updatePhase === "ready" ? (
               <>
-                <span
-                  className="update-version"
-                  title={`新版本 ${updateVersion} 已下载，更新会重启应用`}
-                >
-                  新版本 {updateVersion}
-                </span>
+                {/* 侧栏底部很窄：只留按钮，版本号放 title 里（下面也写着当前版本）。 */}
                 <button
                   type="button"
                   className="btn primary update-install"
-                  title="安装新版本并重启"
+                  title={`安装新版本 ${updateVersion} 并重启`}
                   onClick={() => void runInstall()}
                 >
                   <ArrowUpCircle size={13} strokeWidth={2.2} />

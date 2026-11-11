@@ -1317,31 +1317,22 @@ kbd {
 }
 
 /* 下载是静默的：只有包已经在本地时，这一块才出现。
-   一行放下「版本号 + 更新」：装更新是顺手的事，不该占掉侧栏一整块。 */
+   侧栏底部很窄，再摆版本号只会被截成「新版本 0.1…」，所以只留一个「更新」按钮。 */
 .update-pill.ready {
   display: flex;
   align-items: center;
   gap: 6px;
-  background: var(--surface-2);
-  padding: 6px 4px 6px 10px;
-}
-
-.update-version {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-size: 12px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  background: transparent;
+  padding: 0;
 }
 
 .update-install {
-  flex: none;
-  padding: 4px 9px;
+  flex: 1 1 auto;
+  justify-content: center;
+  padding: 7px 10px;
   gap: 4px;
   font-size: 12px;
-  border-radius: 7px;
+  border-radius: 8px;
 }
 
 .update-pill.ready .update-dismiss {

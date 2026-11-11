@@ -1249,14 +1249,77 @@ fn scale_at_cursor(app: &AppHandle) -> f64 {
 /// 免得恰好在回收那一刻打开的窗口被销毁掉。
 static MAIN_SHOW_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// 「显示 / 创建主窗口」和「关窗后延迟回收」共用的锁。
+///
+/// 关窗 5 秒后有个线程会销毁拿着「藏起来」状态的窗口。用户恰好在回收那一刻
+/// 点「打开主界面」时，两条线程会撞在一起：`show()` 刚排进事件循环，回收线程
+/// 紧接着把窗口销毁，界面上什么都不会出现，只能退出重开。这把锁把两件事排开。
+static MAIN_LIFECYCLE: Mutex<()> = Mutex::new(());
+
+fn lock_main_lifecycle() -> std::sync::MutexGuard<'static, ()> {
+    MAIN_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 把主窗口叫到眼前，并把这次尝试的前因后果记进日志。
+///
+/// 只调 `show()` 不够：窗口如果停在**别的虚拟桌面**上，`show()` 只会让它在那块
+/// 桌面上可见，用户眼前的桌面什么都不会发生——同样是「点了没反应」。
+fn show_main_window(reason: &str, window: &tauri::WebviewWindow) {
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(false);
+    let hwnd = window
+        .hwnd()
+        .ok()
+        .map(|handle| handle.0 as isize)
+        .unwrap_or(0);
+    let on_current = hexbench_core::sys::window_on_current_desktop(hwnd);
+    log::info!(
+        "main: open requested ({reason}) visible={visible} minimized={minimized} on_current_desktop={on_current:?}"
+    );
+    if on_current == Some(false) {
+        match hexbench_core::sys::move_window_to_current_desktop(hwnd) {
+            Ok(()) => log::info!("main: moved to the current virtual desktop"),
+            Err(error) => log::warn!("main: move to current desktop failed: {error}"),
+        }
+    }
+    if minimized {
+        let _ = window.unminimize();
+    }
+    let _ = window.show();
+    if let Err(error) = window.set_focus() {
+        log::warn!("main: set_focus failed: {error}");
+    }
+    if window.is_visible().unwrap_or(false) {
+        log::info!("main: shown");
+        return;
+    }
+    // 刚创建 / 刚从别的桌面搬回来的窗口偶尔晚一拍才真正显示。
+    log::warn!("main: still hidden after show, retrying");
+    let retry = window.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(180));
+        let _ = retry.show();
+        let _ = retry.set_focus();
+        log::info!(
+            "main: retry done visible={:?} on_current_desktop={:?}",
+            retry.is_visible(),
+            retry
+                .hwnd()
+                .ok()
+                .map(|handle| hexbench_core::sys::window_on_current_desktop(handle.0 as isize))
+        );
+    });
+}
+
 fn open_main_now(app: &AppHandle) {
     check_update_if_stale(app);
+    let _lifecycle = lock_main_lifecycle();
     if let Some(window) = app.get_webview_window("main") {
         MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-            return;
+        show_main_window("reuse", &window);
+        return;
     }
 
     // 设置窗口宽度占工作区六成，高度给到七成二：设置页多是长表单，
@@ -1272,6 +1335,7 @@ fn open_main_now(app: &AppHandle) {
         ),
         None => (980.0, 660.0),
     };
+    log::info!("main: creating window ({width}x{height} logical)");
     match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         // 任务栏和 Alt+Tab 里显示的名字：跟面板、格子区分开。
         .title("HexBench 设置")
@@ -3009,19 +3073,20 @@ fn launcher_save_location(
 /// 从面板跳到设置页：把主窗口叫出来，再告诉前端要打开哪一页。
 #[tauri::command]
 fn open_settings(page: String, tab: Option<String>, app: AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("navigate", serde_json::json!({ "page": page, "tab": tab }));
-        return;
-    }
-    // 主窗口被销毁了（关掉一阵子会自动销毁），或者开机自启时根本没建过：
-    // 这时 emit 没有页面接。记下目标页，等窗口建好、页面挂载时自己来取
-    // （见 `take_pending_page`）。建窗口要走工作线程，不能在命令里直接建。
-    if let Ok(mut pending) = app.state::<AppState>().pending_page.lock() {
-        *pending = Some((page, tab));
+    {
+        let _lifecycle = lock_main_lifecycle();
+        if let Some(window) = app.get_webview_window("main") {
+            MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
+            show_main_window("settings", &window);
+            let _ = app.emit("navigate", serde_json::json!({ "page": page, "tab": tab }));
+            return;
+        }
+        // 主窗口被销毁了（关掉一阵子会自动销毁），或者开机自启时根本没建过：
+        // 这时 emit 没有页面接。记下目标页，等窗口建好、页面挂载时自己来取
+        // （见 `take_pending_page`）。建窗口要走工作线程，不能在命令里直接建。
+        if let Ok(mut pending) = app.state::<AppState>().pending_page.lock() {
+            *pending = Some((page, tab));
+        }
     }
     let handle = app.clone();
     thread::spawn(move || open_main_now(&handle));
@@ -7914,6 +7979,41 @@ fn probe_state(app: &AppHandle) -> String {
     format!("lock_free={lock_free}")
 }
 
+/// 自检用：把主窗口挪到另一个虚拟桌面 / 搬回当前桌面，并报告它落在哪。
+#[tauri::command]
+async fn debug_main_desktop(action: String, app: AppHandle) -> Result<String, String> {
+    if !cfg!(debug_assertions) {
+        return Err("disabled".to_string());
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "no main window".to_string())?;
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?.0 as isize;
+    let mut out = format!(
+        "hwnd={hwnd} on_current={:?}",
+        hexbench_core::sys::window_on_current_desktop(hwnd)
+    );
+    match action.as_str() {
+        "away" => {
+            let other = hexbench_core::sys::other_desktop_id()
+                .ok_or_else(|| "no other desktop".to_string())?;
+            let bytes: [u8; 16] = other
+                .as_slice()
+                .try_into()
+                .map_err(|_| "bad desktop id".to_string())?;
+            hexbench_core::sys::move_window_to_desktop(hwnd, &bytes)?;
+        }
+        "back" => hexbench_core::sys::move_window_to_current_desktop(hwnd)?,
+        _ => return Ok(out),
+    }
+    thread::sleep(Duration::from_millis(350));
+    out.push_str(&format!(
+        " after={:?}",
+        hexbench_core::sys::window_on_current_desktop(hwnd)
+    ));
+    Ok(out)
+}
+
 /// 原生格子的窗口清单：给自动化验证用（没有 WebView 页面可注入脚本）。
 #[tauri::command]
 async fn debug_native_state(_app: AppHandle) -> String {
@@ -8239,6 +8339,7 @@ pub fn run() {
     debug_probe,
     debug_drop_targets,
     debug_native_state,
+    debug_main_desktop,
     debug_native_bench,
     debug_native_drop_target,
             launcher_save_location,
@@ -8606,19 +8707,32 @@ pub fn run() {
             let window = window.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(5));
+                // 回收和「打开主界面」共用一把锁：检查、销毁这段不许被 show 插进来，
+                // 否则刚显示的窗口会被紧接着销毁（点了没反应）。
+                let _lifecycle = lock_main_lifecycle();
                 // Reopened meanwhile. The generation also covers a show that is
                 // already on its way through the event loop.
                 if window.is_visible().unwrap_or(false)
                     || MAIN_SHOW_GEN.load(Ordering::SeqCst) != generation
                 {
+                    log::info!("window: main kept (reopened before recycle)");
                     return;
                 }
+                let app = window.app_handle().clone();
                 let started = Instant::now();
                 let _ = window.destroy();
                 log::info!(
                     "window: main destroyed after close in {} ms",
                     started.elapsed().as_millis()
                 );
+                // destroy() 返回和窗口从管理器里摘掉之间还有极短的一段。等在锁里
+                // 摘干净，免得紧接着的「打开主界面」拿到一个已经没有窗口的壳。
+                for _ in 0..100 {
+                    if app.get_webview_window("main").is_none() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
             });
         })
         .build(tauri::generate_context!())

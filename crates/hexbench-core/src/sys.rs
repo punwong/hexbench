@@ -140,6 +140,36 @@ fn guid_from_desktop_id(bytes: &[u8; 16]) -> GUID {
     }
 }
 
+/// 窗口是否在当前（用户正看着的）虚拟桌面上。`None` 表示查不到。
+pub fn window_on_current_desktop(hwnd: isize) -> Option<bool> {
+    if hwnd == 0 {
+        return None;
+    }
+    let object = desktop_manager().ok()?;
+    let mut on_current: i32 = 0;
+    // SAFETY: `object` 是刚激活的接口；只调用 IsWindowOnCurrentVirtualDesktop。
+    unsafe {
+        let vtable = *(object as *mut *const DesktopManagerVtbl);
+        let hr =
+            ((*vtable).is_window_on_current_desktop)(object, hwnd as HWND, &mut on_current);
+        ((*vtable).release)(object);
+        (hr >= 0).then_some(on_current != 0)
+    }
+}
+
+/// 把窗口搬到当前虚拟桌面。
+///
+/// 从别的桌面呼出窗口时，`ShowWindow` 只会让它在**原来的桌面**上可见，
+/// 眼前的桌面不会跟着切过去——看起来就是「点了没反应」。
+pub fn move_window_to_current_desktop(hwnd: isize) -> Result<(), String> {
+    let desktop = current_desktop_id().ok_or_else(|| "读不到当前桌面".to_string())?;
+    let bytes: [u8; 16] = desktop
+        .as_slice()
+        .try_into()
+        .map_err(|_| "当前桌面的 id 长度不对".to_string())?;
+    move_window_to_desktop(hwnd, &bytes)
+}
+
 /// Move one of our windows to the desktop identified by the registry id.
 pub fn move_window_to_desktop(hwnd: isize, desktop: &[u8; 16]) -> Result<(), String> {
     if hwnd == 0 {
@@ -522,6 +552,26 @@ pub fn current_desktop_id() -> Option<Vec<u8>> {
         .ok()?;
     let ids = key.get_raw_value("CurrentVirtualDesktop").ok()?.bytes;
     (!ids.is_empty()).then(|| ids.into_owned())
+}
+
+/// GUID of another virtual desktop (not the active one); `None` when there is only one.
+///
+/// 自检用：把窗口挪走再叫回来，验证「窗口停在别的桌面」这条路径。
+pub fn other_desktop_id() -> Option<Vec<u8>> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops")
+        .ok()?;
+    let all = key.get_raw_value("VirtualDesktopIDs").ok()?.bytes;
+    let current = key.get_raw_value("CurrentVirtualDesktop").ok()?.bytes;
+    if current.len() < 16 {
+        return None;
+    }
+    all.chunks_exact(16)
+        .find(|id| *id != &current[..16])
+        .map(<[u8]>::to_vec)
 }
 
 /// Create a new virtual desktop (Win+Ctrl+D). Windows switches to it.
