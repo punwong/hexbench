@@ -1262,6 +1262,56 @@ fn lock_main_lifecycle() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 窗口状态插件记哪些东西。位置和尺寸要，可见性不要：窗口什么时候出现由界面
+/// 自己决定（见 `show_main_window_ready`），插件提前 `show()` 会把还没画的
+/// 白色空窗口端出来。
+fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
+    tauri_plugin_window_state::StateFlags::all()
+        & !tauri_plugin_window_state::StateFlags::DECORATIONS
+        & !tauri_plugin_window_state::StateFlags::VISIBLE
+}
+
+/// 主窗口的页面画好了：套上上次的尺寸和位置，再显示出来。
+///
+/// 窗口是先藏着建的（见 `open_main_now`）。直接让它出现的话，用户会先看到一个
+/// 纯白的空窗口，尺寸还是按屏幕算出来的默认值，随后窗口状态插件才把上次的尺寸
+/// 和位置套上去——白框不但空，还会跳一下。
+///
+/// 这里**不**拿 `MAIN_LIFECYCLE`：它在主线程上跑，而回收线程是拿着那把锁等主线程
+/// 办完销毁的。刚建出来的窗口也还没有对应的回收线程（没被关过），用不着防。
+fn show_main_window_ready(window: &tauri::WebviewWindow, reason: &str) {
+    use tauri_plugin_window_state::WindowExt;
+
+    // 页面加载和显示之间隔着几十毫秒，这中间窗口可能已经被回收掉了。
+    if window.hwnd().is_err() || window.is_visible().unwrap_or(false) {
+        return;
+    }
+    // 页面加载和插件恢复状态是两条线，谁先到不一定；这里自己再套一次，
+    // 保证窗口出现时就已经是上次的位置和大小。
+    if let Err(error) = window.restore_state(window_state_flags()) {
+        log::warn!("main: restore window state failed: {error}");
+    }
+    let _ = window.show();
+    if let Err(error) = window.set_focus() {
+        log::warn!("main: set_focus failed: {error}");
+    }
+    log::info!("main: shown ({reason})");
+}
+
+/// 过 `delay` 之后在主线程上显示主窗口。
+///
+/// 恢复窗口状态、`show()` 都在主线程做：窗口状态插件自己也是在主线程上恢复的，
+/// 跨线程同时调会互相等。延时是留给 React 提交第一帧的。
+fn schedule_main_show(window: &tauri::WebviewWindow, delay: Duration, reason: &'static str) {
+    let window = window.clone();
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let handle = window.app_handle().clone();
+        let target = window.clone();
+        let _ = handle.run_on_main_thread(move || show_main_window_ready(&target, reason));
+    });
+}
+
 /// 把主窗口叫到眼前，并把这次尝试的前因后果记进日志。
 ///
 /// 只调 `show()` 不够：窗口如果停在**别的虚拟桌面**上，`show()` 只会让它在那块
@@ -1346,10 +1396,32 @@ fn open_main_now(app: &AppHandle) {
         .decorations(false)
         .zoom_hotkeys_enabled(false)
         .center()
+        // 先藏着：页面画好再显示（见 `show_main_window_ready`）。让窗口先出现的话，
+        // 用户先看到的是一个按屏幕算出来的、纯白的空框，随后才被上次的尺寸覆盖。
+        .visible(false)
+        .on_page_load(|window, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                schedule_main_show(&window, Duration::from_millis(40), "page load");
+            }
+        })
         .build()
     {
-        Ok(_) => {
+        Ok(window) => {
             MAIN_SHOW_GEN.fetch_add(1, Ordering::SeqCst);
+            // 兜底：页面一直没加载完（资源坏了、WebView2 卡住）也得让窗口出现，
+            // 一直藏着比白框更糟——用户会以为没打开。2.5 秒给足慢机器的余量：
+            // 正常情况下页面在 1 秒内就绪，走到这里说明是真出问题了。
+            let watchdog = window.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(2500));
+                if watchdog.is_visible().unwrap_or(false) {
+                    return;
+                }
+                log::warn!("main: page never finished loading, showing anyway");
+                let handle = watchdog.app_handle().clone();
+                let target = watchdog.clone();
+                let _ = handle.run_on_main_thread(move || show_main_window_ready(&target, "fallback"));
+            });
         }
         Err(error) => {
             // 打不开设置窗口时不能只写日志：从托盘 / 热键点进来的用户会以为什么都没发生。
@@ -8170,10 +8242,9 @@ pub fn run() {
                 })
                 // The window is frameless by design: restoring a saved
                 // "decorated" flag would bring the system title bar back.
-                .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::all()
-                        & !tauri_plugin_window_state::StateFlags::DECORATIONS,
-                )
+                // 可见性也不恢复：主窗口先藏着建、页面画好才显示，
+                // 插件抢先在它还是白框的时候 `show()` 出来（见 window_state_flags）。
+                .with_state_flags(window_state_flags())
                 .build(),
         )
         .plugin(
