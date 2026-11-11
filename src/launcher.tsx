@@ -168,6 +168,13 @@ function parentOf(path: string): string {
   return trimmed.slice(0, cut);
 }
 
+/** 取所在目录、统一小写；盘根下的文件也算同一层（`parentOf` 在盘根时返回自身）。 */
+function folderOf(path: string): string {
+  const trimmed = path.replace(/\\+$/, "");
+  const cut = trimmed.lastIndexOf("\\");
+  return (cut < 0 ? trimmed : trimmed.slice(0, cut)).toLowerCase();
+}
+
 /**
  * 呼出面板。
  *
@@ -904,6 +911,13 @@ function Launcher() {
       void reload(true);
       setLoadTick((tick) => tick + 1);
     });
+    // 空白处「新建 ▸ 文件夹 / 文本文档」：后端建好之后直接进改名。
+    bind<string>("launcher-rename", (event) => {
+      const path = event.payload;
+      const name = path.split(/[\\/]/).pop() ?? "";
+      skipCommit.current = false;
+      setEditing({ path, name });
+    });
     // 后端呼出时会连发两次（摆好窗口一次、网页窗口也摆好再一次）。这里只认
     // 紧挨着的那一次：两次都跑就是整份重读两遍，还会连着还原两次位置。
     let shownAt = 0;
@@ -1259,6 +1273,22 @@ function Launcher() {
   const filtered = searched ?? items;
 
   const shown = useMemo(() => sortItems(filtered, sort, usage), [filtered, sort, usage]);
+
+  // 搜索会换掉列表里看得见的条目：把已经不在结果里的选中项剔掉。否则接着按
+  // Delete / Ctrl+C，会把屏幕上根本没显示的文件也一起带上。
+  // 只在搜索词变化时收窄——后台重读列表时不能把用户的选中清掉。
+  useEffect(() => {
+    const visible = new Set(shown.map((item) => item.path));
+    setPicked((previous) => {
+      let dropped = false;
+      const next = new Set<string>();
+      for (const path of previous) {
+        if (visible.has(path)) next.add(path);
+        else dropped = true;
+      }
+      return dropped ? next : previous;
+    });
+  }, [query]);
 
   // ---------- 收藏：数据与操作 ----------
 
@@ -1893,7 +1923,11 @@ function Launcher() {
       .catch((error) => showToast(String(error)));
   }, []);
 
-  const startDrag = (paths: string[], event: React.PointerEvent) => {
+  const startDrag = (
+    paths: string[],
+    event: React.PointerEvent,
+    onPlainClick?: () => void,
+  ) => {
     if (event.button !== 0 || paths.length === 0) return;
     const startX = event.clientX;
     const startY = event.clientY;
@@ -1901,7 +1935,13 @@ function Launcher() {
 
     const stop = () => {
       window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointerup", finish);
+    };
+    // 没拖起来就是一次普通点击：多选里点中已选中的一项，松手后收成只选它
+    // （和资源管理器一致）；真拖起来了就保留整组，不能在这里改选中集合。
+    const finish = () => {
+      if (!started) onPlainClick?.();
+      stop();
     };
     const move = (next: PointerEvent) => {
       if (started) return;
@@ -1924,7 +1964,7 @@ function Launcher() {
     };
 
     window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointerup", finish);
   };
 
   const beginMarquee = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -2742,21 +2782,49 @@ function Launcher() {
                 setSelected(index);
                 requestAnimationFrame(() => inputRef.current?.focus());
                 // 拖的是整批选中项；只有一个就是它自己。
-                startDrag(already && picked.size > 1 ? [...picked] : [item.path], event);
+                startDrag(
+                  already && picked.size > 1 ? [...picked] : [item.path],
+                  event,
+                  () => {
+                    if (already && picked.size > 1) setPicked(new Set([item.path]));
+                  },
+                );
               }}
               onContextMenu={(event) => {
                 event.preventDefault();
                 setSelected(index);
+                // 右键点中的条目在多选里：菜单作用到整组，和资源管理器一致。
+                // 不在多选里就先改成只选它，免得对着 A 弹菜单却删了 A+B。
+                // 系统菜单一次只能带同一个文件夹里的条目（搜索结果里可能
+                // 跨目录多选）：菜单和选中集合都收窄到点中的这一层，别出现
+                // 「选了 3 个、只删掉 1 个」。
+                const inSelection = picked.has(item.path);
+                const folder = folderOf(item.path);
+                const group =
+                  inSelection && picked.size > 1
+                    ? [
+                        item.path,
+                        ...[...picked].filter(
+                          (path) => path !== item.path && folderOf(path) === folder,
+                        ),
+                      ]
+                    : [item.path];
+                const narrowed = inSelection && group.length < picked.size;
+                if (!inSelection) setPicked(new Set([item.path]));
+                else if (narrowed) setPicked(new Set(group));
                 void invoke<string | null>("launcher_context_menu", {
-                  path: item.path,
-                }).then((choice) => {
-                  if (choice === "rename") {
-                    skipCommit.current = false;
-                    setEditing({ path: item.path, name: item.name });
-                  } else if (choice === "deleted") {
-                    void refreshAll();
-                  }
-                });
+                  paths: group,
+                })
+                  .then((choice) => {
+                    if (narrowed) showToast("右键菜单只作用于同一文件夹里的条目");
+                    if (choice === "rename") {
+                      skipCommit.current = false;
+                      setEditing({ path: item.path, name: item.name });
+                    } else if (choice === "deleted") {
+                      void refreshAll();
+                    }
+                  })
+                  .catch((error) => showToast(String(error)));
               }}
               onDoubleClick={() => {
                 // 双击文件夹 = 进去；双击文件 = 打开。

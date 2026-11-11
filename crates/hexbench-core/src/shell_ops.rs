@@ -458,6 +458,16 @@ pub fn paste_into(dest: &Path) -> Result<usize, String> {
         log::warn!("paste: clipboard has no files");
         return Err("剪贴板里没有文件".to_string());
     };
+    // 剪贴板里的条目可能已经被别处删掉 / 移走：跳过失效的那些，剩下的照常
+    // 粘贴，别让一个旧路径把整批操作顶掉（IFileOperation 有一项建不出来就整批不做）。
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect();
+    if paths.is_empty() {
+        log::warn!("paste: every clipboard entry is gone");
+        return Err("文件已经不在了".to_string());
+    }
     log::info!(
         "paste: {} items cut={cut} -> {}",
         paths.len(),

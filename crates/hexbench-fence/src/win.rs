@@ -3658,10 +3658,14 @@ fn open_search(owner: HWND, fence: &mut FenceWindow) {
         let scale = fence.scale.max(0.5);
         // 高度 26、圆角、填充底色都对着呼出面板的搜索框来。
         let height = (26.0 * scale).round().max(20.0) as i32;
-        let left = rect.left + (12.0 * scale).round() as i32;
+        // 左侧让开文件夹图标 / 子目录的「‹」（和「重命名格子」的输入框一致）：
+        // 从面包屑起点开始，整块盖住标题。以前从 12 开始，正好切在图标中间，
+        // 左边会漏出一条没被盖住的图标边。
+        let left = rect.left + (NAV_START * scale).round() as i32;
         let right = rect.left + ((fence.search_left() - 8.0) * scale).round() as i32;
         let top = rect.top + (((HEADER_H - 26.0) / 2.0) * scale).round() as i32;
-        let width = (right - left).max(120);
+        // 宽度跟着可用空间走：格子缩到最窄时也不能让输入框盖到右边的按钮上。
+        let width = (right - left).max(24);
         let Some(parts) = create_edit_popup(
             w!("HexBenchNativeFenceSearch"),
             owner,
@@ -3816,15 +3820,57 @@ fn show_background_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
     let result = with_menu_focus(hwnd, || {
         hexbench_core::sys::show_folder_background_menu(dir, x, y, hwnd.0 as isize, can_paste)
     });
-    match result {
+    // 「新建」是我们自己实现的，建完直接进改名——资源管理器也是这个手感。
+    let created = match &result {
         Ok(Some("paste")) => {
             if let Err(error) = hexbench_core::shell_ops::paste_into(dir) {
                 log::warn!("native fence: 粘贴失败: {error}");
             }
+            None
         }
-        Ok(_) => {}
-        Err(error) => log::warn!("native fence: 背景菜单失败: {error}"),
+        Ok(Some("new-folder")) => Some((hexbench_core::sys::create_folder(dir, "新建文件夹"), true)),
+        Ok(Some("new-text")) => Some((
+            hexbench_core::sys::create_text_file(dir, "新建文本文档"),
+            false,
+        )),
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!("native fence: 背景菜单失败: {error}");
+            None
+        }
+    };
+    let Some((created, is_dir)) = created else {
+        return;
+    };
+    match created {
+        Ok(target) => start_rename_created(hwnd, &target, is_dir, x, y),
+        Err(error) => log::warn!("native fence: 新建失败: {error}"),
     }
+}
+
+/// 新建出来的条目直接进入改名框。
+fn start_rename_created(
+    hwnd: HWND,
+    target: &std::path::Path,
+    is_dir: bool,
+    x: i32,
+    y: i32,
+) {
+    let engine = ENGINE.with(|cell| cell.get());
+    let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const FenceWindow;
+    if engine.is_null() || raw.is_null() {
+        return;
+    }
+    // SAFETY: 两个指针都来自本线程的窗口数据，菜单还没返回时一直有效。
+    let (fence, sink) = unsafe { (&*raw, &(*engine).sink) };
+    start_rename_item(
+        sink,
+        fence,
+        &target.to_string_lossy(),
+        is_dir,
+        x,
+        y,
+    );
 }
 
 unsafe extern "system" fn fence_wndproc(

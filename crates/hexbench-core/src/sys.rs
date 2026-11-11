@@ -18,6 +18,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, ScreenToClient, HDC, HMONITOR,
     MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, DESKTOP_READOBJECTS,
 };
@@ -47,10 +48,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint,
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuStringW, InsertMenuW,
-    TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    GA_ROOT, GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DeleteMenu, GetMenuItemCount, GetMenuStringW, GetSubMenu, GetWindowLongPtrW, InsertMenuW,
+    RegisterClassW,
+    SetWindowLongPtrW, TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING,
+    WNDCLASSW,
+    GA_ROOT, GWL_EXSTYLE, GWLP_USERDATA, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_DRAWITEM, WM_INITMENUPOPUP,
+    WM_MEASUREITEM, WM_MENUCHAR, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::geometry::EdgeProbe;
@@ -1628,6 +1634,190 @@ struct ContextMenuVtbl {
 }
 
 const IID_ICONTEXTMENU: GUID = GUID::from_u128(0x0002_14E4_0000_0000_C000_0000_0000_0046);
+const IID_ICONTEXTMENU2: GUID = GUID::from_u128(0x0002_14F4_0000_0000_C000_0000_0000_0046);
+const IID_ICONTEXTMENU3: GUID = GUID::from_u128(0x0002_14F5_0000_0000_C000_0000_0000_0046);
+
+/// `IContextMenu2` / `IContextMenu3`：在 `IContextMenu` 后面接着两个槽。
+#[repr(C)]
+struct ContextMenu2Vtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: usize,
+    query_context_menu: usize,
+    invoke_command: usize,
+    get_command_string: usize,
+    handle_menu_msg: unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> i32,
+    handle_menu_msg2: unsafe extern "system" fn(*mut c_void, u32, usize, isize, *mut isize) -> i32,
+}
+
+/// 弹菜单时用的宿主窗口数据：菜单对象自己，用来现场填懒加载的子菜单。
+struct MenuHost {
+    /// `IContextMenu3`，优先用这个（能带回 LRESULT）。
+    menu3: *mut c_void,
+    /// 老实现只支持 `IContextMenu2`。
+    menu2: *mut c_void,
+}
+
+/// 菜单宿主窗口的消息循环。
+///
+/// 「打开方式」「发送到」「新建」这些子菜单是**懒加载**的：`QueryContextMenu`
+/// 只放一个空壳，真正的条目要等子菜单展开时，由 Shell 把
+/// `WM_INITMENUPOPUP` / `WM_DRAWITEM` / `WM_MEASUREITEM` / `WM_MENUCHAR`
+/// 发给菜单的宿主窗口，再转给 `IContextMenu2/3` 现场生成。
+unsafe extern "system" fn menu_host_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if matches!(
+        message,
+        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
+    ) {
+        unsafe {
+            let host = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const MenuHost;
+            if !host.is_null() {
+                let host = &*host;
+                if !host.menu3.is_null() {
+                    let vtbl = *(host.menu3 as *mut *const ContextMenu2Vtbl);
+                    let mut result: isize = 0;
+                    let hr = ((*vtbl).handle_menu_msg2)(
+                        host.menu3,
+                        message,
+                        wparam,
+                        lparam,
+                        &mut result,
+                    );
+                    // E_NOTIMPL 之类的失败才往下退，不是「没处理」。
+                    if hr >= 0 {
+                        return result;
+                    }
+                }
+                if !host.menu2.is_null() {
+                    let vtbl = *(host.menu2 as *mut *const ContextMenu2Vtbl);
+                    let hr = ((*vtbl).handle_menu_msg)(host.menu2, message, wparam, lparam);
+                    if hr >= 0 {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+/// 弹出菜单，返回选中的命令 id。
+///
+/// 菜单交给一个临时创建的隐藏窗口持有，由它把菜单消息转给 `IContextMenu2/3`。
+/// 以前宿主直接是面板 / 格子窗口，那两个窗口不认识这些消息，
+/// 「打开方式」里就只有 Shell 预置的一项（再点一次才弹选择对话框），
+/// 「发送到」也是空的。
+fn track_popup_menu(menu_object: *mut c_void, popup: HMENU, x: i32, y: i32, owner: HWND) -> u32 {
+    // SAFETY: 菜单对象由调用方保证有效；隐藏窗口只活到菜单关掉为止。
+    unsafe {
+        let menu_vtbl = *(menu_object as *mut *const ContextMenuVtbl);
+        let query_interface: unsafe extern "system" fn(
+            *mut c_void,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute((*menu_vtbl).query_interface);
+        let mut menu3: *mut c_void = std::ptr::null_mut();
+        let mut menu2: *mut c_void = std::ptr::null_mut();
+        if query_interface(menu_object, &IID_ICONTEXTMENU3, &mut menu3) < 0 {
+            menu3 = std::ptr::null_mut();
+        }
+        if query_interface(menu_object, &IID_ICONTEXTMENU2, &mut menu2) < 0 {
+            menu2 = std::ptr::null_mut();
+        }
+        if menu2.is_null() && menu3.is_null() {
+            // 老式菜单对象：照旧直接弹，行为不会比现在更差。
+            return TrackPopupMenuEx(
+                popup,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                x,
+                y,
+                owner,
+                std::ptr::null(),
+            ) as u32;
+        }
+
+        let class_name = windows_sys::core::w!("HexBenchMenuHost");
+        // 窗口类只需要注册一次；重复注册会返回 0 并留下 ERROR_CLASS_ALREADY_EXISTS。
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            let class = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(menu_host_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name,
+            };
+            RegisterClassW(&class);
+        });
+        let host_window = CreateWindowExW(
+            0,
+            class_name,
+            class_name,
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        );
+        if host_window.is_null() {
+            let id = TrackPopupMenuEx(
+                popup,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                x,
+                y,
+                owner,
+                std::ptr::null(),
+            );
+            if !menu3.is_null() {
+                release_object(menu3);
+            }
+            if !menu2.is_null() {
+                release_object(menu2);
+            }
+            return id as u32;
+        }
+
+        // 宿主只活到菜单关掉为止；指针在 TrackPopupMenuEx 期间一直有效。
+        let host = MenuHost { menu3, menu2 };
+        SetWindowLongPtrW(
+            host_window,
+            GWLP_USERDATA,
+            &host as *const MenuHost as isize,
+        );
+        let id = TrackPopupMenuEx(
+            popup,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            x,
+            y,
+            host_window,
+            std::ptr::null(),
+        );
+        SetWindowLongPtrW(host_window, GWLP_USERDATA, 0);
+        DestroyWindow(host_window);
+        if !menu3.is_null() {
+            release_object(menu3);
+        }
+        if !menu2.is_null() {
+            release_object(menu2);
+        }
+        id as u32
+    }
+}
+
 
 /// 在某个位置弹出文件的「资源管理器右键菜单」。
 ///
@@ -1812,18 +2002,11 @@ pub fn show_shell_context_menu_for(
         } else {
             GetForegroundWindow()
         };
-        let id = TrackPopupMenuEx(
-            popup,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            x,
-            y,
-            owner_window,
-            std::ptr::null(),
-        );
+        let id = track_popup_menu(menu_object, popup, x, y, owner_window);
         DestroyMenu(popup);
         log::info!("context menu: picked id={id}");
 
-        match id as u32 {
+        match id {
             0 => {}
             CMD_RENAME => choice = Some("rename"),
             other => {
@@ -1902,6 +2085,31 @@ pub fn create_folder(parent: &std::path::Path, base: &str) -> Result<std::path::
         }
         std::fs::create_dir(&target).map_err(|error| error.to_string())?;
         log::info!("created folder {}", target.display());
+        return Ok(target);
+    }
+    Err("试了很多个名字都被占用了".to_string())
+}
+
+/// 在 `parent` 下新建一个空的文本文档，重名时自动加序号。
+pub fn create_text_file(
+    parent: &std::path::Path,
+    base: &str,
+) -> Result<std::path::PathBuf, String> {
+    if !parent.is_dir() {
+        return Err("这个位置不是一个文件夹".to_string());
+    }
+    for index in 1..1000 {
+        let name = if index == 1 {
+            format!("{base}.txt")
+        } else {
+            format!("{base} ({index}).txt")
+        };
+        let target = parent.join(&name);
+        if target.exists() {
+            continue;
+        }
+        std::fs::write(&target, b"").map_err(|error| error.to_string())?;
+        log::info!("created file {}", target.display());
         return Ok(target);
     }
     Err("试了很多个名字都被占用了".to_string())
@@ -1994,9 +2202,10 @@ pub fn show_folder_background_menu(
     owner: isize,
     can_paste: bool,
 ) -> Result<Option<&'static str>, String> {
-    /// 自己加的「粘贴」用高位 id，避开 Shell 的 1..0x7FFF。
+    /// 自己加的「粘贴」「新建」用高位 id，避开 Shell 的 1..0x7FFF。
     const CMD_PASTE: u32 = 0x8001;
-    let choice: Option<&'static str> = None;
+    const CMD_NEW_FOLDER: u32 = 0x8002;
+    const CMD_NEW_TEXT: u32 = 0x8003;
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = dir
         .as_os_str()
@@ -2097,25 +2306,80 @@ pub fn show_folder_background_menu(
         );
         InsertMenuW(popup, 1, MF_BYPOSITION | MF_SEPARATOR, 0, std::ptr::null());
 
+        // Shell 的「新建」子菜单要靠 `IShellView` 在展开时现场生成条目：
+        // HexBench 没有视图对象，菜单能弹出来，但选了什么都不会建。
+        // 换成自己的两项（资源管理器里最常用的就是这两个），插回原来的位置。
+        let mut new_at: Option<u32> = None;
+        for index in 0..GetMenuItemCount(popup) {
+            let mut text = [0u16; 96];
+            let length = GetMenuStringW(
+                popup,
+                index as u32,
+                text.as_mut_ptr(),
+                text.len() as i32,
+                MF_BYPOSITION,
+            );
+            if length <= 0 {
+                continue;
+            }
+            let submenu = GetSubMenu(popup, index);
+            if submenu.is_null() {
+                continue;
+            }
+            let label = String::from_utf16_lossy(&text[..length as usize]);
+            let plain = label.replace('&', "");
+            if plain.starts_with("新建") || plain.starts_with("New") {
+                new_at = Some(index as u32);
+                break;
+            }
+        }
+        if let Some(index) = new_at {
+            DeleteMenu(popup, index, MF_BYPOSITION);
+        }
+        let new_menu = CreatePopupMenu();
+        if !new_menu.is_null() {
+            AppendMenuW(
+                new_menu,
+                MF_STRING,
+                CMD_NEW_FOLDER as usize,
+                windows_sys::core::w!("文件夹(&F)"),
+            );
+            AppendMenuW(
+                new_menu,
+                MF_STRING,
+                CMD_NEW_TEXT as usize,
+                windows_sys::core::w!("文本文档(&T)"),
+            );
+            let position = new_at.unwrap_or_else(|| GetMenuItemCount(popup) as u32);
+            InsertMenuW(
+                popup,
+                position,
+                MF_BYPOSITION | MF_POPUP,
+                new_menu as usize,
+                windows_sys::core::w!("新建(&W)"),
+            );
+        }
+
         let owner_window = if owner != 0 {
             owner as HWND
         } else {
             GetForegroundWindow()
         };
-        let id = TrackPopupMenuEx(
-            popup,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            x,
-            y,
-            owner_window,
-            std::ptr::null(),
-        );
+        let id = track_popup_menu(menu_object, popup, x, y, owner_window);
         DestroyMenu(popup);
         log::info!("background menu: picked id={id}");
 
-        if id as u32 == CMD_PASTE {
+        if id == CMD_PASTE {
             release_object(menu_object);
             return Ok(Some("paste"));
+        }
+        if id == CMD_NEW_FOLDER || id == CMD_NEW_TEXT {
+            release_object(menu_object);
+            return Ok(Some(if id == CMD_NEW_FOLDER {
+                "new-folder"
+            } else {
+                "new-text"
+            }));
         }
 
         if id != 0 {
@@ -2124,7 +2388,7 @@ pub fn show_folder_background_menu(
                 cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
                 fMask: 0,
                 hwnd: owner_window,
-                lpVerb: (id as u32 - 1) as usize as *const u8,
+                lpVerb: (id - 1) as usize as *const u8,
                 lpParameters: std::ptr::null(),
                 lpDirectory: std::ptr::null(),
                 nShow: SW_SHOWNORMAL,
@@ -2134,7 +2398,7 @@ pub fn show_folder_background_menu(
             let _ = ((*menu_vtbl).invoke_command)(menu_object, &command);
         }
         release_object(menu_object);
-        Ok(choice)
+        Ok(None)
     }
 }
 // ---------------------------------------------------------------------------

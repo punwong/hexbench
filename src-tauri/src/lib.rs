@@ -4375,7 +4375,22 @@ fn launcher_undo(app: AppHandle) -> Result<String, String> {
 #[tauri::command(async)]
 fn launcher_trash(paths: Vec<String>, app: AppHandle) -> Result<usize, String> {
     log::info!("trash: {} items", paths.len());
-    let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    // 多选里可能混着刚被别处删掉 / 移走的路径：跳过它们，别让一个失效的
+    // 条目把整组操作顶掉（IFileOperation 只要有一项建不出来就整批不做）。
+    let total = paths.len();
+    let targets: Vec<PathBuf> = paths
+        .into_iter()
+        .map(PathBuf::from)
+        // symlink_metadata：断掉的快捷方式 / 链接本身也算存在，得能删掉。
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect();
+    if targets.is_empty() {
+        log::warn!("trash: nothing to delete, all {total} path(s) are gone");
+        return Err("文件已经不在了".to_string());
+    }
+    if targets.len() < total {
+        log::warn!("trash: skipped {} of {total} gone path(s)", total - targets.len());
+    }
     let removed = hexbench_core::shell_ops::trash(&targets)?;
     if removed > 0 {
         push_undo(UndoOp::Trash(targets));
@@ -4389,7 +4404,15 @@ fn launcher_trash(paths: Vec<String>, app: AppHandle) -> Result<usize, String> {
 #[tauri::command]
 fn launcher_clipboard_copy(paths: Vec<String>, cut: bool) -> Result<(), String> {
     log::info!("clipboard: copy {} items cut={cut}", paths.len());
-    let targets: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    // 同上：失效的路径不放进剪贴板，剩下的照常复制。
+    let targets: Vec<PathBuf> = paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect();
+    if targets.is_empty() {
+        return Err("文件已经不在了".to_string());
+    }
     hexbench_core::shell_ops::clipboard_set_files(&targets, cut)
 }
 
@@ -4523,10 +4546,30 @@ fn launcher_background_menu(
     LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
     let result = hexbench_core::sys::show_folder_background_menu(&dir, x, y, owner, can_paste);
     LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
-    if let Ok(Some("paste")) = &result {
-        if let Err(error) = hexbench_core::shell_ops::paste_into(&dir) {
-            log::warn!("background menu: paste failed: {error}");
+    // 「新建」是我们自己实现的，同步建好就直接刷新并进改名——资源管理器的手感。
+    let choice = result.as_ref().ok().and_then(|value| *value);
+    match choice {
+        Some("paste") => {
+            if let Err(error) = hexbench_core::shell_ops::paste_into(&dir) {
+                log::warn!("background menu: paste failed: {error}");
+            }
         }
+        Some("new-folder") | Some("new-text") => {
+            let created = if choice == Some("new-folder") {
+                hexbench_core::sys::create_folder(&dir, "新建文件夹")
+            } else {
+                hexbench_core::sys::create_text_file(&dir, "新建文本文档")
+            };
+            return match created {
+                Ok(path) => {
+                    let _ = app.emit("launcher-changed", ());
+                    let _ = app.emit("launcher-rename", path.to_string_lossy().to_string());
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
+        }
+        _ => {}
     }
 
     // Explorer 的「新建 ▸ 文件夹」是先建出来再进入重命名的异步操作：
@@ -4565,27 +4608,38 @@ fn launcher_background_menu(
 
     result.map(|_| ())
 }
-/// 面板里右键：弹出系统原生的文件菜单（和资源管理器同一套）。
-/// 面板里右键：系统原生菜单 + 自己补的重命名 / 删除。
+/// 面板里右键：系统原生菜单 + 自己补的重命名。
+///
+/// `paths` 是多选时的整组文件，菜单里的剪切 / 复制 / 删除会一起作用到这一组；
+/// 第一项必须是右键点中的那个（其它目录的条目会被后端过滤掉）。
 ///
 /// 返回 `"rename"` 表示用户选了重命名（改名要用户输入，交给界面做），
 /// `"deleted"` 表示删到回收站了，`None` 表示没选或执行了系统命令。
 #[tauri::command]
 fn launcher_context_menu(
-    path: String,
+    paths: Vec<String>,
     window: tauri::WebviewWindow,
     app: AppHandle,
 ) -> Result<Option<String>, String> {
-    let target = PathBuf::from(&path);
+    let targets: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let Some(target) = targets.first().cloned() else {
+        return Err("没有选中文件".to_string());
+    };
     if !target.exists() {
-        log::warn!("launcher: context menu skipped, file is gone: {path}");
+        log::warn!(
+            "launcher: context menu skipped, file is gone: {}",
+            target.display()
+        );
         return Err("文件已经不在了".to_string());
     }
     let (x, y) = hexbench_core::sys::cursor_position();
     let owner = window.hwnd().ok().map(|hwnd| hwnd.0 as isize).unwrap_or(0);
-    log::info!("launcher: context menu for {path} at {x},{y}");
+    log::info!(
+        "launcher: context menu for {} item(s) at {x},{y}",
+        targets.len()
+    );
     LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
-    let result = hexbench_core::sys::show_shell_context_menu(&target, x, y, owner, || {
+    let result = hexbench_core::sys::show_shell_context_menu_for(&targets, x, y, owner, || {
         // 先把「命令可能还在跑」的标记戴上：InvokeCommand 本身就可能等进度
         // 窗口，这段时间主线程已经会收到失焦了。菜单里选的可能不是系统命令
         // （改名），那也最多多守几秒。
