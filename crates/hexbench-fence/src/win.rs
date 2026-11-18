@@ -3816,7 +3816,7 @@ fn show_background_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
     if !dir.is_dir() {
         return;
     }
-    let can_paste = hexbench_core::shell_ops::clipboard_get_files().is_some();
+    let can_paste = hexbench_core::shell_ops::clipboard_has_pasteable();
     let result = with_menu_focus(hwnd, || {
         hexbench_core::sys::show_folder_background_menu(dir, x, y, hwnd.0 as isize, can_paste)
     });

@@ -453,10 +453,17 @@ fn clipboard_read_files() -> Option<(Vec<PathBuf>, Option<u32>)> {
 }
 
 /// 粘贴：读剪贴板，再按「复制 / 剪切」执行到 `dest`。
+///
+/// 剪贴板里是图片（截图工具、浏览器「复制图片」）而不是文件时，直接存成 PNG：
+/// 系统资源管理器不给这种粘贴落地，但截图之后最常做的就是「粘到某个文件夹里」。
 pub fn paste_into(dest: &Path) -> Result<usize, String> {
     let Some((paths, cut)) = clipboard_get_files() else {
-        log::warn!("paste: clipboard has no files");
-        return Err("剪贴板里没有文件".to_string());
+        if let Some(saved) = save_clipboard_image(dest)? {
+            log::info!("paste: image saved to {}", saved.display());
+            return Ok(1);
+        }
+        log::warn!("paste: clipboard has neither files nor an image");
+        return Err("剪贴板里没有可粘贴的内容".to_string());
     };
     // 剪贴板里的条目可能已经被别处删掉 / 移走：跳过失效的那些，剩下的照常
     // 粘贴，别让一个旧路径把整批操作顶掉（IFileOperation 有一项建不出来就整批不做）。
@@ -484,6 +491,229 @@ pub fn paste_into(dest: &Path) -> Result<usize, String> {
         log::info!("paste: copied {copied}");
         Ok(copied)
     }
+}
+
+/// 剪贴板里有没有能粘贴的东西：文件列表，或者一张图片。
+pub fn clipboard_has_pasteable() -> bool {
+    clipboard_get_files().is_some() || clipboard_has_image()
+}
+
+/// 剪贴板里有没有图片（截图、浏览器「复制图片」、画图……）。
+pub fn clipboard_has_image() -> bool {
+    use windows::Win32::System::DataExchange::IsClipboardFormatAvailable;
+    use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB};
+
+    // SAFETY: 只查询剪贴板上有哪些格式，不改动任何东西。
+    unsafe {
+        IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok()
+            || IsClipboardFormatAvailable(CF_BITMAP.0 as u32).is_ok()
+            || png_clipboard_format()
+                .is_some_and(|format| IsClipboardFormatAvailable(format).is_ok())
+    }
+}
+
+/// 「PNG」这个自定义剪贴板格式的 id（Chromium 系的程序复制图片时会写它）。
+fn png_clipboard_format() -> Option<u32> {
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+
+    let name: Vec<u16> = "PNG\0".encode_utf16().collect();
+    // SAFETY: 名字以 NUL 结尾，函数只做格式注册。
+    let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
+    (format != 0).then_some(format)
+}
+
+/// 把剪贴板里的图片存成 PNG 文件。返回新建的路径；剪贴板里没有图片就是 `Ok(None)`。
+pub fn save_clipboard_image(dest: &Path) -> Result<Option<PathBuf>, String> {
+    if !dest.is_dir() {
+        return Err("这个位置不是一个文件夹".to_string());
+    }
+    let Some(bytes) = clipboard_image_png() else {
+        return Ok(None);
+    };
+    let path = unique_image_path(dest);
+    std::fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    log::info!("paste: image written to {}", path.display());
+    Ok(Some(path))
+}
+
+/// 从剪贴板读一张图，统一转成 PNG 字节。
+///
+/// 先看「PNG」格式（浏览器复制图片时原样放着 PNG，透明和色彩都不用重算），
+/// 再退到 `CF_DIB`（截图工具、画图），最后才用 `CF_BITMAP`（老程序只给位图）。
+fn clipboard_image_png() -> Option<Vec<u8>> {
+    use windows::Win32::System::DataExchange::CloseClipboard;
+
+    if !open_clipboard_with_retry() {
+        log::warn!("paste: clipboard is busy");
+        return None;
+    }
+    // SAFETY: 剪贴板已经打开，读到的句柄在 CloseClipboard 之前一直有效；
+    // 这里只读不写，读完立刻关。
+    let result = unsafe { read_clipboard_image() };
+    // SAFETY: 配对上面的 OpenClipboard。
+    let _ = unsafe { CloseClipboard() };
+    result
+}
+
+unsafe fn read_clipboard_image() -> Option<Vec<u8>> {
+    use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
+    use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB};
+
+    // 1. 「PNG」格式：字节就是现成的 PNG。
+    if let Some(format) = png_clipboard_format() {
+        if unsafe { IsClipboardFormatAvailable(format) }.is_ok() {
+            if let Some(bytes) = unsafe { clipboard_bytes(format) } {
+                if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                    return Some(bytes);
+                }
+                log::warn!("paste: clipboard PNG format is not a PNG ({} bytes)", bytes.len());
+            }
+        }
+    }
+
+    // 2. CF_DIB：截图工具和画图都放这个，自己解成 RGBA 再编码。
+    if unsafe { IsClipboardFormatAvailable(CF_DIB.0 as u32) }.is_ok() {
+        if let Some(dib) = unsafe { clipboard_bytes(CF_DIB.0 as u32) } {
+            if let Some((rgba, width, height)) = dib_to_rgba(&dib) {
+                return encode_png(width, height, &rgba);
+            }
+            log::warn!("paste: unsupported DIB ({} bytes)", dib.len());
+        }
+    }
+
+    // 3. CF_BITMAP：只有位图的老程序。位图归剪贴板所有，不能 DeleteObject。
+    if unsafe { IsClipboardFormatAvailable(CF_BITMAP.0 as u32) }.is_ok() {
+        if let Ok(handle) = unsafe { GetClipboardData(CF_BITMAP.0 as u32) } {
+            if !handle.is_invalid() {
+                if let Some((rgba, width, height)) =
+                    unsafe { bitmap_to_rgba(HBITMAP(handle.0)) }
+                {
+                    return encode_png(width, height, &rgba);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 读一个剪贴板格式的全部字节（`GlobalLock` 拷出来，不接管所有权）。
+unsafe fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    use windows::Win32::System::DataExchange::GetClipboardData;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+
+    let handle = unsafe { GetClipboardData(format) }.ok()?;
+    if handle.is_invalid() {
+        return None;
+    }
+    let memory = windows::Win32::Foundation::HGLOBAL(handle.0);
+    // SAFETY: 句柄来自剪贴板且剪贴板开着；读完解锁，内存仍归系统。
+    unsafe {
+        let pointer = GlobalLock(memory);
+        if pointer.is_null() {
+            return None;
+        }
+        let size = GlobalSize(memory);
+        let bytes = std::slice::from_raw_parts(pointer as *const u8, size).to_vec();
+        let _ = GlobalUnlock(memory);
+        Some(bytes)
+    }
+}
+
+/// `CF_DIB` 的原始字节 → RGBA。只处理截图和复制图片常见的 24/32 位无压缩格式。
+fn dib_to_rgba(dib: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if dib.len() < 40 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?) as usize;
+    if header_size < 40 || dib.len() < header_size {
+        return None;
+    }
+    let width = i32::from_le_bytes(dib[4..8].try_into().ok()?);
+    let height = i32::from_le_bytes(dib[8..12].try_into().ok()?);
+    let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    // BI_RGB 之外（RLE、位域）先不处理：截图和浏览器都不会给这些格式。
+    if width <= 0 || height == 0 || compression != 0 {
+        return None;
+    }
+    let bytes_per_pixel = match bit_count {
+        24 => 3usize,
+        32 => 4usize,
+        _ => return None,
+    };
+    let width = width as usize;
+    let top_down = height < 0;
+    let height = height.unsigned_abs() as usize;
+    let stride = (width * bytes_per_pixel + 3) & !3;
+    if dib.len() < header_size + stride * height {
+        return None;
+    }
+
+    let mut rgba = vec![0u8; width * height * 4];
+    // 32 位 DIB 的 alpha 常常整片是 0（GDI 截图就是），那是「没有 alpha」而不是
+    // 全透明——照搬会把整张图存成透明的。
+    let opaque = bytes_per_pixel == 3
+        || (0..width * height).all(|pixel| dib[header_size + pixel * 4 + 3] == 0);
+    for y in 0..height {
+        // DIB 默认自下而上；高度为负时才是自上而下。
+        let row = if top_down { y } else { height - 1 - y };
+        let source = header_size + row * stride;
+        for x in 0..width {
+            let from = source + x * bytes_per_pixel;
+            let to = (y * width + x) * 4;
+            rgba[to] = dib[from + 2];
+            rgba[to + 1] = dib[from + 1];
+            rgba[to + 2] = dib[from];
+            rgba[to + 3] = if bytes_per_pixel == 4 && !opaque {
+                dib[from + 3]
+            } else {
+                255
+            };
+        }
+    }
+    Some((rgba, width as u32, height as u32))
+}
+
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// 「截图 2026-11-18 14-30-12.png」，重名就加序号。
+fn unique_image_path(dest: &Path) -> PathBuf {
+    let stamp = local_stamp();
+    for index in 1..1000 {
+        let name = if index == 1 {
+            format!("截图 {stamp}.png")
+        } else {
+            format!("截图 {stamp} ({index}).png")
+        };
+        let target = dest.join(name);
+        if !target.exists() {
+            return target;
+        }
+    }
+    dest.join(format!("截图 {stamp} {}.png", std::process::id()))
+}
+
+/// 本地时间「2026-11-18 14-30-12」：文件名里不能用冒号。
+fn local_stamp() -> String {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+
+    let mut time: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: 只是把当前本地时间填进这块栈内存。
+    unsafe { GetLocalTime(&mut time) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}-{:02}-{:02}",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+    )
 }
 
 /// 把之前删除（进回收站）的文件还原到原位置。

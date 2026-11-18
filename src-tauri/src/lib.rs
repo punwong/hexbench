@@ -1110,6 +1110,34 @@ fn op_name(id: u32) -> &'static str {
 
 /// Note how long the event loop is unavailable, so a "frozen" report can be
 /// traced instead of guessed at.
+/// 粘贴到对话框的图片存这里：%LOCALAPPDATA%io.github.hexbenchpaste。
+///
+/// 只留最近 20 张：它们是交给对话框的临时文件，攒着没用。
+fn paste_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let dir = PathBuf::from(base).join("io.github.hexbench").join("paste");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("png") {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() > 20 {
+        files.sort_by_key(|(time, _)| *time);
+        for (_, path) in files.iter().take(files.len() - 20) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Some(dir)
+}
+
 fn spawn_stall_watchdog(app: AppHandle) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(1000));
@@ -4292,6 +4320,17 @@ async fn launcher_icons(
     ready
 }
 
+/// 拖到文件对话框上的那些项，应该把对话框带到哪个文件夹。
+///
+/// 拖的是文件夹就进它自己（和资源管理器一致），是文件就进它所在的目录。
+fn drop_folder(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first = paths.first()?;
+    if first.is_dir() {
+        return Some(first.clone());
+    }
+    first.parent().map(Path::to_path_buf)
+}
+
 /// 面板里按住一个条目拖出去：交给 OLE，资源管理器 / 浏览器都认。
 ///
 /// `DoDragDrop` 必须留在主线程上：它靠 `SetCapture` 拿鼠标，而只有前台线程拿得到，
@@ -4389,6 +4428,23 @@ fn run_file_drag(app: &AppHandle, label: &str, targets: &[PathBuf]) -> Result<u3
                     drop_event.as_str(),
                     serde_json::json!({ "x": x, "y": y, "paths": list }),
                 );
+            } else if let Some(folder) = drop_folder(&targets) {
+                // 落在别的窗口上：如果那是「打开 / 保存」对话框，就把它带到文件所在的
+                // 文件夹——Windows 自己收到文件拖放什么也不做，连目录都不切。
+                // 判断和打字都放后台：主线程刚从 DoDragDrop 里出来，不能再跟别的窗口
+                // 同步等消息（对方正忙着处理这次拖放）。
+                thread::spawn(move || {
+                    let Some(dialog) = hexbench_core::sys::file_dialog_at(x, y) else {
+                        return;
+                    };
+                    log::info!(
+                        "launcher: drop on file dialog, navigating to {}",
+                        folder.display()
+                    );
+                    if let Err(error) = hexbench_core::sys::navigate_file_dialog(dialog, &folder) {
+                        log::warn!("launcher: navigate dialog failed: {error}");
+                    }
+                });
             }
         }
     }
@@ -4679,7 +4735,7 @@ fn launcher_background_menu(
     // 菜单挂在调用它的窗口上：快捷面板和桌面格子共用一个命令。
     let owner = window.hwnd().ok().map(|hwnd| hwnd.0 as isize).unwrap_or(0);
     // 剪贴板里有文件时才让「粘贴」可用
-    let can_paste = hexbench_core::shell_ops::clipboard_get_files().is_some();
+    let can_paste = hexbench_core::shell_ops::clipboard_has_pasteable();
     LAUNCHER_MENU_OPEN.store(true, Ordering::Relaxed);
     let result = hexbench_core::sys::show_folder_background_menu(&dir, x, y, owner, can_paste);
     LAUNCHER_MENU_OPEN.store(false, Ordering::Relaxed);
@@ -8051,6 +8107,20 @@ fn probe_state(app: &AppHandle) -> String {
     format!("lock_free={lock_free}")
 }
 
+/// 自检用：直接让一个文件对话框跳到指定文件夹（不走拖放，单独测识别 + 填路径 + 回车）。
+#[tauri::command]
+async fn debug_navigate_dialog(hwnd: i64, folder: String) -> Result<String, String> {
+    if !cfg!(debug_assertions) {
+        return Err("disabled".to_string());
+    }
+    let dialog = hwnd as isize;
+    if !hexbench_core::sys::is_file_dialog(dialog) {
+        return Err("不是文件对话框".to_string());
+    }
+    hexbench_core::sys::navigate_file_dialog(dialog, std::path::Path::new(&folder))?;
+    Ok(format!("ok hwnd={hwnd} folder={folder}"))
+}
+
 /// 自检用：把主窗口挪到另一个虚拟桌面 / 搬回当前桌面，并报告它落在哪。
 #[tauri::command]
 async fn debug_main_desktop(action: String, app: AppHandle) -> Result<String, String> {
@@ -8411,6 +8481,7 @@ pub fn run() {
     debug_drop_targets,
     debug_native_state,
     debug_main_desktop,
+    debug_navigate_dialog,
     debug_native_bench,
     debug_native_drop_target,
             launcher_save_location,
@@ -8472,6 +8543,11 @@ pub fn run() {
             }
 
             spawn_engine(engine_shared.clone());
+
+            // 系统「打开」对话框里 Ctrl+V 直接贴剪贴板里的图片（上传框的常见痛点）。
+            if let Some(dir) = paste_dir() {
+                hexbench_core::sys::spawn_dialog_paste_watcher(dir);
+            }
 
             let args: Vec<String> = std::env::args().collect();
             // 从右键菜单启动时：动作在后台做，不弹设置窗口。

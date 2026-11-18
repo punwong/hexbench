@@ -8,9 +8,9 @@
 use std::ffi::c_void;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, TRUE};
@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, VK_CONTROL, VK_D, VK_LBUTTON, VK_LEFT, VK_LWIN, VK_MBUTTON, VK_MENU,
+    KEYEVENTF_UNICODE, VK_CONTROL, VK_D, VK_LBUTTON, VK_LEFT, VK_LWIN, VK_MBUTTON, VK_MENU, VK_V,
     VK_RBUTTON, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows_sys::core::GUID;
@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::Shell::{
     SHGetKnownFolderPath, SHParseDisplayName,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetDlgItem, GetParent,
     GetCursorPos, GetForegroundWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     SetCursorPos, SetWindowLongW, SetWindowPos, WindowFromPoint,
@@ -269,6 +269,14 @@ unsafe extern "system" fn ds_query_continue_drag(
         return DRAGDROP_S_CANCEL;
     }
     if key_state & MK_LBUTTON == 0 {
+        // 松手时停在「打开 / 保存 / 选择文件夹」对话框上：这次拖放不给它处理。
+        // Windows 的对话框收到文件拖放要么什么都不做，要么把拖放循环卡在那里
+        // （对方线程在 Drop 里等我们，我们等它返回）。直接取消，交给
+        // `navigate_file_dialog` 把对话框跳到目标文件夹。
+        let (x, y) = cursor_position();
+        if file_dialog_at(x, y).is_some() {
+            return DRAGDROP_S_CANCEL;
+        }
         return DRAGDROP_S_DROP;
     }
     S_OK
@@ -641,6 +649,414 @@ fn send_keys(vk: u16) -> bool {
     let inputs = [key_input(vk, false), key_input(vk, true)];
     // SAFETY: two valid INPUT structures.
     unsafe { SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) == 2 }
+}
+
+/// 光标底下是不是「打开 / 保存 / 选择文件夹」这类系统对话框；是就返回它的顶层窗口。
+///
+/// 认法三样齐了才算：窗口类 `#32770`、底部有一个真正的路径输入框（文件对话框是
+/// id 1148 的「文件名」框，「选择文件夹」是 id 1152 的「文件夹」框）、并且画着
+/// Shell 的 DirectUI 内容区。自己画的对话框凑不齐这三样。
+pub fn file_dialog_at(x: i32, y: i32) -> Option<isize> {
+    let root = top_window_at(x, y)?;
+    is_file_dialog(root as isize).then_some(root as isize)
+}
+
+/// 当前前台窗口。
+pub fn foreground_window() -> isize {
+    // SAFETY: 纯查询。
+    unsafe { GetForegroundWindow() as isize }
+}
+
+/// 前台这个窗口是不是「打开」文件对话框（上传、选文件那种）。
+///
+/// 只认「打开」：另存为和「选择文件夹」里贴一张图片没有意义。
+pub fn is_file_open_dialog(hwnd: isize) -> bool {
+    if !is_file_dialog(hwnd) {
+        return false;
+    }
+    let dialog = hwnd as HWND;
+    // SAFETY: 纯查询。
+    let ok = unsafe { GetDlgItem(dialog, 1) };
+    if ok.is_null() {
+        return false;
+    }
+    let text = window_text(ok).to_lowercase();
+    text.contains("打开") || text.contains("open")
+}
+
+/// 窗口文字（拿不到就是空串）。
+pub fn window_text(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    // SAFETY: 缓冲区在调用期间有效。
+    let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..copied as usize])
+}
+
+/// 模拟按一次 Ctrl+V：热键被我们截下来但剪贴板里其实没有图片时，把粘贴还回去。
+pub fn send_ctrl_v() {
+    let down = [key_input(VK_CONTROL, false), key_input(VK_V, false)];
+    let up = [key_input(VK_V, true), key_input(VK_CONTROL, true)];
+    let _ = send_inputs(&down);
+    thread::sleep(Duration::from_millis(30));
+    let _ = send_inputs(&up);
+}
+
+/// 「打开」对话框在前台、剪贴板里又是图片时，把 Ctrl+V 临时接管过来。
+///
+/// 很多网站的上传框只给一个系统「打开」对话框，没有「粘贴上传」；而截图之后最想
+/// 做的偏偏就是 Ctrl+V。这里不装全局键盘钩子，只在**两个条件同时成立**时
+/// `RegisterHotKey` 占住 Ctrl+V：前台是「打开」对话框，且剪贴板里有图片。
+/// 条件一消失就立刻放开，其它时候 Ctrl+V 完全不受影响。
+///
+/// 按下时把图片存成临时文件，再把路径填进对话框并回车——文件对话框拿到一个文件
+/// 路径就会选中并打开它，上传框也就拿到了这张图。
+pub fn spawn_dialog_paste_watcher(paste_dir: PathBuf) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, MOD_CONTROL, VK_V,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY,
+    };
+
+    const HOTKEY_ID: i32 = 0x4842;
+
+    thread::spawn(move || {
+        let mut registered = false;
+        let mut last_check = Instant::now() - Duration::from_secs(1);
+        loop {
+            // 热键消息投递到注册它的线程，这条线程自己泵。
+            let mut message: MSG = unsafe { std::mem::zeroed() };
+            // SAFETY: 只读线程消息队列，不转移所有权。
+            while unsafe {
+                PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE)
+            } != 0
+            {
+                if message.message == WM_HOTKEY && message.wParam == HOTKEY_ID as usize {
+                    on_dialog_paste(&paste_dir);
+                }
+            }
+
+            if last_check.elapsed() >= Duration::from_millis(250) {
+                last_check = Instant::now();
+                let want = is_file_open_dialog(foreground_window())
+                    && crate::shell_ops::clipboard_has_image();
+                if want && !registered {
+                    // SAFETY: 标准热键注册，句柄为空表示挂到本线程。
+                    registered = unsafe {
+                        RegisterHotKey(std::ptr::null_mut(), HOTKEY_ID, MOD_CONTROL, VK_V as u32)
+                    } != 0;
+                } else if !want && registered {
+                    // SAFETY: 配对上面的注册。
+                    unsafe {
+                        UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID);
+                    }
+                    registered = false;
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    });
+}
+
+fn on_dialog_paste(paste_dir: &Path) {
+    let dialog = foreground_window();
+    if !is_file_open_dialog(dialog) {
+        return;
+    }
+    if !crate::shell_ops::clipboard_has_image() {
+        // 这中间剪贴板变了：把这次粘贴还给对话框。
+        send_ctrl_v();
+        return;
+    }
+    match crate::shell_ops::save_clipboard_image(paste_dir) {
+        Ok(Some(path)) => {
+            log::info!("dialog paste: {} -> dialog {dialog:#x}", path.display());
+            if let Err(error) = submit_dialog_path(dialog, &path, false) {
+                log::warn!("dialog paste: submit failed: {error}");
+            }
+        }
+        Ok(None) => log::warn!("dialog paste: clipboard has no image after all"),
+        Err(error) => log::warn!("dialog paste: save failed: {error}"),
+    }
+}
+
+/// 这个窗口是不是「打开 / 保存 / 选择文件夹」对话框（按窗口本身判断，不看坐标）。
+pub fn is_file_dialog(hwnd: isize) -> bool {
+    let dialog = hwnd as HWND;
+    if dialog.is_null() {
+        return false;
+    }
+    // SAFETY: 纯查询。
+    unsafe {
+        let mut buffer = [0u16; 64];
+        let copied = GetClassNameW(dialog, buffer.as_mut_ptr(), buffer.len() as i32);
+        if copied <= 0 || String::from_utf16_lossy(&buffer[..copied as usize]) != "#32770" {
+            return false;
+        }
+    }
+    find_dialog_edit(dialog).is_some() && has_child_class(dialog, "DirectUIHWND")
+}
+
+/// 对话框底部那个填路径的输入框。
+///
+/// 文件对话框里它在「文件名」下拉框里面（id 1148），「选择文件夹」对话框里是
+/// 一个单独的输入框（id 1152）。两个 id 都认，认到的是真正能写字的那一层 `Edit`。
+fn find_dialog_edit(dialog: HWND) -> Option<HWND> {
+    struct Search {
+        found: HWND,
+    }
+
+    unsafe fn class_is(hwnd: HWND, want: &str) -> bool {
+        let mut buffer = [0u16; 32];
+        let copied = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        copied > 0 && String::from_utf16_lossy(&buffer[..copied as usize]) == want
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam 是调用方传进来的 `&mut Search`。
+        let search = unsafe { &mut *(lparam as *mut Search) };
+        if !unsafe { class_is(hwnd, "Edit") } {
+            return TRUE;
+        }
+        let control = unsafe { GetDlgCtrlID(hwnd) };
+        // 现代对话框（文件名框 1148）和「选择文件夹」（1152）直接认 id。
+        let by_id = control == 1148 || control == 1152;
+        // 经典模板里文件名是一个普通下拉框，输入框在它里面、id 是 1001：
+        // 认「下拉框的直接子输入框」这条路。
+        let in_combo = unsafe {
+            let parent = GetParent(hwnd);
+            !parent.is_null() && class_is(parent, "ComboBox")
+        };
+        if by_id || in_combo {
+            search.found = hwnd;
+            return 0;
+        }
+        TRUE
+    }
+
+    let mut search = Search {
+        found: std::ptr::null_mut(),
+    };
+    // SAFETY: 回调只读窗口信息，`search` 在调用期间一直有效。
+    unsafe {
+        EnumChildWindows(dialog, Some(callback), &mut search as *mut Search as LPARAM);
+    }
+    (!search.found.is_null()).then_some(search.found)
+}
+
+/// 窗口里有没有某个类的子窗口（递归）。
+fn has_child_class(parent: HWND, class: &str) -> bool {
+    struct Search<'a> {
+        class: &'a str,
+        found: bool,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam 是调用方传进来的 `&mut Search`。
+        let search = unsafe { &mut *(lparam as *mut Search) };
+        let mut buffer = [0u16; 64];
+        let copied = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        if copied > 0 && String::from_utf16_lossy(&buffer[..copied as usize]) == search.class {
+            search.found = true;
+            return 0;
+        }
+        TRUE
+    }
+
+    let mut search = Search {
+        class,
+        found: false,
+    };
+    // SAFETY: 回调只读窗口信息，`search` 在调用期间一直有效。
+    unsafe {
+        EnumChildWindows(parent, Some(callback), &mut search as *mut Search as LPARAM);
+    }
+    search.found
+}
+
+/// 光标底下最上层的可见顶层窗口。
+///
+/// 不用 `WindowFromPoint`：它会给候选窗口发 `WM_NCHITTEST`，对方线程正忙着
+/// （比如刚处理完拖放的对话框）时调用方会一直等在那里——拖拽一结束主线程就卡死。
+/// 按 Z 序枚举 + 比较窗口矩形是纯查询，不惊动任何别的线程。
+pub fn top_window_at(x: i32, y: i32) -> Option<HWND> {
+    struct Search {
+        x: i32,
+        y: i32,
+        hit: HWND,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam 是调用方传进来的 `&mut Search`，只在这里用。
+        let search = unsafe { &mut *(lparam as *mut Search) };
+        if unsafe { IsWindowVisible(hwnd) } == 0 {
+            return TRUE;
+        }
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return TRUE;
+        }
+        if search.x >= rect.left
+            && search.x < rect.right
+            && search.y >= rect.top
+            && search.y < rect.bottom
+        {
+            search.hit = hwnd;
+            // EnumWindows 是自上而下的：第一个命中的就是最上面那个。
+            return 0;
+        }
+        TRUE
+    }
+
+    let mut search = Search {
+        x,
+        y,
+        hit: std::ptr::null_mut(),
+    };
+    // SAFETY: 回调只读窗口状态，`search` 在调用期间一直有效。
+    unsafe {
+        EnumWindows(Some(callback), &mut search as *mut Search as LPARAM);
+    }
+    (!search.hit.is_null()).then_some(search.hit)
+}
+
+/// 把文件对话框带到 `folder`：把路径写进它底部的输入框，再回车。
+///
+/// 这是照着同类工具（Lertaro / Listary 那一类）的做法来的：Windows 11 的对话框
+/// 收到文件拖放什么都不做，但它们自己认「输入框里写了个路径 + 回车」。
+/// 写框用 `WM_SETTEXT`（系统会替我们跨进程编组），回车用 `PostMessage`，
+/// 不依赖模拟键盘输入，也不会把内容打进别的窗口。
+///
+/// 写完会读回来核对：权限不够时系统会静默丢掉 `WM_SETTEXT`，那时候就别回车了。
+pub fn navigate_file_dialog(hwnd: isize, folder: &Path) -> Result<(), String> {
+    submit_dialog_path(hwnd, folder, true)
+}
+
+/// 把任意路径写进对话框的输入框并提交；`as_folder` 时带结尾反斜杠。
+///
+/// 「打开」对话框拿到一个文件路径就会选中并打开它——剪贴板里的图片粘进上传框
+/// 走的就是这条路（先把图片存成临时文件，再把路径交给对话框）。
+pub fn submit_dialog_path(hwnd: isize, path: &Path, as_folder: bool) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetDlgCtrlID, GetParent, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
+        SMTO_ABORTIFHUNG, WM_COMMAND, WM_GETTEXT, WM_KEYDOWN, WM_KEYUP, WM_SETTEXT,
+    };
+
+    const EN_CHANGE: u32 = 0x0300;
+
+    let dialog = hwnd as HWND;
+    if dialog.is_null() {
+        return Err("没有对话框窗口".to_string());
+    }
+    let edit = find_dialog_edit(dialog).ok_or_else(|| "对话框里没有路径输入框".to_string())?;
+
+    // 目录带结尾反斜杠：对话框据此知道「这是要进去的文件夹」，而不是一个文件名。
+    // 对话框只认反斜杠：配置里的路径可能是正斜杠。
+    let mut text = path.display().to_string().replace('/', "\\");
+    if as_folder && !text.ends_with('\\') {
+        text.push('\\');
+    }
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: 缓冲区以 NUL 结尾，调用期间一直有效；WM_SETTEXT 是系统替我们编组的消息。
+    let written = unsafe {
+        SendMessageTimeoutW(
+            edit,
+            WM_SETTEXT,
+            0,
+            wide.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1500,
+            std::ptr::null_mut(),
+        )
+    };
+    if written == 0 {
+        return Err("路径写不进对话框".to_string());
+    }
+
+    // 通知对话框「内容变了」：不通知的话「打开 / 选择文件夹」按钮还是灰的。
+    // SAFETY: 只发一条命令消息，句柄都来自上面的查询。
+    unsafe {
+        let parent = GetParent(edit);
+        if !parent.is_null() {
+            let control = GetDlgCtrlID(edit) as u32;
+            let command = ((EN_CHANGE << 16) | (control & 0xffff)) as usize;
+            SendMessageTimeoutW(
+                parent,
+                WM_COMMAND,
+                command,
+                edit as isize,
+                SMTO_ABORTIFHUNG,
+                1500,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    // 读回来核对：UIPI 拦下 WM_SETTEXT 时不会有任何报错，只会读到空。
+    let mut buffer = [0u16; 1024];
+    // SAFETY: 缓冲区在调用期间一直有效。
+    let read = unsafe {
+        SendMessageTimeoutW(
+            edit,
+            WM_GETTEXT,
+            buffer.len(),
+            buffer.as_mut_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1500,
+            std::ptr::null_mut(),
+        )
+    };
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    let current = if read == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..length])
+    };
+    if !current.eq_ignore_ascii_case(&text) {
+        return Err(format!("路径没写进对话框（读回「{current}」）"));
+    }
+
+    // 回车。挂到输入框所在线程的输入队列上，焦点才放得进去。
+    let edit_thread = unsafe { GetWindowThreadProcessId(edit, std::ptr::null_mut()) };
+    let this_thread = unsafe { GetCurrentThreadId() };
+    let attached = edit_thread != 0
+        && edit_thread != this_thread
+        && unsafe { AttachThreadInput(this_thread, edit_thread, 1) } != 0;
+    // SAFETY: 句柄都有效；PostMessage 不等待，对话框忙也不会卡住我们。
+    unsafe {
+        SetForegroundWindow(dialog);
+        SetFocus(edit);
+        let edit_id = GetDlgCtrlID(edit);
+        let modern = edit_id == 1152 || has_child_class(dialog, "ComboBoxEx32");
+        if modern {
+            // 现代对话框（文件名框 1148 / 选择文件夹 1152）：回车发给输入框。
+            PostMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+            PostMessageW(edit, WM_KEYUP, VK_RETURN as usize, 0);
+        } else {
+            // 经典模板（文件名是一个普通下拉框）：回车要发给下拉框本身，
+            // 由它转给对话框的默认按钮，「输入框里是个目录」才会被解析成
+            // 「进到这个目录」。
+            thread::sleep(Duration::from_millis(120));
+            let combo = GetParent(edit);
+            if !combo.is_null() {
+                PostMessageW(combo, WM_KEYDOWN, VK_RETURN as usize, 0);
+                PostMessageW(combo, WM_KEYUP, VK_RETURN as usize, 0);
+            }
+        }
+    }
+    if attached {
+        // SAFETY: 配对上面的挂接。
+        unsafe {
+            AttachThreadInput(this_thread, edit_thread, 0);
+        }
+    }
+    Ok(())
 }
 
 /// Toggle `WS_EX_NOACTIVATE` on a window.
