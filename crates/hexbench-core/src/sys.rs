@@ -685,7 +685,7 @@ pub fn is_file_open_dialog(hwnd: isize) -> bool {
 }
 
 /// 窗口文字（拿不到就是空串）。
-pub fn window_text(hwnd: HWND) -> String {
+fn window_text(hwnd: HWND) -> String {
     let mut buffer = [0u16; 256];
     // SAFETY: 缓冲区在调用期间有效。
     let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };

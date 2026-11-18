@@ -4428,7 +4428,7 @@ fn run_file_drag(app: &AppHandle, label: &str, targets: &[PathBuf]) -> Result<u3
                     drop_event.as_str(),
                     serde_json::json!({ "x": x, "y": y, "paths": list }),
                 );
-            } else if let Some(folder) = drop_folder(&targets) {
+            } else if let Some(folder) = drop_folder(targets) {
                 // 落在别的窗口上：如果那是「打开 / 保存」对话框，就把它带到文件所在的
                 // 文件夹——Windows 自己收到文件拖放什么也不做，连目录都不切。
                 // 判断和打字都放后台：主线程刚从 DoDragDrop 里出来，不能再跟别的窗口
