@@ -60,6 +60,7 @@ const demoConfig: Config = {
     keepOnShowDesktop: true,
     snap: true,
     snapGrid: false,
+    hideIconsOnDoubleClick: true,
     contextMenu: false,
     opacity: 70,
     frosted: true,
