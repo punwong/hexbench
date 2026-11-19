@@ -7595,6 +7595,11 @@ fn set_fences_visible(visible: bool) {
     }
 }
 
+/// 双击桌面空白处隐藏 / 恢复桌面图标和格子。
+///
+/// 用轮询而不是鼠标钩子：每 20ms 看一眼左键状态，两次按下间隔 ≤450ms、位置几乎
+/// 没变就算双击。点图标要靠 Shell 的选中数排除——第二次按下时上一次点击已经完成，
+/// 如果它选中了图标（选中数 > 0），那是在双击图标，交给 Explorer 处理。
 fn spawn_desktop_double_click(shared: Arc<Mutex<Shared>>) {
     thread::spawn(move || {
         let mut was_down = false;
@@ -7608,7 +7613,14 @@ fn spawn_desktop_double_click(shared: Arc<Mutex<Shared>>) {
             let down = enabled && hexbench_core::sys::left_button_down();
             if down && !was_down {
                 let (x, y) = hexbench_core::sys::cursor_position();
-                if hexbench_core::sys::is_desktop_at(x, y) {
+                let on_desktop = hexbench_core::sys::is_desktop_at(x, y);
+                // 第一次点击之后有没有选中图标：有就说明点在图标上，交给 Explorer。
+                let selected = if on_desktop {
+                    hexbench_core::sys::desktop_selection_count()
+                } else {
+                    0
+                };
+                if on_desktop && selected == 0 {
                     let now = Instant::now();
                     let repeated = last.is_some_and(|(at, px, py)| {
                         now.duration_since(at) <= Duration::from_millis(450)
@@ -7630,18 +7642,12 @@ fn spawn_desktop_double_click(shared: Arc<Mutex<Shared>>) {
                 } else {
                     last = None;
                 }
-            } else if !down && was_down && last.is_some() {
-                // 松开之后看一眼：这一下要是选中了图标（点的是图标，不是空白），
-                // 就别把它当成双击的第一次。
-                thread::sleep(Duration::from_millis(40));
-                if hexbench_core::sys::desktop_selection_count() > 0 {
-                    last = None;
-                }
             }
             was_down = down;
         }
     });
 }
+
 
 
 fn spawn_engine(shared: Arc<Mutex<Shared>>) {
@@ -8206,7 +8212,8 @@ async fn debug_desktop_icons(
     }
     let (x, y) = (x.unwrap_or(0), y.unwrap_or(0));
     Ok(format!(
-        "at {x},{y} desktop={} selected={} list_visible={}",
+        "at {x},{y} top={:?} desktop={} selected={} list_visible={}",
+        hexbench_core::sys::top_class_at(x, y),
         hexbench_core::sys::is_desktop_at(x, y),
         hexbench_core::sys::desktop_selection_count(),
         hexbench_core::sys::desktop_list_visible()

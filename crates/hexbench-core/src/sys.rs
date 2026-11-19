@@ -3067,12 +3067,43 @@ pub fn desktop_list_visible() -> bool {
 }
 
 /// 这个点是不是落在桌面背景上（墙纸那层，不是别的窗口）。
+/// 这个点是不是落在桌面上。
+///
+/// 用 `WindowFromPoint`，不是按 z-order 找矩形：桌面上常常盖着**点击穿透**的全屏
+/// 助手窗口（本机就有一个 `Windows.UI.Core.CoreWindow`，标题「Windows 输入体验」，
+/// 盖满整屏、`IsWindowVisible` 为真），按矩形找会把它当成最上层，于是一律判不出
+/// 「这是桌面」。`WindowFromPoint` 会跳过这类透明窗口，直接落到桌面图标列表上
+/// （参考实现 PecoFence 用的也是这个）。
 pub fn is_desktop_at(x: i32, y: i32) -> bool {
-    let Some(hwnd) = top_window_at(x, y) else {
-        return false;
-    };
-    let class = class_name(hwnd);
-    class == "Progman" || class == "WorkerW"
+    use windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+
+    // SAFETY: 纯查询。
+    unsafe {
+        let under = WindowFromPoint(POINT { x, y });
+        if under.is_null() {
+            return false;
+        }
+        let root = GetAncestor(under, GA_ROOT);
+        let root = if root.is_null() { under } else { root };
+        let class = class_name(root);
+        class == "Progman" || class == "WorkerW"
+    }
+}
+
+/// 这个点实际落在哪个窗口上（自检 / 排错用）：返回「类名。
+pub fn top_class_at(x: i32, y: i32) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+
+    // SAFETY: 纯查询。
+    unsafe {
+        let under = WindowFromPoint(POINT { x, y });
+        if under.is_null() {
+            return None;
+        }
+        let root = GetAncestor(under, GA_ROOT);
+        let root = if root.is_null() { under } else { root };
+        Some(class_name(root))
+    }
 }
 
 
