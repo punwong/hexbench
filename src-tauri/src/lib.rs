@@ -6168,6 +6168,10 @@ fn describe_foreground() -> String {
 }
 
 fn fence_watchdog(_app: &AppHandle, desktop: &DesktopSettings, show_desktop: &mut bool) {
+    // 双击桌面收起了格子：这一轮什么都别做，否则一秒内又被「捞」回来。
+    if FENCES_RESTING.load(Ordering::SeqCst) {
+        return;
+    }
     let hwnds: Vec<isize> = NATIVE_FENCES
         .lock()
         .ok()
@@ -7570,6 +7574,76 @@ fn sync_tray_checks(app: &AppHandle) {
     }
 }
 
+/// 格子是不是被「双击桌面收起」有意藏起来了。
+///
+/// 置位期间看门狗不许把它们重新显示出来（平时它负责把藏起来的格子捞回来，
+/// 那是 Win+D 和异常隐藏的兜底）。
+static FENCES_RESTING: AtomicBool = AtomicBool::new(false);
+
+/// 显示 / 隐藏所有桌面格子。
+fn set_fences_visible(visible: bool) {
+    FENCES_RESTING.store(!visible, Ordering::SeqCst);
+    let host = NATIVE_FENCES.lock().ok().and_then(|slot| slot.clone());
+    let Some(host) = host else {
+        log::warn!("desktop: no native fences to {}", if visible { "show" } else { "hide" });
+        return;
+    };
+    let hwnds = host.hwnds();
+    log::info!("desktop: fences {} -> {} window(s)", if visible { "show" } else { "hide" }, hwnds.len());
+    for hwnd in hwnds {
+        hexbench_core::sys::set_window_visible(hwnd, visible);
+    }
+}
+
+fn spawn_desktop_double_click(shared: Arc<Mutex<Shared>>) {
+    thread::spawn(move || {
+        let mut was_down = false;
+        let mut last: Option<(Instant, i32, i32)> = None;
+        loop {
+            thread::sleep(Duration::from_millis(20));
+            let enabled = shared
+                .lock()
+                .map(|state| state.config.desktop.hide_icons_on_double_click)
+                .unwrap_or(false);
+            let down = enabled && hexbench_core::sys::left_button_down();
+            if down && !was_down {
+                let (x, y) = hexbench_core::sys::cursor_position();
+                if hexbench_core::sys::is_desktop_at(x, y) {
+                    let now = Instant::now();
+                    let repeated = last.is_some_and(|(at, px, py)| {
+                        now.duration_since(at) <= Duration::from_millis(450)
+                            && (x - px).abs() <= 6
+                            && (y - py).abs() <= 6
+                    });
+                    if repeated {
+                        last = None;
+                        // 图标和格子一起收起来 / 一起放出来。
+                        let was_hidden = hexbench_core::sys::desktop_icons_hidden();
+                        if let Err(error) = hexbench_core::sys::toggle_desktop_icons() {
+                            log::warn!("desktop: toggle icons failed: {error}");
+                        }
+                        set_fences_visible(was_hidden);
+                        log::info!("desktop: double-click -> fences visible={was_hidden}");
+                    } else {
+                        last = Some((now, x, y));
+                    }
+                } else {
+                    last = None;
+                }
+            } else if !down && was_down && last.is_some() {
+                // 松开之后看一眼：这一下要是选中了图标（点的是图标，不是空白），
+                // 就别把它当成双击的第一次。
+                thread::sleep(Duration::from_millis(40));
+                if hexbench_core::sys::desktop_selection_count() > 0 {
+                    last = None;
+                }
+            }
+            was_down = down;
+        }
+    });
+}
+
+
 fn spawn_engine(shared: Arc<Mutex<Shared>>) {
     thread::spawn(move || {
         let initial = shared.lock().unwrap().config.clone();
@@ -8107,6 +8181,38 @@ fn probe_state(app: &AppHandle) -> String {
     format!("lock_free={lock_free}")
 }
 
+/// 自检用：桌面图标切换 / 命中测试的探针。
+#[tauri::command]
+async fn debug_desktop_icons(
+    action: String,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<String, String> {
+    if !cfg!(debug_assertions) {
+        return Err("disabled".to_string());
+    }
+    if action == "toggle" {
+        hexbench_core::sys::toggle_desktop_icons()?;
+        return Ok("toggled".to_string());
+    }
+    if action == "lists" {
+        return Ok(hexbench_core::sys::debug_desktop_lists());
+    }
+    if action == "state" {
+        return Ok(format!(
+            "icons_hidden={}",
+            hexbench_core::sys::desktop_icons_hidden()
+        ));
+    }
+    let (x, y) = (x.unwrap_or(0), y.unwrap_or(0));
+    Ok(format!(
+        "at {x},{y} desktop={} selected={} list_visible={}",
+        hexbench_core::sys::is_desktop_at(x, y),
+        hexbench_core::sys::desktop_selection_count(),
+        hexbench_core::sys::desktop_list_visible()
+    ))
+}
+
 /// 自检用：直接让一个文件对话框跳到指定文件夹（不走拖放，单独测识别 + 填路径 + 回车）。
 #[tauri::command]
 async fn debug_navigate_dialog(hwnd: i64, folder: String) -> Result<String, String> {
@@ -8482,6 +8588,7 @@ pub fn run() {
     debug_native_state,
     debug_main_desktop,
     debug_navigate_dialog,
+    debug_desktop_icons,
     debug_native_bench,
     debug_native_drop_target,
             launcher_save_location,
@@ -8543,6 +8650,7 @@ pub fn run() {
             }
 
             spawn_engine(engine_shared.clone());
+            spawn_desktop_double_click(engine_shared.clone());
 
             // 系统「打开」对话框里 Ctrl+V 直接贴剪贴板里的图片（上传框的常见痛点）。
             if let Some(dir) = paste_dir() {

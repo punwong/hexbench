@@ -2270,6 +2270,15 @@ export function DesktopPage({
             onChange={(value) => update({ desktop: { snapGrid: value } })}
           />
         </Row>
+        <Row
+          label="双击桌面全部收起"
+          hint="双击桌面空白处把桌面图标和格子一起收起来，再双击一次恢复；双击图标本身不受影响"
+        >
+          <Toggle
+            checked={desktop.hideIconsOnDoubleClick}
+            onChange={(value) => update({ desktop: { hideIconsOnDoubleClick: value } })}
+          />
+        </Row>
       </Card>
 
       <Card

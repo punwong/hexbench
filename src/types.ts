@@ -145,6 +145,8 @@ export interface DesktopSettings {
   keepOnShowDesktop: boolean;
   snap: boolean;
   snapGrid: boolean;
+  /** 双击桌面空白处隐藏 / 恢复桌面图标 */
+  hideIconsOnDoubleClick: boolean;
   /** 桌面右键菜单里挂一个 HexBench 子菜单（本机注册表状态） */
   contextMenu: boolean;
   /** 卡片不透明度百分比（30–100）：越小背后透得越多 */

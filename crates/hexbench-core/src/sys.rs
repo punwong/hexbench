@@ -2956,6 +2956,254 @@ pub fn shell_icon_host() -> isize {
     }
 }
 
+/// 桌面图标列表：`SHELLDLL_DefView` 里的 `SysListView32`。
+fn desktop_list_view() -> Option<(HWND, HWND)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowExW;
+
+    let host = shell_icon_host();
+    if host == 0 {
+        return None;
+    }
+    let defview_class = wide("SHELLDLL_DefView");
+    let list_class = wide("SysListView32");
+    // SAFETY: 全是标准窗口查询。
+    unsafe {
+        let defview = FindWindowExW(host as HWND, std::ptr::null_mut(), defview_class.as_ptr(), std::ptr::null());
+        if defview.is_null() {
+            return None;
+        }
+        let list = FindWindowExW(defview, std::ptr::null_mut(), list_class.as_ptr(), std::ptr::null());
+        if list.is_null() {
+            return None;
+        }
+        Some((defview, list))
+    }
+}
+
+/// 自检用：把桌面相关的窗口列一遍（宿主、DefView、列表视图、图标数）。
+pub fn debug_desktop_lists() -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumChildWindows, SendMessageW};
+
+    const LVM_GETITEMCOUNT: u32 = 0x1004;
+
+    unsafe extern "system" fn find_list(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam 是调用方传进来的 &mut HWND。
+        let found = unsafe { &mut *(lparam as *mut HWND) };
+        if class_name(hwnd) == "SysListView32" {
+            *found = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    unsafe extern "system" fn find_defview(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: 同上。
+        let found = unsafe { &mut *(lparam as *mut HWND) };
+        if class_name(hwnd) == "SHELLDLL_DefView" {
+            *found = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    struct Search {
+        rows: Vec<String>,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam 是调用方传进来的 &mut Search。
+        let search = unsafe { &mut *(lparam as *mut Search) };
+        let class = class_name(hwnd);
+        if class != "Progman" && class != "WorkerW" {
+            return 1;
+        }
+        // SAFETY: 纯查询。
+        unsafe {
+            let mut list: HWND = std::ptr::null_mut();
+            EnumChildWindows(hwnd, Some(find_list), &mut list as *mut HWND as LPARAM);
+            let mut defview: HWND = if list.is_null() {
+                std::ptr::null_mut()
+            } else {
+                GetParent(list)
+            };
+            if defview.is_null() {
+                EnumChildWindows(hwnd, Some(find_defview), &mut defview as *mut HWND as LPARAM);
+            }
+            let count = if list.is_null() {
+                -1
+            } else {
+                SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as i32
+            };
+            search.rows.push(format!(
+                "{class} host={} defview={} visible={} list={} items={count}",
+                hwnd as isize,
+                defview as isize,
+                IsWindowVisible(hwnd),
+                list as isize
+            ));
+        }
+        1
+    }
+
+    let mut search = Search { rows: Vec::new() };
+    // SAFETY: 回调只读窗口信息。
+    unsafe {
+        EnumWindows(Some(callback), &mut search as *mut Search as LPARAM);
+    }
+    if search.rows.is_empty() {
+        "none".to_string()
+    } else {
+        search.rows.join(" | ")
+    }
+}
+
+/// 桌面图标列表当前是否可见（自检 / 排错用）。
+pub fn desktop_list_visible() -> bool {
+    let Some((_, list)) = desktop_list_view() else {
+        return false;
+    };
+    // SAFETY: 纯查询。
+    unsafe { IsWindowVisible(list) != 0 }
+}
+
+/// 这个点是不是落在桌面背景上（墙纸那层，不是别的窗口）。
+pub fn is_desktop_at(x: i32, y: i32) -> bool {
+    let Some(hwnd) = top_window_at(x, y) else {
+        return false;
+    };
+    let class = class_name(hwnd);
+    class == "Progman" || class == "WorkerW"
+}
+
+
+/// 当前选中的桌面图标有几项。
+///
+/// 「这次点击是不是点在图标上」就靠它判断：点图标会选中它（选中有 1 项），
+/// 点空白处会把选中清空（0 项）。Win11 的桌面图标已经不在 `SysListView32` 里，
+/// UIA 也不把单个图标暴露出来，Shell 视图自己的选中集合是最可靠的口径。
+pub fn desktop_selection_count() -> usize {
+    use windows::core::Interface;
+    use windows::Win32::UI::Shell::{IFolderView, SVGIO_SELECTION};
+
+    let Ok(folder) = desktop_folder_view() else {
+        return 0;
+    };
+    // SAFETY: 标准 Shell 查询。
+    let count = folder.cast::<IFolderView>()
+        .ok()
+        .and_then(|view| unsafe { view.ItemCount(SVGIO_SELECTION) }.ok())
+        .unwrap_or(0);
+    count.max(0) as usize
+}
+
+/// 桌面视图（`IFolderView2`）：读 / 改「显示桌面图标」都走它。
+fn desktop_folder_view() -> Result<windows::Win32::UI::Shell::IFolderView2, String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, IServiceProvider, CLSCTX_ALL};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Shell::{
+        IFolderView2, IShellBrowser, IShellView, ShellWindows, SID_STopLevelBrowser, SWC_DESKTOP,
+        SWFO_NEEDDISPATCH,
+    };
+
+    // SAFETY: 当前线程的 COM 初始化可以重复调用；接口调用都是标准 Shell 查询。
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let shell: windows::Win32::UI::Shell::IShellWindows =
+            CoCreateInstance(&ShellWindows, None, CLSCTX_ALL).map_err(|error| error.to_string())?;
+        // CSIDL_DESKTOP = 0：桌面视图。
+        let location = VARIANT::from(0i32);
+        let root = VARIANT::default();
+        let mut hwnd = 0i32;
+        let dispatch = shell
+            .FindWindowSW(
+                &location,
+                &root,
+                SWC_DESKTOP,
+                &mut hwnd,
+                SWFO_NEEDDISPATCH,
+            )
+            .map_err(|error| error.to_string())?;
+        let provider: IServiceProvider = dispatch.cast().map_err(|error| error.to_string())?;
+        let browser: IShellBrowser = provider
+            .QueryService(&SID_STopLevelBrowser)
+            .map_err(|error| error.to_string())?;
+        let view: IShellView = browser
+            .QueryActiveShellView()
+            .map_err(|error| error.to_string())?;
+        view.cast::<IFolderView2>().map_err(|error| error.to_string())
+    }
+}
+
+/// 桌面图标现在是不是藏起来了。
+pub fn desktop_icons_hidden() -> bool {
+    use windows::Win32::UI::Shell::FWF_NOICONS;
+
+    let Ok(folder) = desktop_folder_view() else {
+        return false;
+    };
+    // SAFETY: 标准 Shell 查询。
+    let flags = unsafe { folder.GetCurrentFolderFlags() }.unwrap_or(0);
+    flags & FWF_NOICONS.0 as u32 != 0
+}
+
+/// 隐藏 / 恢复桌面图标。
+///
+/// 走 Shell 自己的视图接口（`IFolderView2::SetCurrentFolderFlags(FWF_NOICONS)`），
+/// 和桌面右键菜单里那个「显示桌面图标」是同一个开关：切换后马上生效，也能读回当前值。
+/// 之前试过向 `SHELLDLL_DefView` 发 `WM_COMMAND 0x7402`（老办法），Win11 上没反应。
+pub fn toggle_desktop_icons() -> Result<(), String> {
+    use windows::Win32::UI::Shell::FWF_NOICONS;
+
+    let folder = desktop_folder_view()?;
+    let no_icons = FWF_NOICONS.0 as u32;
+    // SAFETY: 标准 Shell 查询 + 设置。
+    unsafe {
+        let flags = folder
+            .GetCurrentFolderFlags()
+            .map_err(|error| error.to_string())?;
+        let hidden = flags & no_icons != 0;
+        let next = if hidden { 0 } else { no_icons };
+        folder
+            .SetCurrentFolderFlags(no_icons, next)
+            .map_err(|error| error.to_string())?;
+        log::info!(
+            "desktop: icons {}",
+            if hidden { "shown" } else { "hidden" }
+        );
+    }
+    Ok(())
+}
+
+/// 显示 / 隐藏一个窗口（不抢焦点、不改位置大小）。
+///
+/// 用 `SetWindowPos` 的 `SWP_SHOWWINDOW` / `SWP_HIDEWINDOW`，不用 `ShowWindow`：
+/// 格子窗口上 `ShowWindow(SW_HIDE)` 会被抹掉（窗口自己那条显示路径会把它重新显示
+/// 出来），`SetWindowPos` 这一条实测能把格子真正藏起来。
+pub fn set_window_visible(hwnd: isize, visible: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW,
+    };
+
+    if hwnd == 0 {
+        return;
+    }
+    let visibility = if visible { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
+    // SAFETY: 句柄由调用方保证有效；只改可见性。
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | visibility,
+        );
+    }
+}
+
 /// 把窗口放到所有普通窗口的最底下（桌面宿主之上）。
 pub fn send_to_bottom(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;

@@ -336,6 +336,8 @@ pub struct DesktopSettings {
     pub snap: bool,
     /// 额外的 8px 网格吸附（逻辑像素）；只影响位置。
     pub snap_grid: bool,
+    /// 双击桌面空白处隐藏 / 恢复桌面图标（和酷呆桌面那种一样）。
+    pub hide_icons_on_double_click: bool,
     /// 在桌面右键菜单里挂一个 HexBench 子菜单（默认开）。
     ///
     /// 这是**本机**的事（要写注册表），同步时以本机为准。设置页没有这个开关；
@@ -358,6 +360,7 @@ impl Default for DesktopSettings {
             keep_on_show_desktop: true,
             snap: true,
             snap_grid: false,
+            hide_icons_on_double_click: true,
             context_menu: true,
             // 70% 是照壁纸调出来的：磨砂看得出来，字也清楚。
             opacity: 70,
