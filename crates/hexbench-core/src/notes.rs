@@ -284,8 +284,11 @@ fn image_matches(body: &str) -> Vec<(usize, usize, &str)> {
     while let Some(offset) = body[scan..].find("![") {
         let start = scan + offset;
         let after = &body[start + 2..];
-        let Some(alt_end) = after.find("](") else {
-            break;
+        // 只在这一行里找 `](`：否则正文里一个孤立的 `![` 会把后面真正的图片整个吞掉。
+        let line_end = after.find('\n').unwrap_or(after.len());
+        let Some(alt_end) = after[..line_end].find("](") else {
+            scan = start + 2;
+            continue;
         };
         let target_start = start + 2 + alt_end + 2;
         let target = &body[target_start..];
@@ -294,6 +297,7 @@ fn image_matches(body: &str) -> Vec<(usize, usize, &str)> {
         let mut end = None;
         for (index, ch) in target.char_indices() {
             match ch {
+                '\n' => break,
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;

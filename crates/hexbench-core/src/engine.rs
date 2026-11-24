@@ -134,7 +134,7 @@ impl Engine {
         None
     }
 
-    fn guard_reason(&mut self, x: i32, y: i32) -> Option<&'static str> {
+    fn guard_reason(&mut self, x: i32, y: i32, in_band: bool) -> Option<&'static str> {
         let guard = &self.config.guard;
 
         // Opening the input desktop is comparatively expensive; twice a second
@@ -150,7 +150,7 @@ impl Engine {
             return Some("button");
         }
 
-        if guard.exclude_taskbar && sys::cursor_over_taskbar(x, y) {
+        if guard.exclude_taskbar && in_band && sys::cursor_over_taskbar(x, y) {
             return Some("taskbar");
         }
         // Process lookup opens a handle; only do it when a list exists, and
@@ -200,9 +200,13 @@ impl Engine {
         };
         tick.cursor = Some((x, y));
 
-        let guard = self.guard_reason(x, y);
+        // 先算命中（纯几何、便宜）：只有真贴着触发带才去问任务栏。
+        // `cursor_over_taskbar` 用的是 `WindowFromPoint`，它会给前台窗口发
+        // WM_NCHITTEST——前台卡死时会把引擎线程一起拖住，光标远离边缘时白做。
+        let probe = self.hit_at(x, y);
+        let guard = self.guard_reason(x, y, probe.is_some());
         tick.guard = guard;
-        let hit = if guard.is_none() { self.hit_at(x, y) } else { None };
+        let hit = if guard.is_none() { probe } else { None };
         tick.hit = hit;
 
         let fire = self.machine.step(hit, at_ms, self.timing());

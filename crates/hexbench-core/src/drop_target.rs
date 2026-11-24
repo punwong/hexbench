@@ -715,6 +715,9 @@ fn register_one(hwnd: isize, route: isize) -> Result<(), String> {
         unsafe { drop(Box::from_raw(raw)) };
         return Err(format!("RegisterDragDrop 0x{result:08x}"));
     }
+    // 注册成功后 OLE 自己持有一份引用（RegisterDragDrop 会 AddRef）：把我们这份
+    // 还掉，否则每次登记都泄漏一个 Target，反复建删格子会稳定累积。
+    unsafe { release(raw as *mut c_void) };
     if let Ok(mut list) = ATTACHED.lock() {
         // SAFETY: 无参数、无副作用。
         list.push((hwnd, route, unsafe { GetCurrentThreadId() }));

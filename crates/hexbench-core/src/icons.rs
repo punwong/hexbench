@@ -326,7 +326,11 @@ pub fn cached_icon_key(path: &Path) -> Option<Option<String>> {
     let file = cache_file(&key)?;
     if file.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
         // 更新访问时间，清理时按「最久没用」淘汰。
-        let _ = std::fs::File::open(&file)
+        // 只读句柄改不了时间戳（需要 FILE_WRITE_ATTRIBUTES）：以前这次 touch
+        // 每次都静默失败，淘汰顺序其实一直是「最早写入」而不是「最久没用」。
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
             .and_then(|handle| handle.set_modified(std::time::SystemTime::now()));
         remember(path, stamp, Some(key.clone()));
         Some(Some(key))

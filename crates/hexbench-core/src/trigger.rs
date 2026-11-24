@@ -77,6 +77,8 @@ pub struct Machine {
     since: u64,
     armed: Option<Hit>,
     last_fire: Option<u64>,
+    /// 看门狗这次只给「额外一次」机会：光标一直停在触发带里时不再每 3 秒切一次桌面。
+    watchdog_used: bool,
 }
 
 impl Default for Machine {
@@ -87,7 +89,7 @@ impl Default for Machine {
 
 impl Machine {
     pub fn new() -> Self {
-        Self { phase: Phase::Idle, since: 0, armed: None, last_fire: None }
+        Self { phase: Phase::Idle, since: 0, armed: None, last_fire: None, watchdog_used: false }
     }
 
     pub fn is_idle(&self) -> bool {
@@ -134,15 +136,24 @@ impl Machine {
                         self.phase = Phase::Disarmed;
                         self.armed = None;
                         self.last_fire = Some(now_ms);
+                        self.watchdog_used = false;
                         return Some(Fire { hit: h, at_ms: now_ms });
                     }
                 }
             },
             Phase::Disarmed => {
-                let stalled = now_ms.saturating_sub(self.last_fire.unwrap_or(now_ms))
-                    >= DISARMED_WATCHDOG_MS;
-                if hit.is_none() || stalled {
+                if hit.is_none() {
+                    // 离开触发带：正常复位，看门狗的机会也还回去。
                     self.phase = Phase::Idle;
+                    self.watchdog_used = false;
+                } else if !self.watchdog_used
+                    && now_ms.saturating_sub(self.last_fire.unwrap_or(now_ms))
+                        >= DISARMED_WATCHDOG_MS
+                {
+                    // 光标一直没离开（比如「向内推」关着，或者推不动）：只额外给一次
+                    // 机会，否则会每 3 秒切一次桌面。
+                    self.phase = Phase::Idle;
+                    self.watchdog_used = true;
                 }
             }
         }

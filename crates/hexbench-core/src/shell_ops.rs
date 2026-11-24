@@ -826,7 +826,10 @@ pub fn thumbnail_cached_rgba(path: &Path, size: u32) -> Option<(Vec<u8>, u32, u3
         cache
             .GetThumbnail(&item, size, WTS_INCACHEONLY, Some(&mut thumb), None, None)
             .ok()?;
-        let bitmap = thumb?.GetSharedBitmap().ok()?;
+        // thumb 必须活到读完之后：ISharedBitmap 只是位图的引用计数包装，
+        // 一释放位图就可能被系统回收（之前写成 `thumb?` 临时值，读的时候已经无效）。
+        let thumb = thumb?;
+        let bitmap = thumb.GetSharedBitmap().ok()?;
         bitmap_to_rgba(bitmap)
     }
 }

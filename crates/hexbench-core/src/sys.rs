@@ -657,8 +657,20 @@ fn send_keys(vk: u16) -> bool {
 /// id 1148 的「文件名」框，「选择文件夹」是 id 1152 的「文件夹」框）、并且画着
 /// Shell 的 DirectUI 内容区。自己画的对话框凑不齐这三样。
 pub fn file_dialog_at(x: i32, y: i32) -> Option<isize> {
-    let root = top_window_at(x, y)?;
-    is_file_dialog(root as isize).then_some(root as isize)
+    use windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+
+    // 和 is_desktop_at 同一个口径：按 z-order 找矩形会被「点击穿透的全屏窗口」
+    // 骗过去（本机就有一个盖满整屏的 CoreWindow），WindowFromPoint 会跳过它们。
+    // SAFETY: 纯查询。
+    unsafe {
+        let under = WindowFromPoint(POINT { x, y });
+        if under.is_null() {
+            return None;
+        }
+        let root = GetAncestor(under, GA_ROOT);
+        let root = if root.is_null() { under } else { root };
+        is_file_dialog(root as isize).then_some(root as isize)
+    }
 }
 
 /// 当前前台窗口。
