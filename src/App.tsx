@@ -208,7 +208,10 @@ export default function App() {
   // background. The sidebar then only ever offers a single「安装」action.
   useEffect(() => {
     if (updatePhase !== "available" || !updateVersion) return;
-    if (updateVersion === config?.updates.dismissedVersion) return;
+    // 配置还没加载时 `dismissedVersion` 是 undefined：这时候判断「被忽略了没有」
+    // 一定不相等，会照样把用户忽略掉的版本下载一遍。
+    if (!config) return;
+    if (updateVersion === config.updates.dismissedVersion) return;
     void runDownload();
   }, [updatePhase, updateVersion, config?.updates.dismissedVersion, runDownload]);
 

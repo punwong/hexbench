@@ -365,6 +365,8 @@ function Launcher() {
   // 编辑器是什么时候打开的：单击卡片就编辑，双击的第二下会落到刚出来的遮罩上，
   // 刚打开的这一小会儿不认「点外面关闭」，不然一双击编辑器就闪没了。
   const draftOpenedAt = useRef(0);
+  /// 草稿的「代」：切换草稿时加一，用来丢弃排队里属于上一份的自动保存。
+  const draftGeneration = useRef(0);
   // 正文的撤销 / 重做：编辑器没有保存按钮，撤销就是唯一的退路。
   const noteBody = useTextHistory("");
   const noteBodyRef = useRef("");
@@ -1336,8 +1338,15 @@ function Launcher() {
         if (!(image.path in iconRef.current)) wanted.push(image.path);
       }
     }
+    // 编辑器里会显示这条笔记的全部图片：只预取前三张的话，第四张起永远是占位符。
+    if (draft?.id) {
+      const editing = notes.find((note) => note.id === draft.id);
+      for (const image of editing?.images ?? []) {
+        if (!(image.path in iconRef.current)) wanted.push(image.path);
+      }
+    }
     if (wanted.length) fillIcons(wanted);
-  }, [scope, notes, fillIcons]);
+  }, [scope, notes, draft, fillIcons]);
 
   // 拖放回调在挂载时注册：这里把「现在是不是收藏视图」和「把图放进收藏」塞进去。
   useEffect(() => {
@@ -1407,6 +1416,7 @@ function Launcher() {
 
   const newNote = useCallback(() => {
     setConfirmDelete(null);
+    draftGeneration.current += 1;
     draftOpenedAt.current = Date.now();
     noteBody.reset("");
     noteBodyRef.current = "";
@@ -1421,6 +1431,7 @@ function Launcher() {
       setConfirmDelete(null);
       try {
         const file = await invoke<NoteFile>("notes_read", { id: note.id });
+        draftGeneration.current += 1;
         draftOpenedAt.current = Date.now();
         noteBody.reset(file.body);
         noteBodyRef.current = file.body;
@@ -1459,7 +1470,14 @@ function Launcher() {
       return Promise.resolve();
     }
     setNoteSave("saving");
+    // 入队时记下这是哪一份草稿：排队期间的保存可能已经换人了。
+    const generation = draftGeneration.current;
     const run = async () => {
+      if (draftGeneration.current !== generation) {
+        // 已经切到别的草稿 / 关掉了编辑器：这条内容属于上一份，丢掉，
+        // 否则会拿新草稿的 id 写旧正文（数据损坏）。
+        return;
+      }
       try {
         let id = noteSaveIdRef.current;
         if (!id) {
@@ -1509,6 +1527,8 @@ function Launcher() {
   /** 关编辑器：先把最后这一下改动排进保存队列，再收起遮罩。 */
   const closeDraft = useCallback(() => {
     if (draftRef.current) void persistDraft();
+    // 关掉编辑器也算换了一份草稿：排队里的保存不该再写进下一条笔记。
+    draftGeneration.current += 1;
     setDraft(null);
   }, [persistDraft]);
 
@@ -1936,6 +1956,7 @@ function Launcher() {
     const stop = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
     };
     // 没拖起来就是一次普通点击：多选里点中已选中的一项，松手后收成只选它
     // （和资源管理器一致）；真拖起来了就保留整组，不能在这里改选中集合。
@@ -1945,6 +1966,12 @@ function Launcher() {
     };
     const move = (next: PointerEvent) => {
       if (started) return;
+      // 左键已经松开（比如 pointerup 丢在了窗口外）：这次拖拽作废，
+      // 不然监听会一直挂着，下一次鼠标移动就会用旧路径发起幽灵拖拽。
+      if ((next.buttons & 1) === 0) {
+        stop();
+        return;
+      }
       if (Math.abs(next.clientX - startX) + Math.abs(next.clientY - startY) < 5) return;
       started = true;
       stop();
@@ -1965,6 +1992,7 @@ function Launcher() {
 
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
   };
 
   const beginMarquee = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -2118,7 +2146,8 @@ function Launcher() {
       return true;
     }
 
-    if (ctrl && key === "v") {
+    // 和上面几个键一样：在输入框里 Ctrl+V 是粘文字，不是粘文件。
+    if (ctrl && key === "v" && !editing) {
       const dir = currentDir || root.root;
       if (!dir) return false;
       take();

@@ -400,6 +400,12 @@ function AppPicker({
       .catch(() => setApps([]));
   }, []);
 
+  // 父组件每次渲染都会传新的 onPick：放进 ref 里，effect 只跟着 picking 走。
+  // 否则设置页每 500ms 的整树重渲染会让这里反复 unlisten / listen 并重复
+  // 调用 pick_app（每次都会在 Rust 侧起一个最长 20 秒的轮询线程）。
+  const onPickRef = useRef(onPick);
+  onPickRef.current = onPick;
+
   useEffect(() => {
     if (!picking) return;
     let stop: (() => void) | undefined;
@@ -407,7 +413,7 @@ function AppPicker({
     void onAppPicked((app) => {
       setPicking(false);
       setError(null);
-      onPick(app);
+      onPickRef.current(app);
     }).then((unlisten) => {
       if (alive) {
         stop = unlisten;
@@ -423,7 +429,7 @@ function AppPicker({
       alive = false;
       stop?.();
     };
-  }, [picking, onPick]);
+  }, [picking]);
 
   const needle = query.trim().toLowerCase();
   const filtered = apps.filter((app) =>
