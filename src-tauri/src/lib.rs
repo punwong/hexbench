@@ -868,7 +868,7 @@ fn sync_pull(app: AppHandle, state: State<'_, AppState>) -> Result<String, Strin
     let mut remote: Config =
         serde_json::from_str(&text).map_err(|error| format!("远程文件不是有效配置：{error}"))?;
 
-    {
+    let to_save = {
         let mut shared = state.shared.lock().unwrap();
         remote.sync.url = shared.config.sync.url.clone();
         remote.sync.username = shared.config.sync.username.clone();
@@ -880,9 +880,11 @@ fn sync_pull(app: AppHandle, state: State<'_, AppState>) -> Result<String, Strin
         hexbench_core::config::merge_desktop_from_sync(&mut remote.desktop, &shared.config.desktop);
         remote.desktop.enabled = shared.config.desktop.enabled;
         remote.desktop.keep_on_show_desktop = shared.config.desktop.keep_on_show_desktop;
-        config::save(&state.config_path, &remote).map_err(|error| error.to_string())?;
-        shared.config = remote;
-    }
+        shared.config = remote.clone();
+        remote
+    };
+    // 写盘放到锁外面：保存要落磁盘，占着全局状态会让引擎和所有命令排队。
+    config::save(&state.config_path, &to_save).map_err(|error| error.to_string())?;
     let _ = app.emit("config-changed", ());
     Ok("已拉取并应用".to_string())
 }
@@ -1000,17 +1002,18 @@ async fn update_download(
 
 #[tauri::command]
 async fn update_install(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let updater = build_updater(&app)?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Err("没有可用的更新".to_string());
+    };
+    // 检查通过之后才取走已经下载的字节：先取再检查的话，一次网络抖动就会把
+    // 已经下载好的包丢掉，用户得重新下载。
     let bytes = state
         .pending_update
         .lock()
         .unwrap()
         .take()
         .ok_or_else(|| "还没有下载更新包".to_string())?;
-
-    let updater = build_updater(&app)?;
-    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
-        return Err("没有可用的更新".to_string());
-    };
     // Verifies the minisign signature before handing the package to NSIS.
     update.install(bytes).map_err(|error| error.to_string())
 }
@@ -5103,6 +5106,8 @@ fn spawn_launcher_watcher(app: AppHandle) {
         );
         // 监听「根目录 + 所有常用文件夹」：任意一处变化都让面板刷新。
         let mut current: Vec<PathBuf> = Vec::new();
+        // 有目录没挂上（盘不在 / 权限不够）时，隔一会儿再试一次。
+        let mut retry_at: Option<Instant> = None;
         // 监听器和它的接收端必须一起活着：丢了监听器就等于丢了监听。
         let mut session: Option<Session> = None;
 
@@ -5151,7 +5156,7 @@ fn spawn_launcher_watcher(app: AppHandle) {
             if wanted != current {
                 session = None;
                 let (sender, rx) = std::sync::mpsc::channel();
-                let mut watched = 0usize;
+                let mut watched: Vec<PathBuf> = Vec::new();
                 if let Ok(mut created) = notify::recommended_watcher(move |event| {
                     let _ = sender.send(event);
                 }) {
@@ -5159,19 +5164,23 @@ fn spawn_launcher_watcher(app: AppHandle) {
                         if directory.is_dir()
                             && created.watch(directory, RecursiveMode::NonRecursive).is_ok()
                         {
-                            watched += 1;
+                            watched.push(directory.clone());
                         }
                     }
-                    if watched > 0 {
-                        log::info!("launcher: watching {watched} directory(ies)");
+                    if !watched.is_empty() {
+                        log::info!("launcher: watching {} directory(ies)", watched.len());
                         session = Some((created, rx));
                     }
                 }
-                // 一个都没挂上（磁盘 / 网络盘暂时不在）就不要记成「已监视」：
-                // 留到下一轮再试，盘回来之后才能自动刷新。
-                if watched > 0 || wanted.is_empty() {
-                    current = wanted;
-                }
+                // 只记「真正挂上」的那些：没挂上的（盘不在、权限不够）要重试，
+                // 否则盘回来之后这个目录再也不会自动刷新。
+                let missing = watched.len() != wanted.len();
+                current = wanted;
+                retry_at = missing.then(|| Instant::now() + Duration::from_secs(15));
+            } else if retry_at.is_some_and(|at| Instant::now() >= at) {
+                // 到点了：清掉「已监视」的记录，下一轮按 wanted 重新挂一遍。
+                current.clear();
+                retry_at = None;
             }
 
             match session.as_ref() {
@@ -5189,6 +5198,9 @@ fn spawn_launcher_watcher(app: AppHandle) {
                             let shared = state.shared.lock().unwrap();
                             shared.config.desktop.fences.clone()
                         };
+                        // 同一次变化可能同时命中「根目录」和「当前子目录」两条规则：
+                        // 记下已经刷过的格子，一格只刷一次。
+                        let mut refreshed: Vec<String> = Vec::new();
                         for fence in fences {
                             let root = fence.path.replace('\\', "/").to_lowercase();
                             let hit = changed.iter().any(|path| {
@@ -5202,7 +5214,11 @@ fn spawn_launcher_watcher(app: AppHandle) {
                                     serde_json::json!({ "path": fence.path }),
                                 );
                                 // 原生格子没有页面自己刷新，watcher 直接推新内容。
-                                native_refresh(&app, &fence.id);
+                                // 根目录和「当前子目录」两条规则可能同时命中：只刷一次。
+                                if !refreshed.contains(&fence.id) {
+                                    refreshed.push(fence.id.clone());
+                                    native_refresh(&app, &fence.id);
+                                }
                             }
                         }
                         // 格子正在看的子目录：变化就让它自己刷新（前端只认事件，
@@ -5227,7 +5243,10 @@ fn spawn_launcher_watcher(app: AppHandle) {
                                     "fence-changed",
                                     serde_json::json!({ "path": watched }),
                                 );
-                                native_refresh(&app, &id);
+                                if !refreshed.contains(&id) {
+                                    refreshed.push(id.clone());
+                                    native_refresh(&app, &id);
+                                }
                             }
                         }
                         // 规则盒的来源目录有变化：等安静下来再按规则收。
@@ -5465,11 +5484,16 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             }
         }
         hexbench_fence::Event::RenameItem { id, path, name } => {
-            // 和网页版的内联改名同一个入口：改名失败在格子里提示，不弹系统报错框。
-            match launcher_rename(path, name, handle.clone()) {
-                Ok(_) => native_refresh(&handle, &id),
-                Err(error) => native_toast(&handle, &id, error),
-            }
+            // 改名要走 Shell（IFileOperation）：重活别占着格子的渲染线程，
+            // 否则一次改名会把这一格连同拖拽一起卡住。
+            let handle = handle.clone();
+            thread::spawn(move || {
+                // 和网页版的内联改名同一个入口：改名失败在格子里提示，不弹系统报错框。
+                match launcher_rename(path, name, handle.clone()) {
+                    Ok(_) => native_refresh(&handle, &id),
+                    Err(error) => native_toast(&handle, &id, error),
+                }
+            });
         }
         hexbench_fence::Event::Hide { id } => {
             native_edit_fence(&handle, &id, |fence| fence.visible = false);
@@ -5478,14 +5502,19 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             if let Ok(mut nav) = NATIVE_NAV.lock() {
                 nav.retain(|state| state.id != id);
             }
-            // 和网页版「删除格子」同一个入口；收纳盒里的文件按 keep 处理，不删。
-            if let Err(error) = fence_delete(id.clone(), None, handle.clone()) {
-                log::warn!("fence {id}: 原生菜单删除失败: {error}");
-            }
+            let handle = handle.clone();
+            thread::spawn(move || {
+                // 和网页版「删除格子」同一个入口；收纳盒里的文件按 keep 处理，不删。
+                if let Err(error) = fence_delete(id.clone(), None, handle.clone()) {
+                    log::warn!("fence {id}: 原生菜单删除失败: {error}");
+                }
+            });
         }
         hexbench_fence::Event::Refresh { id } => {
-            // 右键菜单（在渲染线程上弹，返回时已经关掉）之后重读目录。
-            native_refresh(&handle, &id);
+            // 右键菜单（在渲染线程上弹，返回时已经关掉）之后重读目录：
+            // 读目录、起图标批次都放到后台线程。
+            let handle = handle.clone();
+            thread::spawn(move || native_refresh(&handle, &id));
         }
         hexbench_fence::Event::Navigate { id, path } => {
             // 双击子文件夹：停在格子里看，不弹资源管理器。
@@ -5519,6 +5548,8 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             native_change_folder(&handle, &id);
         }
         hexbench_fence::Event::RunRules { id } => {
+            let handle = handle.clone();
+            thread::spawn(move || {
             let dto = run_rule_box(&handle, &id);
             log::info!(
                 "native fence {id}: 立即整理 matched={} moved={}",
@@ -5532,6 +5563,7 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             };
             native_toast(&handle, &id, text);
             native_refresh(&handle, &id);
+            });
         }
         hexbench_fence::Event::Drop {
             id,

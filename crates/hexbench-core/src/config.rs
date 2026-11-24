@@ -874,8 +874,15 @@ pub fn load(path: &Path) -> (Config, LoadSource) {
     (Config::default(), LoadSource::Default)
 }
 
+/// 保存是「写同一个临时文件再改名」：多个线程同时保存会互相截断，
+/// 最后 rename 上去的可能是两段内容拼出来的坏 JSON。
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Write via a temporary file and `rename`, keeping the previous file as `.bak`.
 pub fn save(path: &Path, config: &Config) -> io::Result<()> {
+    let _guard = SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }

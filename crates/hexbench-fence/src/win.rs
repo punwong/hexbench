@@ -66,7 +66,6 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -114,6 +113,8 @@ const WM_FENCE_WAKE: u32 = WM_APP + 1;
 const WM_FENCE_MENU: u32 = WM_APP + 2;
 /// 拖放回调（OLE 线程）通知渲染线程更新落点高亮。
 const WM_FENCE_DRAG: u32 = WM_APP + 3;
+/// 滚轮钩子把「滚了几格」投递给窗口过程，绘制在那边做（钩子里不能画）。
+const WM_FENCE_WHEEL: u32 = WM_APP + 4;
 
 /// OLE 的落点效果：按住 Ctrl 是复制，否则移动（和资源管理器一致）。
 const DROPEFFECT_COPY: u32 = 1;
@@ -169,7 +170,8 @@ enum Cmd {
 
 pub struct NativeFences {
     tx: Sender<Cmd>,
-    wake_tid: u32,
+    /// 渲染线程上那个隐藏窗口的句柄（用来叫醒它）。
+    wake: isize,
     hwnds: Arc<Mutex<HashMap<String, isize>>>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -185,15 +187,15 @@ impl Drop for NativeFences {
 impl NativeFences {
     pub fn start(sink: EventSink) -> std::result::Result<Arc<Self>, String> {
         let (tx, rx) = channel::<Cmd>();
-        let (ready_tx, ready_rx) = channel::<std::result::Result<u32, String>>();
+        let (ready_tx, ready_rx) = channel::<std::result::Result<isize, String>>();
         let hwnds = Arc::new(Mutex::new(HashMap::new()));
         let thread_hwnds = Arc::clone(&hwnds);
         let join = thread::Builder::new()
             .name("hexbench-native-fence".to_string())
             .spawn(move || render_thread(rx, sink, thread_hwnds, ready_tx))
             .map_err(|error| error.to_string())?;
-        let wake_tid = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok(tid)) => tid,
+        let wake = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(wake)) => wake,
             Ok(Err(error)) => {
                 let _ = join.join();
                 return Err(error);
@@ -205,16 +207,21 @@ impl NativeFences {
         };
         Ok(Arc::new(Self {
             tx,
-            wake_tid,
+            wake,
             hwnds,
             join: Mutex::new(Some(join)),
         }))
     }
 
     fn post(&self, cmd: Cmd) {
-        if self.tx.send(cmd).is_ok() {
+        if self.tx.send(cmd).is_ok() && self.wake != 0 {
             unsafe {
-                let _ = PostThreadMessageW(self.wake_tid, WM_FENCE_WAKE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(HWND(self.wake as *mut _)),
+                    WM_FENCE_WAKE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
         }
     }
@@ -304,8 +311,15 @@ impl NativeFences {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Cmd::Shutdown);
-        unsafe {
-            let _ = PostThreadMessageW(self.wake_tid, WM_FENCE_WAKE, WPARAM(0), LPARAM(0));
+        if self.wake != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.wake as *mut _)),
+                    WM_FENCE_WAKE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
         }
         if let Ok(mut slot) = self.join.lock() {
             if let Some(join) = slot.take() {
@@ -342,7 +356,7 @@ fn render_thread(
     rx: std::sync::mpsc::Receiver<Cmd>,
     sink: EventSink,
     hwnds: Arc<Mutex<HashMap<String, isize>>>,
-    ready: Sender<std::result::Result<u32, String>>,
+    ready: Sender<std::result::Result<isize, String>>,
 ) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -379,14 +393,39 @@ fn render_thread(
         (*engine).hook = hook;
     }
     ENGINE.with(|cell| cell.set(engine));
-    let tid = unsafe { GetCurrentThreadId() };
-    let _ = ready.send(Ok(tid));
+    // 唤醒用的隐藏窗口：之前用的是 PostThreadMessageW 的线程消息，可它会被
+    // TrackPopupMenu / DoDragDrop / MessageBox 这些模态循环取走——那些循环
+    // DispatchMessage 一条无窗口消息等于扔掉，排队的命令只能等下一次唤醒，
+    // 关窗时 join 还可能永远等下去。窗口消息会被正常派发，模态循环也一样。
+    let wake = match unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("HexBenchNativeFenceWake"),
+            w!(""),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            Some(instance),
+            None,
+        )
+    } {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            let _ = ready.send(Err(format!("唤醒窗口创建失败：{error}")));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(wake.0 as isize));
     log::info!("native fence: 渲染线程就绪（D3D11 + D2D + DComp + DWrite + WIC）");
 
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_FENCE_WAKE && msg.hwnd.is_invalid() {
+            if msg.message == WM_FENCE_WAKE && msg.hwnd == wake {
                 while let Ok(cmd) = rx.try_recv() {
                     let quit = handle_cmd(&mut *engine, cmd, &hwnds);
                     if quit {
@@ -4300,6 +4339,18 @@ unsafe extern "system" fn fence_wndproc(
             }
             LRESULT(0)
         }
+        WM_FENCE_WHEEL => {
+            unsafe {
+                let fence = &mut *raw;
+                let notch = w.0 as i32 as f32;
+                if fence.max_scroll() > 0.0 {
+                    fence.set_scroll(fence.scroll - notch / 120.0 * 100.0);
+                    fence.hover = None;
+                    let _ = fence.render(&(*engine).gpu);
+                }
+            }
+            LRESULT(0)
+        }
         WM_FENCE_DRAG => {
             unsafe {
                 let fence = &mut *raw;
@@ -4693,15 +4744,23 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
             let info = unsafe { &*(l.0 as *const MSLLHOOKSTRUCT) };
             let hwnd = unsafe { WindowFromPoint(info.pt) };
             if !hwnd.is_invalid() {
-                let engine = unsafe { &mut *engine };
+                let engine = unsafe { &*engine };
                 if let Some(entry) = engine.windows.iter().find(|entry| entry.hwnd == hwnd) {
-                    let fence = unsafe { &mut *entry.ptr };
-                    let notch = (((info.mouseData >> 16) & 0xffff) as u16 as i16) as f32;
-                    let max = fence.max_scroll();
-                    if max > 0.0 {
-                        fence.set_scroll(fence.scroll - notch / 120.0 * 100.0);
-                        fence.hover = None;
-                        let _ = fence.render(&engine.gpu);
+                    let fence = unsafe { &*entry.ptr };
+                    // 钩子回调要尽快返回：这里只投递「滚了几格」，滚动和绘制交给
+                    // 窗口过程。在低级钩子里直接渲染会拖住系统的鼠标输入，
+                    // 超过 LowLevelHooksTimeout 后滚轮会时灵时不灵；而且它会和
+                    // 窗口过程栈上的 `&mut FenceWindow` 重叠成别名。
+                    if fence.max_scroll() > 0.0 {
+                        let notch = (((info.mouseData >> 16) & 0xffff) as u16 as i16) as i32;
+                        let _ = unsafe {
+                            PostMessageW(
+                                Some(fence.hwnd),
+                                WM_FENCE_WHEEL,
+                                WPARAM(notch as isize as usize),
+                                LPARAM(0),
+                            )
+                        };
                         return LRESULT(1);
                     }
                 }
@@ -4720,6 +4779,16 @@ unsafe extern "system" fn notify_wndproc(
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 
+/// 唤醒窗口的过程：不做事，唤醒本身由渲染线程的外层循环处理。
+unsafe extern "system" fn wake_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
 fn register_classes() -> Result<()> {
     unsafe {
         let module = GetModuleHandleW(None)?;
@@ -4727,13 +4796,15 @@ fn register_classes() -> Result<()> {
             PCWSTR,
             unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
             bool,
-        ); 4] = [
+        ); 5] = [
             (w!("HexBenchNativeFence"), fence_wndproc, true),
             (w!("HexBenchNativeFenceNotify"), notify_wndproc, false),
             // 改名弹层：带边框的小窗口 + 系统 EDIT，输入法由控件自己处理。
             (w!("HexBenchNativeFenceRename"), rename_wndproc, false),
             // 标题条搜索框：同一个做法，只是边打边筛。
             (w!("HexBenchNativeFenceSearch"), search_wndproc, false),
+            // 只用来「拍一下」渲染线程的隐藏窗口（见 render_thread 里的说明）。
+            (w!("HexBenchNativeFenceWake"), wake_wndproc, false),
         ];
         for (name, proc_, double_click) in classes {
             let mut class: WNDCLASSW = std::mem::zeroed();

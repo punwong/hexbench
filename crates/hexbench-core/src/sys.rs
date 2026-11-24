@@ -2629,8 +2629,24 @@ pub fn rename_path(
     path: &std::path::Path,
     new_name: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let name = new_name.trim();
-    validate_name(name)?;
+    let mut name = new_name.trim().to_string();
+    // 快捷方式在格子里显示时不带后缀：改名要把原后缀补回去，否则 `foo.lnk` 会变成
+    // 一个没有扩展名的文件，双击就不打开了。
+    let has_extension = name
+        .rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
+    if !has_extension {
+        let original = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase());
+        if matches!(original.as_deref(), Some("lnk") | Some("url")) {
+            name.push('.');
+            name.push_str(original.as_deref().unwrap_or_default());
+        }
+    }
+    validate_name(&name)?;
+    let name = name.as_str();
     let parent = path
         .parent()
         .ok_or_else(|| "找不到所在文件夹".to_string())?;
