@@ -1205,6 +1205,8 @@ impl GestureEnd {
 struct FenceWindow {
     id: String,
     generation: u64,
+    /// 上一次推帧时的内容指纹：一样就不重建条目 / 排版 / 过滤。
+    content_signature: u64,
     /// 现在显示的目录；空白处右键菜单用。
     path: String,
     /// 绑定的根目录：面包屑和「返回」不越出这里。
@@ -1393,6 +1395,7 @@ impl FenceWindow {
             Ok(FenceWindow {
                 id: frame.id,
                 generation: frame.generation,
+                content_signature: 0,
                 path: frame.path,
                 root: frame.root,
                 crumbs: frame.crumbs,
@@ -1551,6 +1554,7 @@ impl FenceWindow {
     }
 
     fn set_content(&mut self, gpu: &Gpu, frame: Frame) {
+        let signature = content_signature(&frame);
         let previous_path = std::mem::replace(&mut self.path, frame.path);
         let navigated = !previous_path.eq_ignore_ascii_case(&self.path);
         self.generation = frame.generation;
@@ -1587,6 +1591,12 @@ impl FenceWindow {
             self.band = None;
             self.set_scroll(0.0);
         }
+        if !navigated && !view_changed && signature == self.content_signature {
+            // 内容一模一样（只是 watcher 又推了一帧）：条目、排版、过滤都不用重来，
+            // 已加载的图标也留着。
+            return;
+        }
+        self.content_signature = signature;
         self.items = frame
             .items
             .into_iter()
@@ -3843,6 +3853,36 @@ fn start_rename_title(sink: &EventSink, fence: &FenceWindow) {
         },
         sink,
     );
+}
+
+/// 推帧内容的指纹：路径、缩放、视图、排序，以及每个条目的名字 / 大小 / 时间。
+///
+/// 用来跳过「内容没变」的推帧——每次刷新都重建全部 TextLayout 并重跑过滤，
+/// 几千项的目录下每次耗时几十毫秒，图标还会闪一下。
+fn content_signature(frame: &Frame) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    {
+        let mut mix = |value: &str| {
+            for byte in value.to_lowercase().bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        mix(&frame.path);
+        mix(&frame.zoom.to_string());
+        mix(if frame.list { "list" } else { "grid" });
+        mix(&frame.sort_key);
+        mix(&frame.sort_dir.to_string());
+        for item in &frame.items {
+            mix(&item.path);
+            mix(&item.name);
+            mix(&item.size.to_string());
+            mix(&item.modified.to_string());
+        }
+    }
+    hash
 }
 
 /// 条目的「重命名」：输入框出现在菜单原来的位置。
