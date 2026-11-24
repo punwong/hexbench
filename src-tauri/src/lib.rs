@@ -641,6 +641,8 @@ fn move_paths_into(dir: &std::path::Path, paths: &[std::path::PathBuf]) -> usize
     if sources.is_empty() {
         return 0;
     }
+    // 文件从哪儿搬到哪儿进日志：出了「文件怎么不见了」能对着查。
+    log::info!("move: {} item(s) -> {}: {:?}", sources.len(), dir.display(), sources);
     // 交给 Shell：跨盘、进度条、重名询问、长路径都由它处理。
     match hexbench_core::shell_ops::move_into(&sources, dir) {
         Ok(count) => return count,
