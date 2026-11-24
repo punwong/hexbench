@@ -35,6 +35,7 @@ function Guides() {
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
+    let alive = true;
     // 这个 label 的窗口只有一个，但仍然指上 target：不指的话 Tauri 的 listen
     // 默认收所有目标，别的窗口的事件也会进来。
     void listen<Payload>(
@@ -42,9 +43,14 @@ function Guides() {
       (event) => setLines(event.payload ?? empty),
       { target: "snap-guides" },
     ).then((unlisten) => {
-      dispose = unlisten;
+      // 监听是异步拿到的：effect 可能已经拆掉，这时候再挂上就永远没人注销。
+      if (alive) dispose = unlisten;
+      else unlisten();
     });
-    return () => dispose?.();
+    return () => {
+      alive = false;
+      dispose?.();
+    };
   }, []);
 
   const vertical = lines.v ? span(lines.v) : null;

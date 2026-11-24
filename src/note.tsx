@@ -148,7 +148,7 @@ function NoteApp() {
         setRolled(isRolled);
         setReady(true);
         requestAnimationFrame(() => {
-          void invoke("note_ready");
+          void invoke("note_ready").catch(() => undefined);
         });
       })
       .catch((problem) => {

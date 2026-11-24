@@ -732,7 +732,7 @@ function Launcher() {
         label: scope.kind === "folder" ? scope.label : "",
         path: scope.kind === "folder" ? path : "",
         pinned: scope.kind === "folder" ? !!scope.pinned : false,
-      });
+      }).catch(() => undefined);
     }, 400);
     return () => window.clearTimeout(timer);
   }, [scope, path, root.rememberLocation]);

@@ -45,7 +45,9 @@ function Overlay() {
 
     // The window is created before this page finishes loading, so the event that
     // triggered it has already been emitted: ask for the current zones as well.
-    void invoke<Payload>("overlay_zones").then(apply);
+    void invoke<Payload>("overlay_zones")
+      .then(apply)
+      .catch(() => undefined);
 
     const unlisten = listen<Payload>("overlay-zones", (event) => apply(event.payload));
     return () => {

@@ -3536,6 +3536,16 @@ fn notes_pinned(app: AppHandle) -> Vec<String> {
 /// 便签里的链接交给系统浏览器：点在预览里不该把便签窗口本身导航走。
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
+    // 只放行网页和邮件链接：笔记是会同步的，同步来的恶意内容不该靠
+    // `ms-settings:` / `steam:` 这类已注册协议把本机程序拉起来。
+    let lower = url.trim().to_ascii_lowercase();
+    let allowed = ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if !allowed {
+        log::warn!("open_url: 拒绝非网页协议: {url}");
+        return Err("只支持 http / https / mailto 链接".to_string());
+    }
     hexbench_core::sys::open_url(&url)
 }
 
