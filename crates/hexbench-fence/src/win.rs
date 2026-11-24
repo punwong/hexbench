@@ -77,8 +77,8 @@ use windows::Win32::Graphics::Gdi::{
     FF_DONTCARE, FW_NORMAL, OUT_DEFAULT_PRECIS, ScreenToClient, ValidateRect,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
-    VK_RETURN,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DELETE,
+    VK_ESCAPE, VK_F2, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::{Matrix3x2, Vector2};
@@ -1230,6 +1230,8 @@ struct FenceWindow {
     shown: Vec<usize>,
     /// 搜索框开着时的弹层窗口。
     search_popup: Option<HWND>,
+    /// 键盘焦点在这格里（点了条目之后）：F2 改名、Delete 删除、Esc 取消。
+    keyboard: bool,
     /// 左键按在「更多」按钮上：松手时再弹菜单。
     /// 在 `WM_LBUTTONDOWN` 里直接弹菜单会让按钮一直按着，菜单收不到后续鼠标输入。
     dots_down: bool,
@@ -1396,6 +1398,7 @@ impl FenceWindow {
                 shown: Vec::new(),
                 search_popup: None,
                 dots_down: false,
+                keyboard: false,
                 gestures: GestureSettings::default(),
                 gesture: None,
                 back_count: 0,
@@ -3713,6 +3716,51 @@ fn open_search(owner: HWND, fence: &mut FenceWindow) {
     }
 }
 
+/// 点了条目之后让格子接过键盘：F2 改名、Delete 删除、Esc 取消。
+///
+/// 格子平时是 `WS_EX_NOACTIVATE`（点它不抢别的程序的焦点）。要收键盘就得临时
+/// 去掉这个样式并拿到焦点；焦点一走就还回去（见 `end_keyboard`）。
+/// 参考实现 PecoFence 也是这个模型：点条目开一次「focus session」，键盘全在里面处理。
+fn begin_keyboard(hwnd: HWND, fence: &mut FenceWindow) {
+    if fence.keyboard {
+        return;
+    }
+    fence.keyboard = true;
+    hexbench_core::sys::set_no_activate(hwnd.0 as isize, false);
+    hexbench_core::sys::force_foreground(hwnd.0 as isize);
+    unsafe {
+        let _ = SetFocus(Some(hwnd));
+    }
+}
+
+/// 焦点走了：结束这次键盘会话，并恢复「点格子不抢焦点」。
+fn end_keyboard(hwnd: HWND, fence: &mut FenceWindow) {
+    if !fence.keyboard {
+        return;
+    }
+    fence.keyboard = false;
+    hexbench_core::sys::set_no_activate(hwnd.0 as isize, true);
+}
+
+/// 某个路径在屏幕上的左上角（改名框定位用），顺带给出它是不是文件夹。
+fn item_screen_pos(fence: &FenceWindow, path: &str) -> Option<(i32, i32, bool)> {
+    let position = fence.shown.iter().position(|index| {
+        fence
+            .items
+            .get(*index)
+            .is_some_and(|item| item.path == path)
+    })?;
+    let item = fence.items.get(*fence.shown.get(position)?)?;
+    let (x, y, _, _) = fence.item_rect(position);
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(fence.hwnd, &mut rect) }.ok()?;
+    Some((
+        rect.left + (x * fence.scale).round() as i32,
+        rect.top + (y * fence.scale).round() as i32,
+        item.is_dir,
+    ))
+}
+
 /// 标题菜单「重命名格子」：输入框压在标题条上。
 fn start_rename_title(sink: &EventSink, fence: &FenceWindow) {
     let mut rect = RECT::default();
@@ -4004,6 +4052,53 @@ unsafe extern "system" fn fence_wndproc(
             }
             LRESULT(0)
         }
+        WM_KEYDOWN => {
+            unsafe {
+                let fence = &mut *raw;
+                let key = w.0 as u16;
+                if fence.keyboard && key == VK_F2.0 {
+                    let picked = fence.picked_paths();
+                    if let Some(path) = picked.first().cloned() {
+                        if let Some((x, y, is_dir)) = item_screen_pos(fence, &path) {
+                            start_rename_item(&(*engine).sink, fence, &path, is_dir, x, y);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                if fence.keyboard && key == VK_DELETE.0 {
+                    let picked = fence.picked_paths();
+                    if !picked.is_empty() {
+                        let paths: Vec<std::path::PathBuf> =
+                            picked.iter().map(std::path::PathBuf::from).collect();
+                        // 删除要走 Shell，可能弹确认框：别占着格子的渲染线程。
+                        let sink = Arc::clone(&(*engine).sink);
+                        let id = fence.id.clone();
+                        thread::spawn(move || {
+                            if let Err(error) = hexbench_core::shell_ops::trash(&paths) {
+                                log::warn!("fence: delete failed: {error}");
+                            }
+                            sink(Event::Refresh { id });
+                        });
+                    }
+                    return LRESULT(0);
+                }
+                if fence.keyboard && key == VK_ESCAPE.0 {
+                    fence.picked.clear();
+                    fence.anchor = None;
+                    end_keyboard(hwnd, fence);
+                    let _ = fence.render(&(*engine).gpu);
+                    return LRESULT(0);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            unsafe {
+                let fence = &mut *raw;
+                end_keyboard(hwnd, fence);
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             unsafe {
                 let fence = &mut *raw;
@@ -4116,6 +4211,8 @@ unsafe extern "system" fn fence_wndproc(
                             if GetCursorPos(&mut origin).is_ok() {
                                 fence.file_drag = Some(FileDrag { paths, origin });
                             }
+                            // 点中条目：格子接过键盘（F2 / Delete / Esc）。
+                            begin_keyboard(hwnd, fence);
                             let _ = fence.render(&(*engine).gpu);
                         }
                         None => {
