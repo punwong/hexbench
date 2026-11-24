@@ -4068,9 +4068,26 @@ unsafe extern "system" fn fence_wndproc(
                 if fence.keyboard && key == VK_DELETE.0 {
                     let picked = fence.picked_paths();
                     if !picked.is_empty() {
+                        // 先在界面上摘掉再真删：回收站那一趟要几百毫秒，等它刷新回来
+                        // 用户会觉得「按了没反应」。删失败的话下一次刷新会把它们带回来。
+                        fence
+                            .items
+                            .retain(|item| !picked.contains(&item.path));
+                        fence.picked.clear();
+                        fence.apply_filter();
+                        let count = picked.len();
+                        fence.show_toast(
+                            &(*engine).gpu,
+                            if count == 1 {
+                                "已移到回收站".to_string()
+                            } else {
+                                format!("已把 {count} 项移到回收站")
+                            },
+                        );
+                        let _ = fence.render(&(*engine).gpu);
                         let paths: Vec<std::path::PathBuf> =
                             picked.iter().map(std::path::PathBuf::from).collect();
-                        // 删除要走 Shell，可能弹确认框：别占着格子的渲染线程。
+                        // 真正的删除走 Shell（进回收站），放后台线程，别占渲染线程。
                         let sink = Arc::clone(&(*engine).sink);
                         let id = fence.id.clone();
                         thread::spawn(move || {
