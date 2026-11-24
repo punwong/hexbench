@@ -4068,6 +4068,8 @@ unsafe extern "system" fn fence_wndproc(
                 if fence.keyboard && key == VK_DELETE.0 {
                     let picked = fence.picked_paths();
                     if !picked.is_empty() {
+                        // 删了什么进日志：事后要查「文件怎么没了」只能靠它。
+                        log::info!("fence: delete {} item(s): {:?}", picked.len(), picked);
                         // 先在界面上摘掉再真删：回收站那一趟要几百毫秒，等它刷新回来
                         // 用户会觉得「按了没反应」。删失败的话下一次刷新会把它们带回来。
                         fence
