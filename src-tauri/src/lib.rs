@@ -185,7 +185,7 @@ fn diagnostics(app: AppHandle, state: State<'_, AppState>) -> String {
     ));
 
     {
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         out.push_str(&format!(
             "phase={} paused={} cursor={:?} hit={:?} guard={:?}\n",
             shared.engine_phase, shared.paused, shared.cursor, shared.hit, shared.guard
@@ -236,7 +236,7 @@ fn diagnostics(app: AppHandle, state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 fn snapshot(state: State<'_, AppState>) -> Snapshot {
-    let shared = state.shared.lock().unwrap();
+    let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     Snapshot {
         config: shared.config.clone(),
         monitors: shared.monitors.clone(),
@@ -263,7 +263,7 @@ fn snapshot(state: State<'_, AppState>) -> Snapshot {
 /// 主题偏好：system / light / dark。面板和网页窗口自己解析 system。
 #[tauri::command]
 fn ui_theme_preference(state: State<'_, AppState>) -> String {
-    let theme = state.shared.lock().unwrap().config.ui.theme;
+    let theme = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.ui.theme;
     match theme {
         hexbench_core::config::Theme::Dark => "dark",
         hexbench_core::config::Theme::Light => "light",
@@ -276,7 +276,7 @@ fn ui_theme_preference(state: State<'_, AppState>) -> String {
 /// 呼出面板和网页窗口是常驻的（只是 hide/show），改设置不会让它们重新加载，
 /// 页面里那一次 useEffect 也就不会重跑，所以必须从这边发一段 JS 过去。
 fn push_theme_to_windows(app: &AppHandle) {
-    let theme = app.state::<AppState>().shared.lock().unwrap().config.ui.theme;
+    let theme = app.state::<AppState>().shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.ui.theme;
     let value = match theme {
         hexbench_core::config::Theme::Dark => "dark",
         hexbench_core::config::Theme::Light => "light",
@@ -327,7 +327,7 @@ fn save_config(
     // 「设置里改了一处，面板又回到上次的位置/尺寸」。这些字段以内存为准。
     let mut config = config;
     {
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let live = &shared.config.launcher;
         let launcher = &mut config.launcher;
         launcher.panel_w = live.panel_w;
@@ -365,7 +365,7 @@ fn save_config(
     }
     config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
     let (theme_changed, gestures_changed, gestures) = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let theme_changed = shared.config.ui.theme != config.ui.theme;
         let gestures_changed = shared.config.launcher.gestures != config.launcher.gestures;
         let gestures = config.launcher.gestures.clone();
@@ -390,7 +390,7 @@ fn save_config(
 
 #[tauri::command]
 fn set_paused(paused: bool, app: AppHandle, state: State<'_, AppState>) {
-    state.shared.lock().unwrap().paused = paused;
+    state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).paused = paused;
     sync_tray_checks(&app);
 }
 
@@ -401,7 +401,7 @@ fn set_paused(paused: bool, app: AppHandle, state: State<'_, AppState>) {
 fn register_hotkeys(app: &AppHandle) {
     let (pause, launcher) = {
         let state = app.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             shared.config.hotkeys.pause.clone(),
             shared.config.hotkeys.launcher.clone(),
@@ -423,7 +423,7 @@ fn register_hotkeys(app: &AppHandle) {
             ));
         }
     }
-    app.state::<AppState>().shared.lock().unwrap().hotkey_error = error;
+    app.state::<AppState>().shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hotkey_error = error;
 }
 
 fn shortcut_matches(shortcut: &Shortcut, spec: &str) -> bool {
@@ -437,7 +437,7 @@ fn shortcut_matches(shortcut: &Shortcut, spec: &str) -> bool {
 fn show_all_fences(app: &AppHandle) {
     let state = app.state::<AppState>();
     let changed = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut changed = false;
         for fence in shared.config.desktop.fences.iter_mut() {
             if !fence.visible {
@@ -450,7 +450,7 @@ fn show_all_fences(app: &AppHandle) {
     if !changed {
         return;
     }
-    let config = state.shared.lock().unwrap().config.clone();
+    let config = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.clone();
     if let Err(error) = config::save(&state.config_path, &config) {
         log::warn!("tray: 显示全部格子保存失败: {error}");
     }
@@ -461,7 +461,7 @@ fn show_all_fences(app: &AppHandle) {
 fn toggle_pause(app: &AppHandle) {
     {
         let state = app.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.paused = !shared.paused;
     }
     sync_tray_checks(app);
@@ -469,7 +469,7 @@ fn toggle_pause(app: &AppHandle) {
 
 #[tauri::command]
 fn refresh_layout(state: State<'_, AppState>) {
-    state.shared.lock().unwrap().refresh_requested = true;
+    state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).refresh_requested = true;
 }
 
 #[tauri::command]
@@ -477,7 +477,7 @@ fn set_autostart(enabled: bool, app: AppHandle, state: State<'_, AppState>) -> R
     let manager = app.autolaunch();
     let result = if enabled { manager.enable() } else { manager.disable() };
     result.map_err(|error| error.to_string())?;
-    state.shared.lock().unwrap().autostart = enabled;
+    state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).autostart = enabled;
     Ok(())
 }
 
@@ -593,7 +593,7 @@ fn running_apps() -> Vec<RunningAppDto> {
 
 #[tauri::command]
 fn overlay_zones(state: State<'_, AppState>) -> OverlayPayload {
-    let shared = state.shared.lock().unwrap();
+    let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     overlay_geometry(&shared.monitors, &shared.regions, shared.config.trigger.ratio, shared.config.trigger.position)
         .map(|(_, _, _, _, payload)| payload)
         .unwrap_or(OverlayPayload { bands: Vec::new(), zones: Vec::new() })
@@ -679,7 +679,7 @@ fn move_paths_into(dir: &std::path::Path, paths: &[std::path::PathBuf]) -> usize
 fn open_overlay(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (monitors, regions, trigger) = {
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             shared.monitors.clone(),
             shared.regions.clone(),
@@ -782,7 +782,7 @@ fn now_secs() -> i64 {
 
 fn sync_client(state: &AppState) -> Result<hexbench_core::sync::WebDav, String> {
     let (url, username, sealed) = {
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = &shared.config.sync;
         (
             settings.url.clone(),
@@ -807,7 +807,7 @@ fn sync_test(
 ) -> Result<(), String> {
     // An empty field means "use the saved password".
     let password = if password.is_empty() {
-        let sealed = state.shared.lock().unwrap().config.sync.password.clone();
+        let sealed = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.sync.password.clone();
         hexbench_core::sync::open_secret(&sealed).unwrap_or_default()
     } else {
         password
@@ -825,7 +825,7 @@ fn sync_save(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = &mut shared.config.sync;
         settings.url = url;
         settings.username = username;
@@ -844,14 +844,14 @@ fn sync_save(
 #[tauri::command(async)]
 fn sync_push(state: State<'_, AppState>) -> Result<String, String> {
     let client = sync_client(state.inner())?;
-    let mut config = state.shared.lock().unwrap().config.clone();
+    let mut config = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.clone();
     // Credentials are machine-bound; never upload them.
     config.sync.password.clear();
     let body = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
     client.put(SYNC_FILE, &body)?;
 
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.config.sync.last_push = now_secs();
         shared.config.clone()
     };
@@ -869,7 +869,7 @@ fn sync_pull(app: AppHandle, state: State<'_, AppState>) -> Result<String, Strin
         serde_json::from_str(&text).map_err(|error| format!("远程文件不是有效配置：{error}"))?;
 
     let to_save = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         remote.sync.url = shared.config.sync.url.clone();
         remote.sync.username = shared.config.sync.username.clone();
         remote.sync.password = shared.config.sync.password.clone();
@@ -906,7 +906,7 @@ struct UpdateProgress {
 fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     let endpoint = {
         let state = app.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.config.updates.endpoint.clone()
     };
 
@@ -981,10 +981,26 @@ async fn update_download(
     };
 
     let progress_app = app.clone();
+    // 下载回调是按 chunk 来的：直接广播会把所有窗口刷屏，100ms 一条就够了。
+    let last_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes = update
         .download(
             move |chunk, total| {
-                let _ = progress_app.emit("update-progress", UpdateProgress { chunk, total });
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0);
+                let previous = last_progress.load(Ordering::Relaxed);
+                let finished = total.is_some_and(|total| chunk as u64 >= total);
+                if now.saturating_sub(previous) < 100 && !finished {
+                    return;
+                }
+                last_progress.store(now, Ordering::Relaxed);
+                let _ = progress_app.emit_to(
+                    "main",
+                    "update-progress",
+                    UpdateProgress { chunk, total },
+                );
             },
             || {},
         )
@@ -1180,7 +1196,7 @@ fn begin_drag(window: tauri::WebviewWindow) {
 /// The full snapshot is too heavy to drive that at 12 fps.
 #[tauri::command]
 fn hit_state(state: State<'_, AppState>) -> (Option<HitDto>, Option<String>, String) {
-    let shared = state.shared.lock().unwrap();
+    let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     (
         shared.hit.map(|hit| HitDto {
             monitor: hit.monitor,
@@ -1554,16 +1570,18 @@ fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
             if inside != last_inside {
                 last_inside = inside;
                 let _ = if inside {
-                    app.emit(
+                    app.emit_to(
+                        "launcher",
                         "launcher-drag-pos",
                         serde_json::json!({ "x": client_x, "y": client_y }),
                     )
                 } else {
-                    app.emit("launcher-drag-leave", ())
+                    app.emit_to("launcher", "launcher-drag-leave", ())
                 };
             } else if inside {
-                let _ = app.emit(
-                    "launcher-drag-pos",
+                let _ = app.emit_to(
+                        "launcher",
+                        "launcher-drag-pos",
                     serde_json::json!({ "x": client_x, "y": client_y }),
                 );
             }
@@ -1584,7 +1602,7 @@ fn watch_external_drag(app: AppHandle, paths: Vec<String>) {
                         }),
                     );
                 } else {
-                    let _ = app.emit("launcher-drag-leave", ());
+                    let _ = app.emit_to("launcher", "launcher-drag-leave", ());
                 }
                 break;
             }
@@ -1654,14 +1672,16 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
                                         .collect();
                                     log::info!("launcher: drag entered with {} item(s)", list.len());
                                     watch_external_drag(app.clone(), list);
-                                    let _ = app.emit(
-                                        "launcher-drag-pos",
+                                    let _ = app.emit_to(
+                        "launcher",
+                        "launcher-drag-pos",
                                         serde_json::json!({ "x": x, "y": y }),
                                     );
                                 }
                                 DropEvent::Over { x, y, .. } => {
-                                    let _ = app.emit(
-                                        "launcher-drag-pos",
+                                    let _ = app.emit_to(
+                        "launcher",
+                        "launcher-drag-pos",
                                         serde_json::json!({ "x": x, "y": y }),
                                     );
                                 }
@@ -1670,7 +1690,7 @@ fn build_launcher(app: &AppHandle) -> Option<tauri::WebviewWindow> {
                                     if cursor_inside_launcher(&app) {
                                         DRAG_CANCELLED.store(true, Ordering::SeqCst);
                                     }
-                                    let _ = app.emit("launcher-drag-leave", ());
+                                    let _ = app.emit_to("launcher", "launcher-drag-leave", ());
                                 }
                                 DropEvent::Drop { paths, x, y, keys } => {
                                     let list: Vec<String> = paths
@@ -1764,7 +1784,7 @@ fn place_launcher(window: &tauri::WebviewWindow, follow_cursor: bool, size_perce
     // 拖过就按拖出来的尺寸；否则按百分比。
     let saved_size = {
         let state = window.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let launcher = &shared.config.launcher;
         (launcher.panel_remember_size
             && launcher.panel_w > 0
@@ -1860,7 +1880,7 @@ fn now_millis() -> u64 {
 /// 面板的呼出外观：是否贴着鼠标 + 尺寸百分比。
 fn launcher_appearance(app: &AppHandle) -> (bool, (u32, u32)) {
     let shared = app.state::<AppState>();
-    let shared = shared.shared.lock().unwrap();
+    let shared = shared.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let launcher = &shared.config.launcher;
     (
         launcher.follow_cursor,
@@ -1916,7 +1936,7 @@ fn reveal_launcher(window: &tauri::WebviewWindow, appearance: (bool, (u32, u32))
         let app = window.app_handle();
         let enabled = {
             let state = app.state::<AppState>();
-            let shared = state.shared.lock().unwrap();
+            let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             shared.config.launcher.web_enabled
                 && !shared.config.launcher.sites.is_empty()
         };
@@ -2238,7 +2258,7 @@ fn ensure_web_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
 fn place_web_window(app: &AppHandle, web: &tauri::WebviewWindow) {
     let (width_percent, height_percent, follow, side, saved) = {
         let state = app.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let launcher = &shared.config.launcher;
         let pct_w = launcher.site_width_percent.clamp(10, 90);
         let pct_h = launcher.site_height_percent.clamp(20, 100);
@@ -2335,7 +2355,7 @@ fn reflow_site_page(app: &AppHandle, width: f64, height: f64) {
 fn store_web_geometry(app: &AppHandle, x: i32, y: i32, w: u32, h: u32) {
     let config = {
         let state = app.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let launcher = &mut shared.config.launcher;
         launcher.site_x = x;
         launcher.site_y = y;
@@ -2399,7 +2419,7 @@ fn remember_web_geometry(window: &tauri::WebviewWindow) {
     let handle = window.app_handle().clone();
     let config = {
         let state = handle.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let launcher = &mut shared.config.launcher;
         launcher.site_x = x;
         launcher.site_y = y;
@@ -2433,7 +2453,7 @@ fn store_panel_size(window: &tauri::WebviewWindow) {
     let app = window.app_handle();
     let config = {
         let state = app.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let launcher = &mut shared.config.launcher;
         launcher.panel_w = width;
         launcher.panel_h = height;
@@ -2707,7 +2727,7 @@ struct WebSiteDto {
 fn launcher_web_sites(app: AppHandle) -> Vec<WebSiteDto> {
     log::info!("web: launcher_web_sites called");
     let state = app.state::<AppState>();
-    let shared = state.shared.lock().unwrap();
+    let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     shared
         .config
         .launcher
@@ -2986,7 +3006,7 @@ fn scan_categories(root: &str, order: &[String], hidden: &[String]) -> Vec<Launc
 async fn launcher_categories_at(path: String, app: AppHandle) -> Vec<LauncherCategory> {
     let (order, hidden) = {
         let state = app.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             shared.config.launcher.category_order.clone(),
             shared.config.launcher.hidden_categories.clone(),
@@ -3046,7 +3066,7 @@ fn clamp_zoom(value: u32) -> u32 {
 
 fn launcher_root(app: &AppHandle) -> LauncherRoot {
     let state = app.state::<AppState>();
-    let shared = state.shared.lock().unwrap();
+    let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = shared.config.launcher.root.clone();
     let location = shared.config.launcher.last_location.clone();
     let remember_location = shared.config.launcher.remember_location;
@@ -3160,7 +3180,7 @@ fn launcher_save_location(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let pinned = pinned.unwrap_or(false);
-    let mut shared = state.shared.lock().unwrap();
+    let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let launcher = &mut shared.config.launcher;
     if !launcher.remember_location {
         return Ok(());
@@ -3226,7 +3246,7 @@ fn launcher_save_view(
     pinned: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut shared = state.shared.lock().unwrap();
+    let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let launcher = &mut shared.config.launcher;
     let (slot_view, slot_key, slot_dir, slot_zoom) = if pinned {
         (
@@ -3355,7 +3375,7 @@ fn launcher_set_drop_target(path: Option<String>) {
 
 /// 配置里留空就是默认目录；每次调用顺手把目录建好。
 fn notes_root(state: &AppState) -> Result<PathBuf, String> {
-    let folder = state.shared.lock().unwrap().config.notes.folder.clone();
+    let folder = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.notes.folder.clone();
     hexbench_core::notes::resolve_root(&folder)
 }
 
@@ -3606,7 +3626,7 @@ fn note_pins(app: &AppHandle) -> Vec<NotePin> {
 fn write_note_pins(app: &AppHandle, pins: Vec<NotePin>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.config.notes.pinned = pins;
         shared.config.clone()
     };
@@ -3617,7 +3637,7 @@ fn write_note_pins(app: &AppHandle, pins: Vec<NotePin>) -> Result<(), String> {
 fn rename_pin_id(app: &AppHandle, old_id: &str, new_id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut changed = false;
         for pin in &mut shared.config.notes.pinned {
             if pin.id == old_id {
@@ -3637,7 +3657,7 @@ fn rename_pin_id(app: &AppHandle, old_id: &str, new_id: &str) -> Result<(), Stri
 fn unpin_label(app: &AppHandle, label: &str) -> Option<String> {
     let removed = {
         let state = app.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let index = shared
             .config
             .notes
@@ -4066,7 +4086,7 @@ async fn notes_send(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let (root, send_enter) = {
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             hexbench_core::notes::resolve_root(&shared.config.notes.folder)?,
             shared.config.notes.send_enter,
@@ -4912,7 +4932,7 @@ struct CacheInfo {
     files: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cache_stats() -> Vec<CacheInfo> {
     let mut list = Vec::new();
     if let Some(dir) = hexbench_core::icons::cache_dir() {
@@ -4930,7 +4950,7 @@ fn cache_stats() -> Vec<CacheInfo> {
 }
 
 /// 清空所有缓存，返回释放的字节数。
-#[tauri::command]
+#[tauri::command(async)]
 fn cache_clear(app: AppHandle) -> Result<u64, String> {
     let freed = hexbench_core::icons::clear_cache();
     log::info!("cache: cleared {freed} bytes");
@@ -4999,7 +5019,7 @@ fn launcher_pick_folder(target: String, app: AppHandle) {
         let folder = path.to_string_lossy().to_string();
         let state = handle.state::<AppState>();
         let config = {
-            let mut shared = state.shared.lock().unwrap();
+            let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if is_root {
                 shared.config.launcher.root = folder.clone();
             } else if !shared.config.launcher.folders.contains(&folder) {
@@ -5023,7 +5043,7 @@ fn launcher_pick_folder(target: String, app: AppHandle) {
 #[tauri::command]
 fn launcher_clear_folder(app: AppHandle, state: State<'_, AppState>) {
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.config.launcher.folders.clear();
         shared.config.clone()
     };
@@ -5035,7 +5055,7 @@ fn launcher_clear_folder(app: AppHandle, state: State<'_, AppState>) {
 #[tauri::command]
 fn launcher_save_folders(folders: Vec<String>, app: AppHandle, state: State<'_, AppState>) {
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cleaned: Vec<String> = folders
             .into_iter()
             .map(|entry| entry.trim().to_string())
@@ -5058,7 +5078,7 @@ fn launcher_save_folders(folders: Vec<String>, app: AppHandle, state: State<'_, 
 #[tauri::command]
 fn launcher_save_category_order(order: Vec<String>, app: AppHandle, state: State<'_, AppState>) {
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if shared.config.launcher.category_order == order {
             return;
         }
@@ -5114,7 +5134,7 @@ fn spawn_launcher_watcher(app: AppHandle) {
         loop {
             let wanted = {
                 let state = app.state::<AppState>();
-                let shared = state.shared.lock().unwrap();
+                let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let mut list: Vec<PathBuf> = Vec::new();
                 let root = shared.config.launcher.root.clone();
                 if !root.trim().is_empty() {
@@ -5195,7 +5215,7 @@ fn spawn_launcher_watcher(app: AppHandle) {
                         // 落进某个格子的根目录（或它下面的路径）就只通知那一格。
                         let fences = {
                             let state = app.state::<AppState>();
-                            let shared = state.shared.lock().unwrap();
+                            let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             shared.config.desktop.fences.clone()
                         };
                         // 同一次变化可能同时命中「根目录」和「当前子目录」两条规则：
@@ -5351,7 +5371,7 @@ fn wake_fence_manager() {
 /// 改完 `desktop` 之后统一落盘：写配置、通知设置页、叫醒管理器。
 fn save_fence_config(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let config = state.shared.lock().unwrap().config.clone();
+    let config = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.clone();
     config::save(&state.config_path, &config).map_err(|error| error.to_string())?;
     let _ = app.emit("config-changed", ());
     wake_fence_manager();
@@ -5430,7 +5450,7 @@ fn system_uses_dark_theme() -> bool {
 }
 
 fn ui_uses_dark_theme(app: &AppHandle) -> bool {
-    match app.state::<AppState>().shared.lock().unwrap().config.ui.theme {
+    match app.state::<AppState>().shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.ui.theme {
         hexbench_core::config::Theme::Dark => true,
         hexbench_core::config::Theme::Light => false,
         hexbench_core::config::Theme::System => system_uses_dark_theme(),
@@ -6368,7 +6388,7 @@ fn guides_state() -> &'static Mutex<GuidesState> {
 /// 虚拟屏幕的物理范围（副屏在主屏左边 / 上边时坐标是负的）。
 fn guides_bounds(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
     let state = app.state::<AppState>();
-    let shared = state.shared.lock().unwrap();
+    let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let monitors = &shared.monitors;
     let left = monitors.iter().map(|m| m.x).min()?;
     let top = monitors.iter().map(|m| m.y).min()?;
@@ -6625,7 +6645,7 @@ fn fence_persist_rect(app: &AppHandle, id: &str, rect: Rect) {
     let monitor = hexbench_core::sys::monitor_at(center_x, center_y);
     let state = app.state::<AppState>();
     let config = {
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(fence) = shared
             .config
             .desktop
@@ -6728,12 +6748,12 @@ fn fence_place(
 fn save_desktop(app: &AppHandle, desktop: DesktopSettings) -> Result<(), String> {
     {
         let state = app.state::<AppState>();
-        state.shared.lock().unwrap().config.desktop = desktop;
+        state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.desktop = desktop;
     }
     save_fence_config(app)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn fence_create(path: String, app: AppHandle) -> Result<FenceSettings, String> {
     let path = path.trim().replace('/', "\\");
     if path.is_empty() {
@@ -6758,7 +6778,7 @@ fn fence_create(path: String, app: AppHandle) -> Result<FenceSettings, String> {
 
 /// 新建一个收纳盒：幕后目录建在「文档\HexBench 收纳」下面，格子绑定它。
 /// 目录名用标题 + id，标题之后改了也不会把目录搬来搬去。
-#[tauri::command]
+#[tauri::command(async)]
 fn fence_create_box(title: String, app: AppHandle) -> Result<FenceSettings, String> {
     let mut desktop = desktop_snapshot(&app);
     if desktop.fences.len() >= FENCE_MAX {
@@ -6832,7 +6852,7 @@ fn box_contents(store: &Path) -> (Vec<PathBuf>, u64) {
     (paths, bytes)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn fence_box_info(id: String, app: AppHandle) -> Option<BoxInfoDto> {
     let fence = desktop_snapshot(&app)
         .fences
@@ -6852,7 +6872,7 @@ fn fence_box_info(id: String, app: AppHandle) -> Option<BoxInfoDto> {
 /// 删除格子。收纳盒里的文件怎么处理由设置页传 `mode`：
 /// `release` 搬到桌面、`purge` 删到回收站、其余（`keep` / 空）留在目录里。
 /// 绑文件夹的格子本来就不动文件，`mode` 无所谓。
-#[tauri::command]
+#[tauri::command(async)]
 fn fence_delete(id: String, mode: Option<String>, app: AppHandle) -> Result<(), String> {
     let mut desktop = desktop_snapshot(&app);
     let Some(fence) = desktop.fences.iter().find(|fence| fence.id == id).cloned() else {
@@ -7076,7 +7096,7 @@ fn run_rule_box(app: &AppHandle, id: &str) -> RuleRunDto {
     RuleRunDto { matched, moved }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn fence_rule_preview(id: String, app: AppHandle) -> Vec<RuleMatchDto> {
     let Some(fence) = desktop_snapshot(&app)
         .fences
@@ -7088,7 +7108,7 @@ fn fence_rule_preview(id: String, app: AppHandle) -> Vec<RuleMatchDto> {
     collect_rule_matches(&fence, &rule_box_stores(&app))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn fence_rule_run(id: String, app: AppHandle) -> RuleRunDto {
     run_rule_box(&app, &id)
 }
@@ -7183,7 +7203,7 @@ fn fence_set_enabled(enabled: bool, app: AppHandle) -> Result<(), String> {
     desktop.enabled = enabled;
     {
         let state = app.state::<AppState>();
-        state.shared.lock().unwrap().config.desktop = desktop;
+        state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.desktop = desktop;
     }
     save_fence_config(&app)
 }
@@ -7193,7 +7213,7 @@ fn fence_set_enabled(enabled: bool, app: AppHandle) -> Result<(), String> {
 fn fence_set_appearance(opacity: u32, frosted: bool, app: AppHandle) -> Result<(), String> {
     {
         let state = app.state::<AppState>();
-        let mut shared = state.shared.lock().unwrap();
+        let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.config.desktop.opacity = opacity;
         shared.config.desktop.frosted = frosted;
         shared.config.desktop.clamp_opacity();
@@ -7365,7 +7385,7 @@ fn fence_update(
     }
     {
         let state = app.state::<AppState>();
-        state.shared.lock().unwrap().config.desktop = desktop;
+        state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).config.desktop = desktop;
     }
     save_fence_config(&app)?;
     Ok(())
@@ -7540,7 +7560,7 @@ fn fence_run_resize(
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let paused = {
         let state = app.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.paused
     };
     let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
@@ -7609,7 +7629,7 @@ fn sync_tray_checks(app: &AppHandle) {
     };
     let paused = {
         let state = app.state::<AppState>();
-        let shared = state.shared.lock().unwrap();
+        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.paused
     };
     if let Some(MenuItemKind::Check(item)) = menu.get("pause") {
@@ -8481,7 +8501,7 @@ pub fn run() {
                     }
                     let (pause, launcher) = {
                         let state = app.state::<AppState>();
-                        let shared = state.shared.lock().unwrap();
+                        let shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         (
                             shared.config.hotkeys.pause.clone(),
                             shared.config.hotkeys.launcher.clone(),
@@ -8694,7 +8714,7 @@ pub fn run() {
             let enabled = handle.autolaunch().is_enabled().unwrap_or(false);
             {
                 let state = app.state::<AppState>();
-                let mut shared = state.shared.lock().unwrap();
+                let mut shared = state.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 shared.autostart = enabled;
                 shared.accent = hexbench_core::sys::accent_color();
             }
@@ -8840,8 +8860,9 @@ pub fn run() {
                                 match drop {
                                     tauri::DragDropEvent::Enter { .. }
                                     | tauri::DragDropEvent::Over { .. } => {
-                                        let _ = app.emit(
-                                            "launcher-drag-pos",
+                                        let _ = app.emit_to(
+                        "launcher",
+                        "launcher-drag-pos",
                                             serde_json::json!({ "x": client_x, "y": client_y }),
                                         );
                                     }
@@ -8865,7 +8886,7 @@ pub fn run() {
                                         if cursor_inside_launcher(app) {
                                             DRAG_CANCELLED.store(true, Ordering::SeqCst);
                                         }
-                                        let _ = app.emit("launcher-drag-leave", ());
+                                        let _ = app.emit_to("launcher", "launcher-drag-leave", ());
                                     }
                                     _ => {}
                                 }
@@ -8907,7 +8928,7 @@ pub fn run() {
                             if cursor_inside_launcher(app) {
                                 DRAG_CANCELLED.store(true, Ordering::SeqCst);
                             }
-                            let _ = app.emit("launcher-drag-leave", ());
+                            let _ = app.emit_to("launcher", "launcher-drag-leave", ());
                         }
                         _ => {}
                     }
