@@ -2317,7 +2317,7 @@ impl FenceWindow {
             M31: offset.x as f32 / self.scale,
             M32: offset.y as f32 / self.scale,
         };
-        unsafe {
+        let drawn = unsafe {
             self.dc.SetTarget(&bitmap);
             self.dc.SetDpi(self.scale * 96.0, self.scale * 96.0);
             self.dc.BeginDraw();
@@ -2326,13 +2326,17 @@ impl FenceWindow {
             let transparent = rgb(0, 0, 0, 0.0);
             self.dc.Clear(Some(&transparent));
             self.paint(gpu, &base);
-            self.dc.EndDraw(None, None)?;
+            let drawn = self.dc.EndDraw(None, None);
             self.dc.SetTarget(None::<&ID2D1Image>);
-        }
-        unsafe {
-            self.surface.EndDraw()?;
-            gpu.dcomp.Commit()?;
-        }
+            drawn
+        };
+        // 不管画没画成，都要把 surface 这次绘制会话收掉：留在 BeginDraw 状态的话，
+        // 之后每次 BeginDraw 都会失败，这一格就再也不刷新了（设备重置、驱动更新、
+        // 远程桌面切换都会走到这里）。
+        let finished = unsafe { self.surface.EndDraw() };
+        drawn?;
+        finished?;
+        unsafe { gpu.dcomp.Commit()?; }
         Ok(())
     }
 
