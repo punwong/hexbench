@@ -1232,6 +1232,8 @@ struct FenceWindow {
     search_popup: Option<HWND>,
     /// 键盘焦点在这格里（点了条目之后）：F2 改名、Delete 删除、Esc 取消。
     keyboard: bool,
+    /// 进键盘会话之前的前台窗口：结束会话时把焦点还回去。
+    keyboard_return: HWND,
     /// 左键按在「更多」按钮上：松手时再弹菜单。
     /// 在 `WM_LBUTTONDOWN` 里直接弹菜单会让按钮一直按着，菜单收不到后续鼠标输入。
     dots_down: bool,
@@ -1399,6 +1401,7 @@ impl FenceWindow {
                 search_popup: None,
                 dots_down: false,
                 keyboard: false,
+                keyboard_return: HWND::default(),
                 gestures: GestureSettings::default(),
                 gesture: None,
                 back_count: 0,
@@ -3726,6 +3729,8 @@ fn begin_keyboard(hwnd: HWND, fence: &mut FenceWindow) {
         return;
     }
     fence.keyboard = true;
+    // 记下现在的前台窗口：结束会话时还给它，不然用户的按键会继续喂给格子。
+    fence.keyboard_return = unsafe { GetForegroundWindow() };
     hexbench_core::sys::set_no_activate(hwnd.0 as isize, false);
     hexbench_core::sys::force_foreground(hwnd.0 as isize);
     unsafe {
@@ -3740,6 +3745,13 @@ fn end_keyboard(hwnd: HWND, fence: &mut FenceWindow) {
     }
     fence.keyboard = false;
     hexbench_core::sys::set_no_activate(hwnd.0 as isize, true);
+    // 把焦点还回原来那个窗口；还不了就让系统自己决定（下一个点击会归位）。
+    let previous = std::mem::take(&mut fence.keyboard_return);
+    if !previous.is_invalid() {
+        unsafe {
+            let _ = SetForegroundWindow(previous);
+        }
+    }
 }
 
 /// 某个路径在屏幕上的左上角（改名框定位用），顺带给出它是不是文件夹。
@@ -4109,7 +4121,7 @@ unsafe extern "system" fn fence_wndproc(
                     return LRESULT(0);
                 }
             }
-            LRESULT(0)
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
         WM_KILLFOCUS => {
             unsafe {

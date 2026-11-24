@@ -1414,6 +1414,10 @@ fn open_main_now(app: &AppHandle) {
         None => (980.0, 660.0),
     };
     log::info!("main: creating window ({width}x{height} logical)");
+    // 页面就绪过就置位：2.5 秒兜底据此判断「窗口一直没出来」，而不是
+    // 「用户已经打开又关掉了」——后者不该再被兜底弹出来。
+    let page_shown = Arc::new(AtomicBool::new(false));
+    let page_shown_for_load = page_shown.clone();
     match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         // 任务栏和 Alt+Tab 里显示的名字：跟面板、格子区分开。
         .title("HexBench 设置")
@@ -1427,8 +1431,9 @@ fn open_main_now(app: &AppHandle) {
         // 先藏着：页面画好再显示（见 `show_main_window_ready`）。让窗口先出现的话，
         // 用户先看到的是一个按屏幕算出来的、纯白的空框，随后才被上次的尺寸覆盖。
         .visible(false)
-        .on_page_load(|window, payload| {
+        .on_page_load(move |window, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                page_shown_for_load.store(true, Ordering::SeqCst);
                 schedule_main_show(&window, Duration::from_millis(40), "page load");
             }
         })
@@ -1442,6 +1447,10 @@ fn open_main_now(app: &AppHandle) {
             let watchdog = window.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(2500));
+                // 页面就绪过（窗口可能已经被用户关掉）：兜底不该把它再弹出来。
+                if page_shown.load(Ordering::SeqCst) {
+                    return;
+                }
                 if watchdog.is_visible().unwrap_or(false) {
                     return;
                 }
