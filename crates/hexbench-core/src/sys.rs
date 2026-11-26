@@ -274,7 +274,7 @@ unsafe extern "system" fn ds_query_continue_drag(
         // （对方线程在 Drop 里等我们，我们等它返回）。直接取消，交给
         // `navigate_file_dialog` 把对话框跳到目标文件夹。
         let (x, y) = cursor_position();
-        if file_dialog_at(x, y).is_some() {
+        if file_dialog_at_quiet(x, y).is_some() {
             return DRAGDROP_S_CANCEL;
         }
         return DRAGDROP_S_DROP;
@@ -656,6 +656,18 @@ fn send_keys(vk: u16) -> bool {
 /// 认法三样齐了才算：窗口类 `#32770`、底部有一个真正的路径输入框（文件对话框是
 /// id 1148 的「文件名」框，「选择文件夹」是 id 1152 的「文件夹」框）、并且画着
 /// Shell 的 DirectUI 内容区。自己画的对话框凑不齐这三样。
+/// 和 `file_dialog_at` 一样判断「光标下是不是文件对话框」，但**不发任何消息**。
+///
+/// 给 OLE 的 `QueryContinueDrag` 用：它跑在拖拽的模态循环里，此时目标窗口的
+/// 线程可能正在回调我们的数据对象（等我们这边返回）。如果这里再用
+/// `WindowFromPoint` 给对方发 `WM_NCHITTEST`，就是两边互相等——资源管理器
+/// 和我们都卡住。所以走按 z-order 找矩形那条纯查询路径，代价是遇到点击穿透的
+/// 全屏覆盖窗口时可能判不出来（那种情况下只是不取消，退化成原来的行为）。
+pub fn file_dialog_at_quiet(x: i32, y: i32) -> Option<isize> {
+    let root = top_window_at(x, y)?;
+    is_file_dialog(root as isize).then_some(root as isize)
+}
+
 pub fn file_dialog_at(x: i32, y: i32) -> Option<isize> {
     use windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 

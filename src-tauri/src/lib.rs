@@ -5605,32 +5605,32 @@ fn native_host(app: &AppHandle) -> Option<Arc<hexbench_fence::NativeFences>> {
             if dest.trim().is_empty() || paths.is_empty() {
                 return;
             }
-            // 格子里把文件拖到它自己所在的目录：系统仍会送一个 Drop，
-            // 真搬的话就是「自己移进自己」，直接忽略。
-            let dest_dir = Path::new(&dest)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&dest));
-            if !copy
-                && paths.iter().all(|path| {
-                    Path::new(path)
-                        .parent()
-                        .map(|parent| {
-                            parent
-                                .canonicalize()
-                                .unwrap_or_else(|_| parent.to_path_buf())
-                                == dest_dir
-                        })
-                        .unwrap_or(false)
-                })
-            {
-                return;
-            }
-            // 这里还在 OLE 的 Drop 回调里（渲染线程）：Shell 操作和整格重读
-            // 都可能要几百毫秒，同步做会把所有格子卡住、也拖着资源管理器的
-            // 拖拽不放。放到工作线程，回调立刻返回。
+            // 这里还在 OLE 的 Drop 回调里（渲染线程）：路径规范化、Shell 操作和
+            // 整格重读都可能要几百毫秒（网络盘上规范化就可能卡住），同步做会把
+            // 所有格子卡住、也拖着资源管理器的拖拽不放。全部放到工作线程。
             let worker = handle.clone();
             let fence_id = id.clone();
             thread::spawn(move || {
+                // 格子里把文件拖到它自己所在的目录：系统仍会送一个 Drop，
+                // 真搬的话就是「自己移进自己」，直接忽略。
+                let dest_dir = Path::new(&dest)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&dest));
+                if !copy
+                    && paths.iter().all(|path| {
+                        Path::new(path)
+                            .parent()
+                            .map(|parent| {
+                                parent
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| parent.to_path_buf())
+                                    == dest_dir
+                            })
+                            .unwrap_or(false)
+                    })
+                {
+                    return;
+                }
                 let result = if copy {
                     launcher_copy_into(dest, paths, worker.clone())
                 } else {
